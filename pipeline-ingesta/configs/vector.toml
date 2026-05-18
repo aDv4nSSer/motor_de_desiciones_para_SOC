@@ -91,3 +91,132 @@ duration_ms = end_ms - start_ms
 type = "console"
 inputs = ["parse_eve"]
 encoding.codec = "json"
+
+# ============================================================
+# UNIT TESTS
+# Ejecutar: vector test configs/vector.toml
+# Cada test cubre un caso representativo del Golden Subset.
+# ============================================================
+
+# -- Test 1: TCP normal con todos los campos presentes ------
+[[tests]]
+name = "tcp_normal_full_fields"
+
+  [[tests.inputs]]
+  insert_at = "parse_eve"
+  type = "log"
+
+    [tests.inputs.log_fields]
+    message = '{"timestamp":"2026-05-15T10:23:45.123456+0000","event_type":"flow","proto":"TCP","flow":{"start":"2026-05-15T10:23:44.000000+0000","end":"2026-05-15T10:23:45.123456+0000","bytes_toserver":1240,"pkts_toserver":8,"bytes_toclient":5680,"pkts_toclient":12},"tcp":{"tcp_flags":"0x1b","tcp_flags_tc":"0x02","tcp_flags_ts":"0x12"}}'
+
+  [[tests.outputs]]
+  extract_from = "parse_eve"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert_eq!(.PROTOCOL, 6)
+    assert_eq!(.IN_BYTES, 1240)
+    assert_eq!(.IN_PKTS, 8)
+    assert_eq!(.OUT_BYTES, 5680)
+    assert_eq!(.OUT_PKTS, 12)
+    assert_eq!(.TCP_FLAGS, 27)
+    assert_eq!(.CLIENT_TCP_FLAGS, 18)
+    assert_eq!(.SERVER_TCP_FLAGS, 2)
+    assert_eq!(.FLOW_DURATION_MILLISECONDS, 1123)
+    '''
+
+# -- Test 2: UDP sin objeto tcp ------------------------------
+[[tests]]
+name = "udp_no_tcp_object"
+
+  [[tests.inputs]]
+  insert_at = "parse_eve"
+  type = "log"
+
+    [tests.inputs.log_fields]
+    message = '{"timestamp":"2026-05-15T10:25:00.500000+0000","event_type":"flow","proto":"UDP","flow":{"start":"2026-05-15T10:24:59.000000+0000","end":"2026-05-15T10:25:00.500000+0000","bytes_toserver":80,"pkts_toserver":1,"bytes_toclient":160,"pkts_toclient":1}}'
+
+  [[tests.outputs]]
+  extract_from = "parse_eve"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert_eq!(.PROTOCOL, 17)
+    assert_eq!(.TCP_FLAGS, 0)
+    assert_eq!(.CLIENT_TCP_FLAGS, 0)
+    assert_eq!(.SERVER_TCP_FLAGS, 0)
+    assert_eq!(.FLOW_DURATION_MILLISECONDS, 1500)
+    '''
+
+# -- Test 3: ICMP sin objeto tcp -----------------------------
+[[tests]]
+name = "icmp_no_tcp_object"
+
+  [[tests.inputs]]
+  insert_at = "parse_eve"
+  type = "log"
+
+    [tests.inputs.log_fields]
+    message = '{"timestamp":"2026-05-15T10:26:00.000000+0000","event_type":"flow","proto":"ICMP","flow":{"start":"2026-05-15T10:25:58.000000+0000","end":"2026-05-15T10:26:00.000000+0000","bytes_toserver":84,"pkts_toserver":1,"bytes_toclient":84,"pkts_toclient":1}}'
+
+  [[tests.outputs]]
+  extract_from = "parse_eve"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert_eq!(.PROTOCOL, 1)
+    assert_eq!(.TCP_FLAGS, 0)
+    assert_eq!(.FLOW_DURATION_MILLISECONDS, 2000)
+    assert_eq!(.SRC_TO_DST_SECOND_BYTES, 42.0)
+    assert_eq!(.DST_TO_SRC_SECOND_BYTES, 42.0)
+    '''
+
+# -- Test 4: TCP SYN parcial (sin tcp_flags_tc) --------------
+[[tests]]
+name = "tcp_syn_partial_flags"
+
+  [[tests.inputs]]
+  insert_at = "parse_eve"
+  type = "log"
+
+    [tests.inputs.log_fields]
+    message = '{"timestamp":"2026-05-15T10:27:30.999000+0000","event_type":"flow","proto":"TCP","flow":{"start":"2026-05-15T10:27:30.000000+0000","end":"2026-05-15T10:27:30.999000+0000","bytes_toserver":74,"pkts_toserver":1,"bytes_toclient":0,"pkts_toclient":0},"tcp":{"tcp_flags":"0x02","tcp_flags_ts":"0x02"}}'
+
+  [[tests.outputs]]
+  extract_from = "parse_eve"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert_eq!(.PROTOCOL, 6)
+    assert_eq!(.TCP_FLAGS, 2)
+    assert_eq!(.CLIENT_TCP_FLAGS, 2)
+    assert_eq!(.SERVER_TCP_FLAGS, 0)
+    assert_eq!(.FLOW_DURATION_MILLISECONDS, 999)
+    assert_eq!(.DST_TO_SRC_SECOND_BYTES, 0.0)
+    '''
+
+# -- Test 5: Duración cero — guarda de división por cero -----
+[[tests]]
+name = "zero_duration_division_guard"
+
+  [[tests.inputs]]
+  insert_at = "parse_eve"
+  type = "log"
+
+    [tests.inputs.log_fields]
+    message = '{"timestamp":"2026-05-15T10:28:00.000000+0000","event_type":"flow","proto":"TCP","flow":{"start":"2026-05-15T10:28:00.000000+0000","end":"2026-05-15T10:28:00.000000+0000","bytes_toserver":0,"pkts_toserver":0,"bytes_toclient":0,"pkts_toclient":0},"tcp":{"tcp_flags":"0x00"}}'
+
+  [[tests.outputs]]
+  extract_from = "parse_eve"
+
+    [[tests.outputs.conditions]]
+    type = "vrl"
+    source = '''
+    assert_eq!(.FLOW_DURATION_MILLISECONDS, 0)
+    assert_eq!(.SRC_TO_DST_SECOND_BYTES, 0.0)
+    assert_eq!(.DST_TO_SRC_SECOND_BYTES, 0.0)
+    '''
