@@ -1,0 +1,23 @@
+# Estado interno de Vector (checkpoints, buffers)
+.vector-data/
+
+# Outputs temporales del pipeline
+*.out
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,93 @@
+# ============================================================
+# Pipeline Golden Subset - Fase 1 (desarrollo con stdin)
+# Source: stdin (pegamos EVE JSON por entrada estándar)
+# Transform: VRL del Golden Subset
+# Sink: consola (stdout)
+# ============================================================
+
+data_dir = "/home/aiayala/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta/.vector-data"
+
+[sources.eve_stdin]
+type = "stdin"
+
+[transforms.parse_eve]
+type = "remap"
+inputs = ["eve_stdin"]
+source = '''
+# Paso 1: parsear la línea cruda como JSON
+. = parse_json!(.message)
+
+# Paso 2: PROTOCOL — mapear string canónico a entero NetFlow
+proto_str = string!(.proto)
+.PROTOCOL = if proto_str == "TCP" {
+    6
+} else if proto_str == "UDP" {
+    17
+} else if proto_str == "ICMP" {
+    1
+} else if proto_str == "ICMP6" {
+    58
+} else if proto_str == "GRE" {
+    47
+} else {
+    0
+}
+
+# Paso 3: Bytes y paquetes (extracción directa con casteo a int)
+.IN_BYTES  = int!(.flow.bytes_toserver)
+.IN_PKTS   = int!(.flow.pkts_toserver)
+.OUT_BYTES = int!(.flow.bytes_toclient)
+.OUT_PKTS  = int!(.flow.pkts_toclient)
+
+# Paso 4: TCP flags — hex string a int, default "0x00" para no-TCP
+flags_all    = .tcp.tcp_flags    || "0x00"
+flags_client = .tcp.tcp_flags_ts || "0x00"
+flags_server = .tcp.tcp_flags_tc || "0x00"
+
+.TCP_FLAGS        = parse_int!(flags_all)
+.CLIENT_TCP_FLAGS = parse_int!(flags_client)
+.SERVER_TCP_FLAGS = parse_int!(flags_server)
+
+# Paso 5: FLOW_DURATION_MILLISECONDS (precisión sub-segundo)
+start_ms = to_unix_timestamp(parse_timestamp!(.flow.start, "%+"), unit: "milliseconds")
+end_ms   = to_unix_timestamp(parse_timestamp!(.flow.end,   "%+"), unit: "milliseconds")
+duration_ms = end_ms - start_ms
+.FLOW_DURATION_MILLISECONDS = if duration_ms < 0 { 0 } else { duration_ms }
+
+# Paso 6: Throughput por segundo en cada dirección
+# División por cero protegida: la guarda if==0 evita el caso problemático.
+# El "_, err" le dice al compilador que sabemos que la división puede ser
+# falible y aceptamos manejar el error (que en la práctica nunca ocurre
+# porque la guarda lo previene).
+.SRC_TO_DST_SECOND_BYTES, _err = if .FLOW_DURATION_MILLISECONDS == 0 {
+    0.0
+} else {
+    to_float(.IN_BYTES) / (to_float(.FLOW_DURATION_MILLISECONDS) / 1000.0)
+}
+
+.DST_TO_SRC_SECOND_BYTES, _err = if .FLOW_DURATION_MILLISECONDS == 0 {
+    0.0
+} else {
+    to_float(.OUT_BYTES) / (to_float(.FLOW_DURATION_MILLISECONDS) / 1000.0)
+}
+
+# Paso 7: salida limpia — solo las 11 features del Golden Subset
+. = {
+    "PROTOCOL":                   .PROTOCOL,
+    "IN_BYTES":                   .IN_BYTES,
+    "IN_PKTS":                    .IN_PKTS,
+    "OUT_BYTES":                  .OUT_BYTES,
+    "OUT_PKTS":                   .OUT_PKTS,
+    "TCP_FLAGS":                  .TCP_FLAGS,
+    "CLIENT_TCP_FLAGS":           .CLIENT_TCP_FLAGS,
+    "SERVER_TCP_FLAGS":           .SERVER_TCP_FLAGS,
+    "FLOW_DURATION_MILLISECONDS": .FLOW_DURATION_MILLISECONDS,
+    "SRC_TO_DST_SECOND_BYTES":    .SRC_TO_DST_SECOND_BYTES,
+    "DST_TO_SRC_SECOND_BYTES":    .DST_TO_SRC_SECOND_BYTES
+}
+'''
+
+[sinks.stdout]
+type = "console"
+inputs = ["parse_eve"]
+encoding.codec = "json"

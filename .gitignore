@@ -1,0 +1,30 @@
+# Estado interno de Vector (checkpoints, buffers)
+**/.vector-data/
+
+# Outputs temporales del pipeline
+*.out
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python (notebooks de Joaquín, scripts de validación)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Datos crudos (datasets pesados — NO versionar)
+*.csv
+*.parquet
+*.pcap
+data/raw/
+
+# OS
+.DS_Store
+Thumbs.db
