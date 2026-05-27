@@ -1,8 +1,6 @@
+
 # ============================================================
-# Pipeline Golden Subset - Fase 1 (desarrollo con stdin)
-# Source: stdin (pegamos EVE JSON por entrada estándar)
-# Transform: VRL del Golden Subset
-# Sink: consola (stdout)
+# Pipeline Golden Subset v4 — desarrollo local con stdin
 # ============================================================
 
 data_dir = "/home/aiayala/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta/.vector-data"
@@ -14,66 +12,80 @@ type = "stdin"
 type = "remap"
 inputs = ["eve_stdin"]
 source = '''
-# Paso 1: parsear la línea cruda como JSON
 . = parse_json!(.message)
 
-# Paso 2: PROTOCOL — mapear string canónico a entero NetFlow
+if .event_type != "flow" {
+    abort
+}
+
 proto_str = string!(.proto)
-.PROTOCOL = if proto_str == "TCP" {
+protocol_raw = if proto_str == "TCP" {
     6
 } else if proto_str == "UDP" {
     17
 } else if proto_str == "ICMP" {
     1
-} else if proto_str == "ICMP6" {
-    58
+} else if proto_str == "SCTP" {
+    132
 } else if proto_str == "GRE" {
     47
+} else if proto_str == "IGMP" {
+    2
+} else if proto_str == "ESP" {
+    50
+} else if proto_str == "AH" {
+    51
 } else {
     0
 }
+.PROTOCOL = if protocol_raw > 89 { 89 } else if protocol_raw < 0 { 0 } else { protocol_raw }
 
-# Paso 3: Bytes y paquetes (extracción directa con casteo a int)
-.IN_BYTES  = int!(.flow.bytes_toserver)
-.IN_PKTS   = int!(.flow.pkts_toserver)
-.OUT_BYTES = int!(.flow.bytes_toclient)
-.OUT_PKTS  = int!(.flow.pkts_toclient)
+src_port_raw,  _err = int(.src_port  || 0)
+dest_port_raw, _err = int(.dest_port || 0)
+.L4_SRC_PORT = if src_port_raw  > 65535 { 65535 } else if src_port_raw  < 0 { 0 } else { src_port_raw  }
+.L4_DST_PORT = if dest_port_raw > 65535 { 65535 } else if dest_port_raw < 0 { 0 } else { dest_port_raw }
 
-# Paso 4: TCP flags — hex string a int, default "0x00" para no-TCP
+in_bytes_raw  = int!(.flow.bytes_toserver)
+in_pkts_raw   = int!(.flow.pkts_toserver)
+out_bytes_raw = int!(.flow.bytes_toclient)
+out_pkts_raw  = int!(.flow.pkts_toclient)
+
+.IN_BYTES  = if in_bytes_raw  > 94055   { 94055   } else if in_bytes_raw  < 0 { 0 } else { in_bytes_raw  }
+.IN_PKTS   = if in_pkts_raw   > 628     { 628     } else if in_pkts_raw   < 0 { 0 } else { in_pkts_raw   }
+.OUT_BYTES = if out_bytes_raw > 1466528 { 1466528 } else if out_bytes_raw < 0 { 0 } else { out_bytes_raw }
+.OUT_PKTS  = if out_pkts_raw  > 1158    { 1158    } else if out_pkts_raw  < 0 { 0 } else { out_pkts_raw  }
+
 flags_all    = .tcp.tcp_flags    || "0x00"
 flags_client = .tcp.tcp_flags_ts || "0x00"
 flags_server = .tcp.tcp_flags_tc || "0x00"
 
-.TCP_FLAGS        = parse_int!(flags_all)
-.CLIENT_TCP_FLAGS = parse_int!(flags_client)
-.SERVER_TCP_FLAGS = parse_int!(flags_server)
+tcp_flags_raw    = parse_int!(string!(flags_all))
+client_flags_raw = parse_int!(string!(flags_client))
+server_flags_raw = parse_int!(string!(flags_server))
 
-# Paso 5: FLOW_DURATION_MILLISECONDS (precisión sub-segundo)
-start_ms = to_unix_timestamp(parse_timestamp!(.flow.start, "%+"), unit: "milliseconds")
-end_ms   = to_unix_timestamp(parse_timestamp!(.flow.end,   "%+"), unit: "milliseconds")
-duration_ms = end_ms - start_ms
-.FLOW_DURATION_MILLISECONDS = if duration_ms < 0 { 0 } else { duration_ms }
+.TCP_FLAGS        = if tcp_flags_raw    > 223 { 223 } else if tcp_flags_raw    < 0 { 0 } else { tcp_flags_raw    }
+.CLIENT_TCP_FLAGS = if client_flags_raw > 223 { 223 } else if client_flags_raw < 0 { 0 } else { client_flags_raw }
+.SERVER_TCP_FLAGS = if server_flags_raw > 218 { 218 } else if server_flags_raw < 0 { 0 } else { server_flags_raw }
 
-# Paso 6: Throughput por segundo en cada dirección
-# División por cero protegida: la guarda if==0 evita el caso problemático.
-# El "_, err" le dice al compilador que sabemos que la división puede ser
-# falible y aceptamos manejar el error (que en la práctica nunca ocurre
-# porque la guarda lo previene).
-.SRC_TO_DST_SECOND_BYTES, _err = if .FLOW_DURATION_MILLISECONDS == 0 {
-    0.0
+start_ts = .flow.start || null
+end_ts   = .flow.end   || null
+
+duration_ms_raw = if start_ts != null && end_ts != null {
+    start_ms = to_unix_timestamp(parse_timestamp!(string!(start_ts), "%+"), unit: "milliseconds")
+    end_ms   = to_unix_timestamp(parse_timestamp!(string!(end_ts),   "%+"), unit: "milliseconds")
+    diff     = end_ms - start_ms
+    if diff < 0 { 0 } else { diff }
 } else {
-    to_float(.IN_BYTES) / (to_float(.FLOW_DURATION_MILLISECONDS) / 1000.0)
+    age_sec, _err = int(.flow.age || 0)
+    age_sec * 1000
 }
 
-.DST_TO_SRC_SECOND_BYTES, _err = if .FLOW_DURATION_MILLISECONDS == 0 {
-    0.0
-} else {
-    to_float(.OUT_BYTES) / (to_float(.FLOW_DURATION_MILLISECONDS) / 1000.0)
-}
+.FLOW_DURATION_MILLISECONDS = if duration_ms_raw > 120534 { 120534 } else if duration_ms_raw < 0 { 0 } else { duration_ms_raw }
 
-# Paso 7: salida limpia — solo las 11 features del Golden Subset
 . = {
     "PROTOCOL":                   .PROTOCOL,
+    "L4_SRC_PORT":                .L4_SRC_PORT,
+    "L4_DST_PORT":                .L4_DST_PORT,
     "IN_BYTES":                   .IN_BYTES,
     "IN_PKTS":                    .IN_PKTS,
     "OUT_BYTES":                  .OUT_BYTES,
@@ -81,9 +93,7 @@ duration_ms = end_ms - start_ms
     "TCP_FLAGS":                  .TCP_FLAGS,
     "CLIENT_TCP_FLAGS":           .CLIENT_TCP_FLAGS,
     "SERVER_TCP_FLAGS":           .SERVER_TCP_FLAGS,
-    "FLOW_DURATION_MILLISECONDS": .FLOW_DURATION_MILLISECONDS,
-    "SRC_TO_DST_SECOND_BYTES":    .SRC_TO_DST_SECOND_BYTES,
-    "DST_TO_SRC_SECOND_BYTES":    .DST_TO_SRC_SECOND_BYTES
+    "FLOW_DURATION_MILLISECONDS": .FLOW_DURATION_MILLISECONDS
 }
 '''
 
@@ -93,130 +103,108 @@ inputs = ["parse_eve"]
 encoding.codec = "json"
 
 # ============================================================
-# UNIT TESTS
+# UNIT TESTS — Golden Subset v4 (11 features)
 # Ejecutar: vector test configs/vector.toml
-# Cada test cubre un caso representativo del Golden Subset.
 # ============================================================
 
-# -- Test 1: TCP normal con todos los campos presentes ------
 [[tests]]
 name = "tcp_normal_full_fields"
+[[tests.inputs]]
+insert_at = "parse_eve"
+type = "log"
+[tests.inputs.log_fields]
+message = '{"timestamp":"2026-05-15T10:23:45.123456+0000","event_type":"flow","proto":"TCP","src_port":52341,"dest_port":443,"flow":{"start":"2026-05-15T10:23:44.000000+0000","end":"2026-05-15T10:23:45.123456+0000","bytes_toserver":1240,"pkts_toserver":8,"bytes_toclient":5680,"pkts_toclient":12},"tcp":{"tcp_flags":"0x1b","tcp_flags_tc":"0x02","tcp_flags_ts":"0x12"}}'
+[[tests.outputs]]
+extract_from = "parse_eve"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.PROTOCOL, 6)
+assert_eq!(.L4_SRC_PORT, 52341)
+assert_eq!(.L4_DST_PORT, 443)
+assert_eq!(.IN_BYTES, 1240)
+assert_eq!(.IN_PKTS, 8)
+assert_eq!(.OUT_BYTES, 5680)
+assert_eq!(.OUT_PKTS, 12)
+assert_eq!(.TCP_FLAGS, 27)
+assert_eq!(.CLIENT_TCP_FLAGS, 18)
+assert_eq!(.SERVER_TCP_FLAGS, 2)
+assert_eq!(.FLOW_DURATION_MILLISECONDS, 1123)
+'''
 
-  [[tests.inputs]]
-  insert_at = "parse_eve"
-  type = "log"
-
-    [tests.inputs.log_fields]
-    message = '{"timestamp":"2026-05-15T10:23:45.123456+0000","event_type":"flow","proto":"TCP","flow":{"start":"2026-05-15T10:23:44.000000+0000","end":"2026-05-15T10:23:45.123456+0000","bytes_toserver":1240,"pkts_toserver":8,"bytes_toclient":5680,"pkts_toclient":12},"tcp":{"tcp_flags":"0x1b","tcp_flags_tc":"0x02","tcp_flags_ts":"0x12"}}'
-
-  [[tests.outputs]]
-  extract_from = "parse_eve"
-
-    [[tests.outputs.conditions]]
-    type = "vrl"
-    source = '''
-    assert_eq!(.PROTOCOL, 6)
-    assert_eq!(.IN_BYTES, 1240)
-    assert_eq!(.IN_PKTS, 8)
-    assert_eq!(.OUT_BYTES, 5680)
-    assert_eq!(.OUT_PKTS, 12)
-    assert_eq!(.TCP_FLAGS, 27)
-    assert_eq!(.CLIENT_TCP_FLAGS, 18)
-    assert_eq!(.SERVER_TCP_FLAGS, 2)
-    assert_eq!(.FLOW_DURATION_MILLISECONDS, 1123)
-    '''
-
-# -- Test 2: UDP sin objeto tcp ------------------------------
 [[tests]]
-name = "udp_no_tcp_object"
+name = "udp_dns_no_tcp_object"
+[[tests.inputs]]
+insert_at = "parse_eve"
+type = "log"
+[tests.inputs.log_fields]
+message = '{"timestamp":"2026-05-15T10:25:00.500000+0000","event_type":"flow","proto":"UDP","src_port":54321,"dest_port":53,"flow":{"start":"2026-05-15T10:24:59.000000+0000","end":"2026-05-15T10:25:00.500000+0000","bytes_toserver":80,"pkts_toserver":1,"bytes_toclient":160,"pkts_toclient":1}}'
+[[tests.outputs]]
+extract_from = "parse_eve"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.PROTOCOL, 17)
+assert_eq!(.L4_DST_PORT, 53)
+assert_eq!(.TCP_FLAGS, 0)
+assert_eq!(.CLIENT_TCP_FLAGS, 0)
+assert_eq!(.SERVER_TCP_FLAGS, 0)
+assert_eq!(.FLOW_DURATION_MILLISECONDS, 1500)
+'''
 
-  [[tests.inputs]]
-  insert_at = "parse_eve"
-  type = "log"
-
-    [tests.inputs.log_fields]
-    message = '{"timestamp":"2026-05-15T10:25:00.500000+0000","event_type":"flow","proto":"UDP","flow":{"start":"2026-05-15T10:24:59.000000+0000","end":"2026-05-15T10:25:00.500000+0000","bytes_toserver":80,"pkts_toserver":1,"bytes_toclient":160,"pkts_toclient":1}}'
-
-  [[tests.outputs]]
-  extract_from = "parse_eve"
-
-    [[tests.outputs.conditions]]
-    type = "vrl"
-    source = '''
-    assert_eq!(.PROTOCOL, 17)
-    assert_eq!(.TCP_FLAGS, 0)
-    assert_eq!(.CLIENT_TCP_FLAGS, 0)
-    assert_eq!(.SERVER_TCP_FLAGS, 0)
-    assert_eq!(.FLOW_DURATION_MILLISECONDS, 1500)
-    '''
-
-# -- Test 3: ICMP sin objeto tcp -----------------------------
 [[tests]]
-name = "icmp_no_tcp_object"
+name = "icmp_no_tcp_no_ports"
+[[tests.inputs]]
+insert_at = "parse_eve"
+type = "log"
+[tests.inputs.log_fields]
+message = '{"timestamp":"2026-05-15T10:26:00.000000+0000","event_type":"flow","proto":"ICMP","src_port":0,"dest_port":0,"flow":{"start":"2026-05-15T10:25:58.000000+0000","end":"2026-05-15T10:26:00.000000+0000","bytes_toserver":84,"pkts_toserver":1,"bytes_toclient":84,"pkts_toclient":1}}'
+[[tests.outputs]]
+extract_from = "parse_eve"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.PROTOCOL, 1)
+assert_eq!(.L4_SRC_PORT, 0)
+assert_eq!(.L4_DST_PORT, 0)
+assert_eq!(.TCP_FLAGS, 0)
+assert_eq!(.FLOW_DURATION_MILLISECONDS, 2000)
+'''
 
-  [[tests.inputs]]
-  insert_at = "parse_eve"
-  type = "log"
-
-    [tests.inputs.log_fields]
-    message = '{"timestamp":"2026-05-15T10:26:00.000000+0000","event_type":"flow","proto":"ICMP","flow":{"start":"2026-05-15T10:25:58.000000+0000","end":"2026-05-15T10:26:00.000000+0000","bytes_toserver":84,"pkts_toserver":1,"bytes_toclient":84,"pkts_toclient":1}}'
-
-  [[tests.outputs]]
-  extract_from = "parse_eve"
-
-    [[tests.outputs.conditions]]
-    type = "vrl"
-    source = '''
-    assert_eq!(.PROTOCOL, 1)
-    assert_eq!(.TCP_FLAGS, 0)
-    assert_eq!(.FLOW_DURATION_MILLISECONDS, 2000)
-    assert_eq!(.SRC_TO_DST_SECOND_BYTES, 42.0)
-    assert_eq!(.DST_TO_SRC_SECOND_BYTES, 42.0)
-    '''
-
-# -- Test 4: TCP SYN parcial (sin tcp_flags_tc) --------------
 [[tests]]
-name = "tcp_syn_partial_flags"
+name = "tcp_ssh_syn_partial_flags"
+[[tests.inputs]]
+insert_at = "parse_eve"
+type = "log"
+[tests.inputs.log_fields]
+message = '{"timestamp":"2026-05-15T10:27:30.999000+0000","event_type":"flow","proto":"TCP","src_port":49812,"dest_port":22,"flow":{"start":"2026-05-15T10:27:30.000000+0000","end":"2026-05-15T10:27:30.999000+0000","bytes_toserver":74,"pkts_toserver":1,"bytes_toclient":0,"pkts_toclient":0},"tcp":{"tcp_flags":"0x02","tcp_flags_ts":"0x02"}}'
+[[tests.outputs]]
+extract_from = "parse_eve"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.PROTOCOL, 6)
+assert_eq!(.L4_DST_PORT, 22)
+assert_eq!(.TCP_FLAGS, 2)
+assert_eq!(.CLIENT_TCP_FLAGS, 2)
+assert_eq!(.SERVER_TCP_FLAGS, 0)
+assert_eq!(.FLOW_DURATION_MILLISECONDS, 999)
+'''
 
-  [[tests.inputs]]
-  insert_at = "parse_eve"
-  type = "log"
-
-    [tests.inputs.log_fields]
-    message = '{"timestamp":"2026-05-15T10:27:30.999000+0000","event_type":"flow","proto":"TCP","flow":{"start":"2026-05-15T10:27:30.000000+0000","end":"2026-05-15T10:27:30.999000+0000","bytes_toserver":74,"pkts_toserver":1,"bytes_toclient":0,"pkts_toclient":0},"tcp":{"tcp_flags":"0x02","tcp_flags_ts":"0x02"}}'
-
-  [[tests.outputs]]
-  extract_from = "parse_eve"
-
-    [[tests.outputs.conditions]]
-    type = "vrl"
-    source = '''
-    assert_eq!(.PROTOCOL, 6)
-    assert_eq!(.TCP_FLAGS, 2)
-    assert_eq!(.CLIENT_TCP_FLAGS, 2)
-    assert_eq!(.SERVER_TCP_FLAGS, 0)
-    assert_eq!(.FLOW_DURATION_MILLISECONDS, 999)
-    assert_eq!(.DST_TO_SRC_SECOND_BYTES, 0.0)
-    '''
-
-# -- Test 5: Duración cero — guarda de división por cero -----
 [[tests]]
-name = "zero_duration_division_guard"
-
-  [[tests.inputs]]
-  insert_at = "parse_eve"
-  type = "log"
-
-    [tests.inputs.log_fields]
-    message = '{"timestamp":"2026-05-15T10:28:00.000000+0000","event_type":"flow","proto":"TCP","flow":{"start":"2026-05-15T10:28:00.000000+0000","end":"2026-05-15T10:28:00.000000+0000","bytes_toserver":0,"pkts_toserver":0,"bytes_toclient":0,"pkts_toclient":0},"tcp":{"tcp_flags":"0x00"}}'
-
-  [[tests.outputs]]
-  extract_from = "parse_eve"
-
-    [[tests.outputs.conditions]]
-    type = "vrl"
-    source = '''
-    assert_eq!(.FLOW_DURATION_MILLISECONDS, 0)
-    assert_eq!(.SRC_TO_DST_SECOND_BYTES, 0.0)
-    assert_eq!(.DST_TO_SRC_SECOND_BYTES, 0.0)
-    '''
+name = "tcp_zero_duration_suspicious_port"
+[[tests.inputs]]
+insert_at = "parse_eve"
+type = "log"
+[tests.inputs.log_fields]
+message = '{"timestamp":"2026-05-15T10:28:00.000000+0000","event_type":"flow","proto":"TCP","src_port":33445,"dest_port":4444,"flow":{"start":"2026-05-15T10:28:00.000000+0000","end":"2026-05-15T10:28:00.000000+0000","bytes_toserver":0,"pkts_toserver":0,"bytes_toclient":0,"pkts_toclient":0},"tcp":{"tcp_flags":"0x00"}}'
+[[tests.outputs]]
+extract_from = "parse_eve"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.L4_DST_PORT, 4444)
+assert_eq!(.FLOW_DURATION_MILLISECONDS, 0)
+assert_eq!(.IN_BYTES, 0)
+assert_eq!(.OUT_BYTES, 0)
+'''
