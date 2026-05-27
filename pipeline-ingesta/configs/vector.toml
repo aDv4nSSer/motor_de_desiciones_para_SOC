@@ -55,13 +55,20 @@ out_pkts_raw  = int!(.flow.pkts_toclient)
 .OUT_BYTES = if out_bytes_raw > 1466528 { 1466528 } else if out_bytes_raw < 0 { 0 } else { out_bytes_raw }
 .OUT_PKTS  = if out_pkts_raw  > 1158    { 1158    } else if out_pkts_raw  < 0 { 0 } else { out_pkts_raw  }
 
-flags_all    = .tcp.tcp_flags    || "0x00"
-flags_client = .tcp.tcp_flags_ts || "0x00"
-flags_server = .tcp.tcp_flags_tc || "0x00"
+# --- Paso 5: TCP flags — hex string → int ---
+# Suricata puede emitir "0x1b" o "1b" dependiendo del contexto.
+# Normalizamos agregando "0x" si falta antes de parsear.
+flags_all_raw    = string!(.tcp.tcp_flags    || "00")
+flags_client_raw = string!(.tcp.tcp_flags_ts || "00")
+flags_server_raw = string!(.tcp.tcp_flags_tc || "00")
 
-tcp_flags_raw    = parse_int!(string!(flags_all))
-client_flags_raw = parse_int!(string!(flags_client))
-server_flags_raw = parse_int!(string!(flags_server))
+flags_all_hex    = if starts_with(flags_all_raw,    "0x") { flags_all_raw    } else { "0x" + flags_all_raw    }
+flags_client_hex = if starts_with(flags_client_raw, "0x") { flags_client_raw } else { "0x" + flags_client_raw }
+flags_server_hex = if starts_with(flags_server_raw, "0x") { flags_server_raw } else { "0x" + flags_server_raw }
+
+tcp_flags_raw    = parse_int!(flags_all_hex)
+client_flags_raw = parse_int!(flags_client_hex)
+server_flags_raw = parse_int!(flags_server_hex)
 
 .TCP_FLAGS        = if tcp_flags_raw    > 223 { 223 } else if tcp_flags_raw    < 0 { 0 } else { tcp_flags_raw    }
 .CLIENT_TCP_FLAGS = if client_flags_raw > 223 { 223 } else if client_flags_raw < 0 { 0 } else { client_flags_raw }
