@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import logging.config
 import os
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
 import uvicorn
 from fastapi import FastAPI
@@ -45,6 +47,14 @@ _API_VERSION = os.getenv("API_VERSION", "0.1.0")
 _API_DEBUG = os.getenv("FASTAPI_DEBUG", "false").lower() == "true"
 _ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
+    logger.info("api_startup", extra={"version": _API_VERSION, "debug": _API_DEBUG})
+    yield
+    logger.info("api_shutdown")
+
+
 app = FastAPI(
     title=_API_TITLE,
     version=_API_VERSION,
@@ -57,6 +67,7 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     debug=_API_DEBUG,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -73,16 +84,6 @@ app.include_router(predict_router)
 @app.get("/health", tags=["health"], summary="Health check")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": _API_VERSION}
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    logger.info("api_startup", extra={"version": _API_VERSION, "debug": _API_DEBUG})
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    logger.info("api_shutdown")
 
 
 # ---------------------------------------------------------------------------
