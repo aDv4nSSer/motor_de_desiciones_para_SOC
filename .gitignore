@@ -1,31 +1,47 @@
-# Estado interno de Vector (checkpoints, buffers)
+# --- Secretos y configuración local ---
+.env
+.env.local
+.env.*.local
+.secrets.baseline
+
+# --- Modelos ML ---
+*.pkl
+*.joblib
+models/
+
+# --- Estado interno de Vector (checkpoints, buffers) ---
 **/.vector-data/
 
-# Outputs temporales del pipeline
+# --- Outputs del pipeline ---
+outputs/
+*.jsonl
+*.jsonl.gz
 *.out
 *.log
 
-# Editor / IDE
+# --- Editor / IDE ---
 .vscode/
 .idea/
 *.swp
 *~
 
-# Python (notebooks de Joaquín, scripts de validación)
+# --- Python ---
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .pytest_cache/
 .ipynb_checkpoints/
+dist/
+build/
+*.egg-info/
 
-# Datos crudos (datasets pesados — NO versionar)
+# --- Datos crudos (datasets pesados — NO versionar) ---
 *.csv
 *.parquet
 *.pcap
 data/raw/
 
-# OS
+# --- OS ---
 .DS_Store
 Thumbs.db
-outputs/
