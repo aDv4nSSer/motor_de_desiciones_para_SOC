@@ -1,0 +1,161 @@
+Leyendo /mnt/d/tesis/proyecto_tesis/analisis/data/processed/NF-CICIDS2018-v3.parquet
+
+======================================================================
+Filas totales:    20,115,529
+Columnas totales: 13
+Columnas:         ['PROTOCOL', 'IN_BYTES', 'IN_PKTS', 'OUT_BYTES', 'OUT_PKTS', 'TCP_FLAGS', 'CLIENT_TCP_FLAGS', 'SERVER_TCP_FLAGS', 'FLOW_DURATION_MILLISECONDS', 'SRC_TO_DST_SECOND_BYTES', 'DST_TO_SRC_SECOND_BYTES', 'Label', 'Attack']
+======================================================================
+
+ESTADÍSTICAS (Golden Subset)
+----------------------------------------------------------------------
+                                 count          mean           std   min   25%    50%     75%           max
+PROTOCOL                    20115529.0     10.249357      5.554124   1.0   6.0    6.0    17.0  5.800000e+01
+IN_BYTES                    20115529.0    759.380457   2531.552174  28.0  67.0  146.0  1120.0  9.406000e+04
+IN_PKTS                     20115529.0      6.336313     17.850922   1.0   1.0    3.0     8.0  6.280000e+02
+OUT_BYTES                   20115529.0   2746.444612  32067.304705   0.0  92.0  192.0  1721.0  1.466817e+06
+OUT_PKTS                    20115529.0      6.265902     27.315275   0.0   1.0    2.0     7.0  1.159000e+03
+TCP_FLAGS                   20115529.0     69.794712     94.901537   0.0   0.0   23.0   219.0  2.230000e+02
+CLIENT_TCP_FLAGS            20115529.0     68.882988     95.192916   0.0   0.0   20.0   218.0  2.230000e+02
+SERVER_TCP_FLAGS            20115529.0     19.242358     26.133314   0.0   0.0   20.0    27.0  2.180000e+02
+FLOW_DURATION_MILLISECONDS  20115529.0  12035.139571  31592.932131   1.0   1.0   32.0  2450.0  1.205340e+05
+SRC_TO_DST_SECOND_BYTES     20115529.0     29.211376     99.196426   0.0   0.0    0.0     5.0  2.218944e+03
+DST_TO_SRC_SECOND_BYTES     20115529.0     14.964971     50.995972   0.0   0.0    0.0     3.0  2.015000e+03
+
+TIPOS DE DATOS
+----------------------------------------------------------------------
+PROTOCOL                        int16
+IN_BYTES                        int32
+IN_PKTS                         int32
+OUT_BYTES                       int32
+OUT_PKTS                        int32
+TCP_FLAGS                       int16
+CLIENT_TCP_FLAGS                int16
+SERVER_TCP_FLAGS                int16
+FLOW_DURATION_MILLISECONDS      int32
+SRC_TO_DST_SECOND_BYTES       float32
+DST_TO_SRC_SECOND_BYTES       float32
+
+======================================================================
+PRIMERAS 5 FILAS (formato JSON, casos de oro)
+======================================================================
+
+--- Fila 0 ---
+{
+  "PROTOCOL": 17.0,
+  "IN_BYTES": 156.0,
+  "IN_PKTS": 1.0,
+  "OUT_BYTES": 0.0,
+  "OUT_PKTS": 0.0,
+  "TCP_FLAGS": 0.0,
+  "CLIENT_TCP_FLAGS": 0.0,
+  "SERVER_TCP_FLAGS": 0.0,
+  "FLOW_DURATION_MILLISECONDS": 1.0,
+  "SRC_TO_DST_SECOND_BYTES": 0.0,
+  "DST_TO_SRC_SECOND_BYTES": 1.0
+}
+
+--- Fila 1 ---
+{
+  "PROTOCOL": 17.0,
+  "IN_BYTES": 805.0,
+  "IN_PKTS": 5.0,
+  "OUT_BYTES": 0.0,
+  "OUT_PKTS": 0.0,
+  "TCP_FLAGS": 0.0,
+  "CLIENT_TCP_FLAGS": 0.0,
+  "SERVER_TCP_FLAGS": 0.0,
+  "FLOW_DURATION_MILLISECONDS": 3003.0,
+  "SRC_TO_DST_SECOND_BYTES": 0.0,
+  "DST_TO_SRC_SECOND_BYTES": 0.0
+}
+
+--- Fila 2 ---
+{
+  "PROTOCOL": 17.0,
+  "IN_BYTES": 1288.0,
+  "IN_PKTS": 8.0,
+  "OUT_BYTES": 0.0,
+  "OUT_PKTS": 0.0,
+  "TCP_FLAGS": 0.0,
+  "CLIENT_TCP_FLAGS": 0.0,
+  "SERVER_TCP_FLAGS": 0.0,
+  "FLOW_DURATION_MILLISECONDS": 12058.0,
+  "SRC_TO_DST_SECOND_BYTES": 0.0,
+  "DST_TO_SRC_SECOND_BYTES": 0.0
+}
+
+--- Fila 3 ---
+{
+  "PROTOCOL": 17.0,
+  "IN_BYTES": 393.0,
+  "IN_PKTS": 3.0,
+  "OUT_BYTES": 0.0,
+  "OUT_PKTS": 0.0,
+  "TCP_FLAGS": 0.0,
+  "CLIENT_TCP_FLAGS": 0.0,
+  "SERVER_TCP_FLAGS": 0.0,
+  "FLOW_DURATION_MILLISECONDS": 48029.0,
+  "SRC_TO_DST_SECOND_BYTES": 0.0,
+  "DST_TO_SRC_SECOND_BYTES": 0.0
+}
+
+--- Fila 4 ---
+{
+  "PROTOCOL": 6.0,
+  "IN_BYTES": 373.0,
+  "IN_PKTS": 5.0,
+  "OUT_BYTES": 700.0,
+  "OUT_PKTS": 5.0,
+  "TCP_FLAGS": 27.0,
+  "CLIENT_TCP_FLAGS": 27.0,
+  "SERVER_TCP_FLAGS": 27.0,
+  "FLOW_DURATION_MILLISECONDS": 1.0,
+  "SRC_TO_DST_SECOND_BYTES": 700.0,
+  "DST_TO_SRC_SECOND_BYTES": 373.0
+}
+
+======================================================================
+VERIFICACIÓN DE FÓRMULA
+======================================================================
+Flujos analizados: 9,016,601 (44.8% del total)
+  F1: bytes/(ms/1000)  →  match ±1%:   0.0%
+  F2: bytes/ms         →  match ±1%:   0.6%
+
+Ejemplos comparativos (10 filas):
+    IN_BYTES  FLOW_DURATION_MILLISECONDS  SRC_TO_DST_SECOND_BYTES        calc_F1     calc_F2
+4        373                           1                    700.0  373000.000000  373.000000
+9         73                          63                      2.0    1158.730159    1.158730
+12        77                          17                      2.0    4529.411765    4.529412
+14       373                           1                      7.0  373000.000000  373.000000
+15        73                          76                      1.0     960.526316    0.960526
+18       373                           1                    700.0  373000.000000  373.000000
+20       360                           1                    454.0  360000.000000  360.000000
+22       373                           1                      7.0  373000.000000  373.000000
+23       373                           1                      7.0  373000.000000  373.000000
+24       373                           1                      7.0  373000.000000  373.000000
+
+======================================================================
+DISTRIBUCIÓN DE CLASES
+======================================================================
+Label
+0    17514626
+1     2600903
+
+TOP ATAQUES
+----------------------------------------------------------------------
+Attack
+Benign                      17514626
+DDOS_attack-HOIC             1032311
+FTP-BruteForce                386720
+DDoS_attacks-LOIC-HTTP        288589
+Bot                           207703
+SSH-Bruteforce                188474
+Infilteration                 188152
+DoS_attacks-SlowHTTPTest      105550
+DoS_attacks-Hulk              100076
+DoS_attacks-GoldenEye          61300
+DoS_attacks-Slowloris          36040
+DDOS_attack-LOIC-UDP            3450
+Brute_Force_-Web                1618
+Brute_Force_-XSS                 480
+SQL_Injection                    440

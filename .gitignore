@@ -28,3 +28,4 @@ data/raw/
 # OS
 .DS_Store
 Thumbs.db
+outputs/
