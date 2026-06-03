@@ -2,7 +2,11 @@
 .env
 .env.local
 .env.*.local
+HEAD
 # .secrets.baseline es config de detect-secrets y debe commitearse
+
+.secrets
+ 3dae4bf135053ae0601107675aa63d1e54fcddb9
 
 # --- Modelos ML ---
 *.pkl
