@@ -2,7 +2,7 @@
 .env
 .env.local
 .env.*.local
-.secrets.baseline
+.secrets
 
 # --- Modelos ML ---
 *.pkl
