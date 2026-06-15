@@ -111,3 +111,29 @@
 
 **Evidencia:** [Métricas, comandos, resultados que respaldan]
 ```
+
+---
+
+## H6 — Isolation Forest mejora con features derivadas y segmentación por respuesta
+
+**Fecha:** 2026-06-15
+**Contexto:** Tras el fracaso del Isolation Forest crudo (H4, 20.9% recall), se probaron features derivadas de comportamiento (ratio_pkts, pkts_per_sec, bytes_per_pkt, is_no_response) y segmentación del corpus por presencia de respuesta del servidor (OUT_PKTS>0).
+
+**Hallazgo:** El modelo "general" con features derivadas sigue pobre (11.3% recall). Pero el modelo entrenado SOLO sobre flows con respuesta del servidor (sesiones completadas) alcanza:
+- Contaminación 0.05: recall 26.6%, FPR 4.6% (excelente precisión)
+- Contaminación 0.25: recall 55.6%, FPR 24.2%
+
+La diferencia confirma que las anomalías de comportamiento (C2, exfiltración, brute force completado) solo son detectables en flows con sesión establecida. Los escaneos (97% del corpus) ahogan la señal en el modelo general.
+
+**Decisión:** Adoptar arquitectura de Isolation Forest segmentado — aplicar el detector de anomalías únicamente a flows con OUT_PKTS>0. Para escaneos, confiar en LightGBM + reglas. A medida que Cowrie genere más sesiones SSH completas, el corpus de ataques-con-respuesta (hoy 2.693) crecerá y mejorará el recall.
+
+**Evidencia:**
+
+| Modelo | Mejor cont | Recall | FPR | F1 |
+|--------|-----------|--------|-----|-----|
+| General (crudo, H4) | 0.25 | 20.9% | 24.9% | 0.269 |
+| General (derivado) | 0.25 | 11.3% | 24.9% | 0.155 |
+| Solo-con-respuesta | 0.05 | 26.6% | 4.6% | 0.296 |
+| Solo-con-respuesta | 0.25 | 55.6% | 24.2% | 0.256 |
+
+**Limitación actual:** solo 2.693 ataques con respuesta en el corpus. Dependiente del crecimiento vía honeypot (H5).
