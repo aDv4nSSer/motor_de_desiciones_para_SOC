@@ -137,3 +137,26 @@ La diferencia confirma que las anomalías de comportamiento (C2, exfiltración, 
 | Solo-con-respuesta | 0.25 | 55.6% | 24.2% | 0.256 |
 
 **Limitación actual:** solo 2.693 ataques con respuesta en el corpus. Dependiente del crecimiento vía honeypot (H5).
+
+---
+
+## H7 — Desajuste de features entre entrenamiento e inferencia del Isolation Forest
+
+**Fecha:** 2026-06-15
+**Contexto:** Tras integrar el Isolation Forest al motor (model.py), un flow de prueba (sesión SSH de 8s, 50 paquetes) recibía anomaly_score de 0.08 — absurdamente bajo para tráfico que debería ser anómalo.
+
+**Hallazgo:** El model.py tenía tres desajustes con el entrenamiento (train_isolation_forest_v2.py):
+1. No cargaba ni aplicaba el RobustScaler — pasaba features crudos a un modelo entrenado con datos escalados.
+2. No calculaba las 6 features derivadas (ratio_pkts, pkts_per_sec, etc.) — pasaba 4 features a un modelo que espera 11.
+3. La normalización del score usaba un rango incorrecto.
+
+El modelo recibía datos en un formato incompatible con su entrenamiento, produciendo scores sin sentido.
+
+**Decisión:** Reescribir model.py para replicar EXACTAMENTE el pipeline de entrenamiento: clip a límites del contrato → cálculo de las 11 features derivadas → transform con el scaler guardado → score_samples. Principio: la transformación de features en inferencia debe ser idéntica a la de entrenamiento.
+
+**Evidencia:**
+- Antes: anomaly_score 0.08 (datos mal formateados)
+- Después: anomaly_score 0.9611 (sesión SSH correctamente detectada como anómala)
+- El flow pasó de T0 (ALLOW) a T1 (LOG) gracias al detector de anomalías.
+
+**Lección de diseño:** Cualquier transformación aplicada en entrenamiento (escalado, features derivadas, clipping) DEBE guardarse y aplicarse idénticamente en inferencia. Un scaler desalineado degrada silenciosamente el modelo sin lanzar errores.
