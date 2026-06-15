@@ -1,0 +1,16 @@
+[Unit]
+Description=Cowrie SSH Honeypot
+After=network.target
+
+[Service]
+Type=forking
+User=cowrie
+WorkingDirectory=/home/cowrie/cowrie
+ExecStart=/home/cowrie/cowrie/cowrie-env/bin/cowrie start
+ExecStop=/home/cowrie/cowrie/cowrie-env/bin/cowrie stop
+PIDFile=/home/cowrie/cowrie/var/run/cowrie.pid
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

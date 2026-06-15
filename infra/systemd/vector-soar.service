@@ -1,0 +1,14 @@
+[Unit]
+Description=Vector SOAR Pipeline
+After=network.target suricata.service
+Requires=suricata.service
+
+[Service]
+Type=simple
+User=aiayala
+ExecStart=/usr/bin/vector --config /home/aiayala/tesis/motor_decisiones_soc/pipeline-ingesta/configs/vector.production.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
