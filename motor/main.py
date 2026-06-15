@@ -1,0 +1,131 @@
+"""
+main.py — Motor de Decisiones SOC v2
+FastAPI: recibe flows de Vector (single o batch), clasifica con ML, publica a Redis.
+Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
+"""
+import uuid, logging, time
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+
+from schemas import FlowFeatures, DecisionResponse, RiskTier
+from model import get_model
+from redis_client import publish_decision, publish_flow
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s"
+)
+log = logging.getLogger("motor")
+
+T3_CLASSTYPES = {
+    "trojan-activity", "shellcode-detect", "web-application-attack",
+    "attempted-admin", "attempted-user", "successful-admin", "policy-violation",
+}
+
+TIER_NAMES = {0: "T0_BENIGNO", 1: "T1_BAJO", 2: "T2_MEDIO", 3: "T3_CRITICO"}
+DECISIONS  = {0: "ALLOW", 1: "LOG", 2: "ALERT", 3: "BLOCK"}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Motor SOC iniciando...")
+    model = get_model()
+    log.info(f"Modelo cargado: {model.model_version}")
+    yield
+    log.info("Motor SOC detenido.")
+
+app = FastAPI(
+    title="Motor de Decisiones SOC",
+    description="Motor de riesgo calibrado con ML para SOAR en SOC — Tesis UBO",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
+    """Procesa un evento y retorna la decisión."""
+    t_start = time.perf_counter()
+    model   = get_model()
+
+    try:
+        flow     = FlowFeatures(**event_data)
+        features = flow.model_dump()
+    except Exception as e:
+        log.error(f"Validación fallida: {e} | body: {str(event_data)[:200]}")
+        return {"trace_id": trace_id, "error": str(e), "tier": 0, "decision": "ALLOW"}
+
+    classtype_override = classtype.lower() in T3_CLASSTYPES
+    scores = model.predict(features)
+    tier   = 3 if classtype_override else model.tier(scores["risk_score"])
+
+    response = {
+        "trace_id":           trace_id,
+        "tier":               tier,
+        "tier_name":          TIER_NAMES[tier],
+        "risk_score":         scores["risk_score"],
+        "anomaly_score":      scores["anomaly_score"],
+        "ml_score":           scores["ml_score"],
+        "decision":           DECISIONS[tier],
+        "classtype_override": classtype_override,
+        "model_version":      model.model_version,
+        "features_used": {
+            "SERVER_TCP_FLAGS":           features["SERVER_TCP_FLAGS"],
+            "OUT_PKTS":                   features["OUT_PKTS"],
+            "FLOW_DURATION_MILLISECONDS": features["FLOW_DURATION_MILLISECONDS"],
+            "L4_DST_PORT":               features["L4_DST_PORT"],
+        }
+    }
+
+    publish_flow(trace_id, features)
+    publish_decision(trace_id, features, response)
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    if elapsed_ms > 100:
+        log.warning(f"Fast Path lento: {elapsed_ms:.1f}ms [trace={trace_id}]")
+
+    log.info(
+        f"[{trace_id[:8]}] tier={tier} score={scores['risk_score']:.3f} "
+        f"port={features['L4_DST_PORT']} elapsed={elapsed_ms:.1f}ms"
+    )
+    return response
+
+# ── Endpoint principal ─────────────────────────────────────────────────────────
+@app.post("/decide")
+async def decide(request: Request):
+    """
+    Fast Path (<100ms): acepta un evento único o array de eventos de Vector.
+    """
+    try:
+        body = await request.json()
+    except Exception as e:
+        log.error(f"JSON inválido: {e}")
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+
+    classtype = request.headers.get("X-Suricata-Classtype", "")
+    trace_id  = request.headers.get("X-Trace-Id", str(uuid.uuid4()))
+
+    # Vector puede enviar un objeto único o un array de objetos (batch)
+    events = body if isinstance(body, list) else [body]
+
+    results = [process_event(ev, str(uuid.uuid4()), classtype) for ev in events]
+
+    # Si Vector envió un solo evento, retornar un objeto; si batch, retornar lista
+    return results[0] if len(results) == 1 else results
+
+# ── Health ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    model = get_model()
+    return {
+        "status":        "ok",
+        "model_version": model.model_version,
+        "model_real":    model.lgbm is not None,
+        "iforest_real":  model.iforest is not None,
+    }
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Motor de Decisiones SOC",
+        "version": "0.2.0",
+        "endpoints": {"POST /decide": "Clasificar flow", "GET /health": "Estado"}
+    }
