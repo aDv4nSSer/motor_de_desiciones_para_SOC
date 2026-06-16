@@ -216,14 +216,15 @@ def cargar_registro_campanas():
                 registros[ip].append({
                     "desde": fecha - timedelta(minutes=5),
                     "hasta": fecha + timedelta(minutes=35),
-                    "tipos": tipos
+                    "tipos": tipos,
+                    "puertos_excluir": r.get("puertos_excluir", [])
                 })
             except:
                 continue
     log(f"  Campañas cargadas: {sum(len(v) for v in registros.values())} de {len(registros)} IPs")
     return registros
 
-def get_label_campana(src_ip, timestamp_str, campanas):
+def get_label_campana(src_ip, timestamp_str, campanas, dest_port=0):
     if src_ip not in campanas:
         return None
     try:
@@ -236,6 +237,8 @@ def get_label_campana(src_ip, timestamp_str, campanas):
         desde = c["desde"].replace(tzinfo=timezone.utc) if c["desde"].tzinfo is None else c["desde"]
         hasta = c["hasta"].replace(tzinfo=timezone.utc) if c["hasta"].tzinfo is None else c["hasta"]
         if desde <= ts <= hasta:
+            if dest_port in c.get("puertos_excluir", []):
+                return None
             return 1, f"campaña:{'+'.join(c['tipos'])}", "alta"
     return None
 
@@ -355,7 +358,7 @@ def main():
                 abuse_score = cache.get(src_ip, {}).get("score", -1)
 
             # Prioridad 0: campaña controlada (más alta)
-            camp_result = get_label_campana(src_ip, r.get("timestamp",""), campanas)
+            camp_result = get_label_campana(src_ip, r.get("timestamp",""), campanas, dest_port)
             if camp_result:
                 label, razon, confianza = camp_result
             else:

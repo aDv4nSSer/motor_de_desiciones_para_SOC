@@ -160,3 +160,16 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 - El flow pasó de T0 (ALLOW) a T1 (LOG) gracias al detector de anomalías.
 
 **Lección de diseño:** Cualquier transformación aplicada en entrenamiento (escalado, features derivadas, clipping) DEBE guardarse y aplicarse idénticamente en inferencia. Un scaler desalineado degrada silenciosamente el modelo sin lanzar errores.
+
+## H8 — Colisión entre IP del investigador e IP atacante en etiquetado por campaña
+
+**Fecha:** 2026-06-15
+**Contexto:** Al revisar flows de la IP 190.114.34.111 (IP actual del investigador), se detectaron sesiones SSH largas en puerto 2222 con OUT_PKTS de 299-1656 y duraciones de 15-23 minutos. El registro de campañas tenía esa IP como atacante.
+
+**Hallazgo:** El etiquetador v3 etiquetaba TODOS los flows de la IP atacante como label=1 sin distinguir el puerto. Las sesiones SSH legítimas de administración del investigador habrían quedado etiquetadas como ataque, contaminando el corpus.
+
+**Decisión:** Agregar campo puertos_excluir al registro_campanas.jsonl. El etiquetador verifica si dest_port está en la lista de exclusión antes de asignar label=1.
+
+**Evidencia:** 281 flows desde 190.114.34.111 el 15-06-2026. Puerto 2222: DUR=1383s, OUT_PKTS=1656 (sesión SSH legítima). Puerto 8080: DUR=13s, OUT_PKTS=953 (HTTP flood de campaña).
+
+**Lección:** En entornos donde el investigador usa la misma IP para trabajar y atacar, el etiquetado por IP sin filtro de puerto introduce ruido en el corpus.
