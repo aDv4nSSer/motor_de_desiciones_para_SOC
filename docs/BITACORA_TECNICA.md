@@ -173,3 +173,18 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 **Evidencia:** 281 flows desde 190.114.34.111 el 15-06-2026. Puerto 2222: DUR=1383s, OUT_PKTS=1656 (sesión SSH legítima). Puerto 8080: DUR=13s, OUT_PKTS=953 (HTTP flood de campaña).
 
 **Lección:** En entornos donde el investigador usa la misma IP para trabajar y atacar, el etiquetado por IP sin filtro de puerto introduce ruido en el corpus.
+
+---
+
+## H9 — Cowrie caído 3 días por PATH faltante en servicio systemd
+
+**Fecha:** 2026-06-18
+**Contexto:** Al revisar el estado de Cowrie el 18 de junio, se detectó que llevaba inactivo desde el 15 de junio a las 23:17 — exactamente después de la sesión de ataques controlados y el reinicio de UFW.
+
+**Hallazgo:** El servicio systemd de Cowrie no tenía configurada la variable de entorno PATH del virtualenv. Al intentar iniciar, Cowrie ejecuta `os.execvp("twistd", ...)` pero systemd no incluye el directorio `cowrie-env/bin/` en el PATH del proceso, causando `FileNotFoundError`.
+
+**Decisión:** Agregar `Environment=PATH=/home/cowrie/cowrie/cowrie-env/bin:...` al archivo cowrie.service. Cowrie reiniciado exitosamente.
+
+**Impacto:** 3 días sin captura de sesiones SSH reales (15-18 junio). El corpus perdió aproximadamente 3-4 días de sesiones Cowrie estimadas en 50-100 sesiones adicionales.
+
+**Lección:** Los servicios systemd que usan virtualenvs de Python deben declarar explícitamente el PATH del virtualenv en la configuración del servicio, ya que systemd no hereda el PATH del usuario.

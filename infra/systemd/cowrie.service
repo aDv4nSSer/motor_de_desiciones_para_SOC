@@ -6,6 +6,7 @@ After=network.target
 Type=forking
 User=cowrie
 WorkingDirectory=/home/cowrie/cowrie
+Environment=PATH=/home/cowrie/cowrie/cowrie-env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/home/cowrie/cowrie/cowrie-env/bin/cowrie start
 ExecStop=/home/cowrie/cowrie/cowrie-env/bin/cowrie stop
 PIDFile=/home/cowrie/cowrie/var/run/cowrie.pid
