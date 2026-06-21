@@ -5,7 +5,36 @@ Soporta: modelo real de Joaquín (LightGBM) + Isolation Forest (anomalías) o pl
 CORRECCIÓN v2: el Isolation Forest ahora aplica correctamente el scaler y las
 features derivadas, igual que en el entrenamiento (train_isolation_forest_v2.py).
 """
-import os, json, logging, numpy as np
+import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.isotonic import IsotonicRegression
+
+
+class CalibratedLightGBM(BaseEstimator, ClassifierMixin):
+    """Wrapper LightGBM + calibrador isotonico.
+    Debe estar definida ANTES de joblib.load() para que el .pkl deserialice correctamente.
+    """
+    def __init__(self, base_model=None, calibrator=None):
+        self.base_model = base_model
+        self.calibrator = calibrator
+
+    def fit(self, X, y):
+        return self
+
+    def predict_proba(self, X):
+        raw = self.base_model.predict_proba(X)[:, 1]
+        if self.calibrator is not None:
+            cal = np.clip(self.calibrator.predict(raw), 0.0, 1.0)
+        else:
+            cal = raw
+        return np.column_stack([1 - cal, cal])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+import os, json, logging, sys
+import numpy as np
 from pathlib import Path
 
 log = logging.getLogger("motor.model")
@@ -26,6 +55,10 @@ CLIP_MAX = {
     "SERVER_TCP_FLAGS": 218, "OUT_PKTS": 1158,
     "FLOW_DURATION_MILLISECONDS": 120534, "L4_DST_PORT": 65535, "IN_PKTS": 628,
 }
+
+# Registrar CalibratedLightGBM en __main__ para que joblib pueda deserializar
+import __main__
+__main__.CalibratedLightGBM = CalibratedLightGBM
 
 class MotorModel:
     def __init__(self):
