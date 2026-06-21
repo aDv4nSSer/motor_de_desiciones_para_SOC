@@ -188,3 +188,33 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 **Impacto:** 3 días sin captura de sesiones SSH reales (15-18 junio). El corpus perdió aproximadamente 3-4 días de sesiones Cowrie estimadas en 50-100 sesiones adicionales.
 
 **Lección:** Los servicios systemd que usan virtualenvs de Python deben declarar explícitamente el PATH del virtualenv en la configuración del servicio, ya que systemd no hereda el PATH del usuario.
+
+---
+
+## H10 — Feature contract rechaza sesiones largas: limitación del Golden 4
+
+**Fecha:** 2026-06-21
+**Contexto:** Durante la validación del modelo LightGBM v7.1 integrado al motor, se probaron flows de brute force SSH real con FLOW_DURATION_MILLISECONDS=900.000ms (15 minutos), como los que captura Cowrie.
+
+**Hallazgo:** El feature contract define FLOW_DURATION_MILLISECONDS con límite superior de 120.534ms (≈2 minutos). Flows que superen ese límite son rechazados por validación Pydantic y el motor devuelve ALLOW por defecto — sin analizar el flujo. Esto significa que sesiones SSH largas reales quedan fuera del rango de detección del motor.
+
+**Resultados de validación completa del modelo (21 junio 2026):**
+
+| Patrón | ML score | IForest | Tier | Veredicto |
+|--------|----------|---------|------|-----------|
+| Escaneo SSH (OUT=0, DUR=0) | 0.61 | 0.43 | T2 ALERT | ✓ correcto |
+| Escaneo RDP (OUT=0, DUR=0) | 0.61 | 0.63 | T2 ALERT | ✓ correcto |
+| Escaneo PostgreSQL (OUT=0) | 0.61 | 0.70 | T2 ALERT | ✓ correcto |
+| Slow HTTP (SYN=2, DUR=25s) | 1.00 | 0.64 | T3 BLOCK | ✓ excelente |
+| SQL Injection (8080, 120ms) | 1.00 | 0.34 | T3 BLOCK | ✓ excelente |
+| Credential stuffing (8080) | 0.99 | 0.72 | T3 BLOCK | ✓ excelente |
+| Exfiltración (OUT=950pkts) | 0.27 | 1.00 | T1 LOG | ⚠ solo IForest |
+| Telnet completado (23, 5s) | 0.00 | 0.96 | T1 LOG | ⚠ IF detecta, ML no |
+| C2 beacon (4444, 30s) | 0.49 | 0.53 | T1 LOG | ⚠ ambiguo |
+| Web benigno (80, 250ms) | 0.49 | 0.37 | T1 LOG | ✓ no bloqueado |
+| SSH sesión real (22, 8s) | 0.00 | 0.96 | T1 LOG | ~ aceptable |
+| SSH brute force (900s) | ERROR | — | T0 ALLOW | ✗ fuera de rango |
+
+**Decisión:** Documentar como limitación conocida del Golden 4 para la defensa de noviembre. El rango fue definido sobre el dataset académico Queensland donde las sesiones largas son raras. Para producción real, se recomienda clipear los flows largos al límite máximo (120.534ms) en Vector antes de enviarlo al motor, en lugar de rechazarlos.
+
+**Valor para la tesis:** Demuestra que el sistema fue validado con casos reales, que se identificaron sus límites con precisión, y que el diseño híbrido ML+IForest compensa las debilidades del modelo supervisado en sesiones completadas.
