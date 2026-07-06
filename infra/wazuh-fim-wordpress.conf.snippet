@@ -1,0 +1,27 @@
+<!--
+  Snippet de configuracion FIM (syscheck) para WordPress/educasex en .138.
+  Agregar dentro del bloque <syscheck> de /var/ossec/etc/ossec.conf del AGENTE.
+  Hallazgo H12 (docs/BITACORA_TECNICA.md) - 2026-07-05.
+
+  Nota sobre 'restrict': usa sregex de Wazuh, NO PCRE completo.
+  No soporta grupos con alternancia tipo (a|b|c) - deben repetirse
+  patrones completos separados por '|' en el nivel superior.
+-->
+
+<!-- WordPress educasex (Docker) - ampliacion FIM, hallazgo H12 -->
+<directories realtime="yes" recursion_level="0">/var/lib/docker/volumes/web_wp_educasex_data/_data</directories>
+<directories realtime="yes">/var/lib/docker/volumes/web_wp_educasex_data/_data/wp-admin</directories>
+<directories realtime="yes">/var/lib/docker/volumes/web_wp_educasex_data/_data/wp-includes</directories>
+<directories realtime="yes">/var/lib/docker/volumes/web_wp_educasex_data/_data/wp-content/plugins</directories>
+<directories realtime="yes">/var/lib/docker/volumes/web_wp_educasex_data/_data/wp-content/themes</directories>
+<directories realtime="yes" restrict=".php$|.phtml$|.phar$|.php[0-9]$">/var/lib/docker/volumes/web_wp_educasex_data/_data/wp-content/uploads</directories>
+<directories realtime="yes">/opt/web</directories>
+
+<!--
+  Frecuencia de escaneo bajada de 12h (43200s) a 5min (300s) SOLO para
+  syscheck. Mitigacion del bug de deteccion realtime documentado en H12
+  (eventos inotify confirmados via pyinotify, pero wazuh-syscheckd no
+  los procesa para directorios agregados en caliente). rootcheck se
+  mantuvo en 43200s - no tocar ese valor por error, como paso hoy.
+-->
+<frequency>300</frequency>

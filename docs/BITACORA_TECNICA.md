@@ -218,3 +218,79 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 **Decisión:** Documentar como limitación conocida del Golden 4 para la defensa de noviembre. El rango fue definido sobre el dataset académico Queensland donde las sesiones largas son raras. Para producción real, se recomienda clipear los flows largos al límite máximo (120.534ms) en Vector antes de enviarlo al motor, en lugar de rechazarlos.
 
 **Valor para la tesis:** Demuestra que el sistema fue validado con casos reales, que se identificaron sus límites con precisión, y que el diseño híbrido ML+IForest compensa las debilidades del modelo supervisado en sesiones completadas.
+
+---
+
+## H11 — API de Wazuh: payload incompatible en Active Response on-demand
+
+**Fecha:** 2026-07-04
+**Contexto:** Activación de R2 en modo enforce (bloqueo real vía Wazuh Active Response), tras validar R1/R2 en dry_run el 22 de junio.
+
+**Hallazgo:** El payload inicial de enforcer.py (WazuhAPIEnforcer.block) fallaba con 400 Bad Request en TODAS las IPs reales, mientras que la autenticación (POST /security/user/authenticate) funcionaba correctamente. La salvaguarda de degradación diseñada en R2 funcionó como se esperaba: el motor no crasheó, solo registró block_skipped con el error. Se identificaron tres causas combinadas:
+1. Faltaba el prefijo "!" en el nombre del comando ("!firewall-drop" en vez de "firewall-drop") — sin él, la API busca un binding <active-response> ya configurado en ossec.conf (inexistente en este manager), en vez de ejecutar el script directamente.
+2. El campo "custom" es inválido en la API de Wazuh 4.14.5 y causa rechazo total del request (mensaje exacto: "Invalid field found {'custom'}").
+3. La IP debe enviarse en alert.data.srcip, no en arguments — formato que espera internamente el script firewall-drop.
+
+**Decisión:** Corregido el body en WazuhAPIEnforcer.block() a:
+`{"command": f"!{wazuh_ar_command}", "alert": {"data": {"srcip": ip}}}`
+Validado primero con curl manual aislado antes de reiniciar el worker, para descartar fallos en el resto del pipeline.
+
+**Evidencia:** Bloqueo real confirmado en iptables del agente .138 sobre 3 IPs con abuse=100 en AbuseIPDB (85.217.149.73, 160.119.71.136, 91.231.89.90), TTL=1800s, ejecutados automáticamente por el worker en producción.
+
+**Lección de diseño:** Un 400 Bad Request en la primera llamada real (no en pruebas triviales) es la razón por la que probar el payload exacto con curl antes de activar el modo enforce en el pipeline completo ahorra ciclos de debugging — el error habría sido indistinguible de un problema de red o credenciales sin aislar la llamada.
+
+---
+
+## H12 — FIM ampliado a WordPress + bugs de sintaxis restrict y limitación de tiempo real
+
+**Fecha:** 2026-07-05
+**Contexto:** El análisis de "qué pasa si un atacante traspasa el perímetro" llevó a auditar el alcance real del FIM de Wazuh en .138 (servidor web). Se encontró que syscheck solo vigilaba rutas del sistema operativo (/etc, /usr/bin, etc.), dejando el webroot completo de WordPress/educasex sin ningún tipo de monitoreo de integridad.
+
+**Hallazgo:** Se amplió syscheck para cubrir wp-admin, wp-includes, wp-content/plugins, wp-content/themes (vigilancia completa) y wp-content/uploads (vigilancia restringida solo a ejecutables vía atributo restrict, dado que ahí hay escritura legítima constante de WordPress). Surgieron dos problemas reales:
+1. La sintaxis inicial del restrict (`\.(php|phtml|phar|php[0-9])$`, con grupo de alternancia entre paréntesis) es sintaxis PCRE no soportada por el motor sregex de Wazuh — el filtro coincidía con cero archivos en vez de fallar visiblemente. Corregido a `.php$|.phtml$|.phar$|.php[0-9]$` (patrones repetidos, sin paréntesis, sin escapar el punto), siguiendo el ejemplo oficial de Wazuh.
+2. Tras corregir el restrict, el escaneo por lotes detecta y filtra correctamente (validado: 471 archivos en uploads/, solo 4 .php capturados). Pero la detección en tiempo real (realtime, basada en inotify) no procesa archivos nuevos en ninguna carpeta agregada — confirmado que el kernel entrega los eventos correctamente (probado con pyinotify de forma aislada), así que el problema está específicamente en cómo wazuh-syscheckd consume esos eventos. Sospecha no confirmada: relacionada a los ciclos de reconexión agente-manager (ver Pendientes).
+
+**Decisión:** Mitigación mientras se investiga la causa raíz del bug de realtime: frecuencia del escaneo programado bajada de 12h a 5 minutos para syscheck (rootcheck se mantuvo en 12h). Acota la ventana de exposición de "hasta 12 horas sin detectar un webshell" a "hasta 5 minutos", con el restrict funcionando correctamente en modo batch.
+
+**Evidencia:** 471 archivos totales bajo uploads/, 4 correctamente capturados con el restrict corregido (3 pruebas .php + 1 index.php legítimo de plugin). pyinotify confirmó entrega de eventos IN_CREATE/IN_CLOSE_WRITE del kernel en <1s. auditd/whodata evaluado como alternativa pero no instalado — queda para noviembre.
+
+---
+
+## H13 — Segunda forma de respuesta activa: cuarentena de archivo para compromiso interno
+
+**Fecha:** 2026-07-05 / 2026-07-06
+**Contexto:** El análisis de "qué pasa si un atacante traspasa el perímetro" identificó que R2 solo sabe ejecutar una acción (bloqueo de IP externa vía firewall-drop), que no sirve si el compromiso ya ocurrió dentro de la infraestructura propia (protegida además por la safelist, correctamente). Se diseñó e implementó una segunda forma de Active Response: cuarentena de archivo, disparable cuando el FIM (H12) detecta un ejecutable nuevo en una carpeta de solo-uploads — señal de alta confianza de webshell.
+
+**Hallazgo:** El script (quarantine-file, Python, registrado como Active Response custom) mueve el archivo sospechoso fuera del webroot servible a /var/ossec/quarantine/, con permisos 000 y un archivo .origin para trazabilidad/restauración manual — preserva evidencia en vez de borrar. Restringido por diseño a rutas dentro del webroot de educasex. Surgieron dos bugs de ingeniería no triviales:
+1. Wazuh resolvió el `<executable>` configurado (quarantine-file.py) sin la extensión al invocar el script (invocó active-response/bin/quarantine-file, sin .py) — el archivo no existía con ese nombre exacto, sin error explícito, solo silencio. Corregido renombrando el script sin extensión (mismo patrón que los binarios nativos de Wazuh).
+2. Bug más serio: el script usaba `sys.stdin.read()` (espera EOF) en vez de `sys.stdin.readline()` (espera \n). Wazuh no cierra el pipe de stdin tras enviar el JSON (protocolo de handshake check_keys/continue), así que el script quedó colgado indefinidamente esperando un EOF que nunca llega — deadlock clásico, advertido en la documentación oficial de Wazuh pero no verificado en el desarrollo inicial. Esto bloqueó wazuh-execd por completo durante ~3 minutos, deteniendo los bloqueos reales de R2 (firewall-drop) para tráfico malicioso real en producción durante esa ventana. Detectado por ausencia de actividad en active-responses.log, confirmado con ps aux (proceso python3 huérfano en estado sleeping), resuelto matando el proceso y corrigiendo el código.
+
+**Decisión:** quarantine-file.py → quarantine-file (sin extensión). readline() en vez de read(). Validado el ciclo completo (FIM detecta archivo → API dispara cuarentena → archivo movido con permisos 000 → firewall-drop sigue operando en paralelo sin bloquearse) antes de dar el hallazgo por cerrado.
+
+**Evidencia:** 3 archivos de prueba puestos en cuarentena exitosamente tras el fix. Confirmado que firewall-drop procesó tráfico real (IPs con abuse=100) inmediatamente antes y después del incidente de deadlock, acotando el impacto real a ~3 minutos.
+
+**Lección de diseño:** un script de Active Response que se cuelga no solo falla su propia acción — bloquea TODO el pipeline de respuesta activa del agente, incluidas acciones ya validadas en producción (R2/firewall-drop). Todo script custom de AR debe probarse con `timeout` en pruebas manuales antes de conectarlo al pipeline real, y debe seguir el protocolo de lectura por línea (readline), no por EOF (read).
+
+**Pendiente para noviembre:** la Pieza A del diseño (traer alertas FIM del manager de vuelta al motor de decisiones para clasificación automática T3) no se implementó — hoy la cuarentena se disparó manualmente vía API para validar el mecanismo, no automáticamente desde una alerta real.
+
+---
+
+## H14 — Timeout de systemd insuficiente en wazuh-manager.service
+
+**Fecha:** 2026-07-05
+**Contexto:** Un `systemctl restart wazuh-manager` (necesario para cargar el comando de H13) falló con timeout, marcando el servicio como failed pese a que los daemons reales (incluidos wazuh-analysisd y wazuh-remoted) seguían arrancando y terminaban operativos como procesos huérfanos.
+
+**Hallazgo:** El unit de systemd de Wazuh trae TimeoutSec=45, insuficiente para un arranque completo bajo carga real (~40-50s medidos, margen ajustado). systemd mata el proceso ExecStart al cumplirse el timeout, pero los daemons ya lanzados sobreviven como huérfanos y siguen funcionando — generando un falso "failed" que no refleja el estado real del servicio.
+
+**Decisión:** Override permanente vía drop-in de systemd (/etc/systemd/system/wazuh-manager.service.d/override.conf), sin modificar el unit file del paquete. TimeoutStartSec=180, TimeoutStopSec=60.
+
+**Evidencia:** Tras el override, `systemctl restart wazuh-manager` completa limpio (active (running), status=0/SUCCESS) sin intervención manual con wazuh-control.
+
+**Lección de diseño:** un estado "failed" de systemd no siempre significa que el servicio esté caído — puede ser un falso negativo de monitoreo. Verificar el estado funcional real (agent_control -l, API respondiendo) antes de asumir una falla real.
+
+---
+
+## Pendientes detectados (no resueltos hoy)
+
+- **Inestabilidad de conexión periódica agente-manager:** patrón recurrente (~cada hora) de "Agent key already in use", "Response timeout", "Cannot send request to agent" entre .139 y .138. Causa no confirmada — candidatos: desincronización de reloj, proceso periódico en .138 reiniciando la conexión, configuración de keepalive. Pendiente investigar antes de noviembre, puede explicar fallos silenciosos de Active Response a futuro.
+- **20 reglas de threat intel inactivas** (IDs 99901-99920): referencian listas IOC (malicious-ioc/malware-hashes, malicious-ip, malicious-domains) que nunca se cargaron con contenido real. Las reglas existen pero no tienen efecto. Pendiente decidir si se completan con feeds reales o se eliminan del ruleset.
