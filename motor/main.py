@@ -5,12 +5,14 @@ Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
 import uuid, logging, time
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
 
 from schemas import FlowFeatures, DecisionResponse, RiskTier
 from model import get_model
 from redis_client import publish_decision, publish_flow
+from response.queue import enqueue_response_task
+from dashboard import get_stats, get_recent_decisions, get_active_blocks, get_recent_responses
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,10 +77,22 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
         }
     }
 
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    response["latency_ms"] = round(elapsed_ms, 2)
+
     publish_flow(trace_id, features)
     publish_decision(trace_id, features, response)
+    enqueue_response_task(
+        trace_id=trace_id,
+        tier=tier,
+        risk_score=scores["risk_score"],
+        src_ip=event_data.get("IPV4_SRC_ADDR") or event_data.get("src_ip"),
+        dst_ip=event_data.get("IPV4_DST_ADDR") or event_data.get("dst_ip"),
+        dst_port=features["L4_DST_PORT"],
+        classtype=classtype,
+        classtype_override=classtype_override,
+    )
 
-    elapsed_ms = (time.perf_counter() - t_start) * 1000
     if elapsed_ms > 100:
         log.warning(f"Fast Path lento: {elapsed_ms:.1f}ms [trace={trace_id}]")
 
@@ -129,3 +143,25 @@ async def root():
         "version": "0.2.0",
         "endpoints": {"POST /decide": "Clasificar flow", "GET /health": "Estado"}
     }
+
+# ── Dashboard: endpoints de solo lectura ────────────────────────────────────
+@app.get("/api/dashboard/stats")
+async def dashboard_stats(window_minutes: int = 60):
+    return get_stats(window_minutes)
+
+@app.get("/api/dashboard/decisions")
+async def dashboard_decisions(limit: int = 50):
+    return get_recent_decisions(min(limit, 200))
+
+@app.get("/api/dashboard/blocks/active")
+async def dashboard_blocks_active():
+    return get_active_blocks()
+
+@app.get("/api/dashboard/blocks/recent")
+async def dashboard_blocks_recent(limit: int = 50):
+    return get_recent_responses(min(limit, 200))
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    with open("dashboard.html", encoding="utf-8") as f:
+        return f.read()

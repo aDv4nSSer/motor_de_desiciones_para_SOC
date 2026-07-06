@@ -9,7 +9,7 @@ log = logging.getLogger("motor.redis")
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "200.54.12.140")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASS = os.environ.get("REDIS_PASSWORD", "soc_ubo_2026")
+REDIS_PASS = os.environ.get("REDIS_PASSWORD", "")
 MAXLEN     = 10000
 
 _client = None
@@ -51,6 +51,7 @@ def publish_decision(trace_id: str, features: dict, decision: dict):
             "DURATION_MS":   str(features.get("FLOW_DURATION_MILLISECONDS", 0)),
             "SERVER_FLAGS":  str(features.get("SERVER_TCP_FLAGS", 0)),
             "decision":      decision["decision"],
+            "latency_ms":    str(decision.get("latency_ms", 0)),
         }
         r.xadd("soc:decisions", payload, maxlen=MAXLEN, approximate=True)
         return True

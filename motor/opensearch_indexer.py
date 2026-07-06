@@ -24,14 +24,14 @@ log = logging.getLogger("opensearch_indexer")
 # ── Configuración ─────────────────────────────────────────────────────────────
 REDIS_HOST   = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT   = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASS   = os.environ.get("REDIS_PASSWORD", "soc_ubo_2026")
+REDIS_PASS   = os.environ.get("REDIS_PASSWORD", "")
 REDIS_STREAM = "soc:decisions"
 CONSUMER_GRP = "opensearch-indexer"
 CONSUMER_ID  = "worker-1"
 
 OS_HOST      = os.environ.get("OS_HOST", "https://localhost:9201")
 OS_USER      = os.environ.get("OS_USER", "admin")
-OS_PASS      = os.environ.get("OS_PASS", "SocUBO2026!")
+OS_PASS      = os.environ.get("OS_PASS", "")
 OS_INDEX     = "soc-decisions"
 
 STATE_FILE   = "/home/aiayala/tesis/motor/logs/opensearch_indexer_state.json"
@@ -49,9 +49,12 @@ def os_request(method, path, body=None):
             f"{OS_USER}:{OS_PASS}".encode()).decode()
     }
     data = json.dumps(body).encode() if body else None
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Esquema de URL no permitido: {parsed.scheme!r}")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as r:  # nosec B310
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as r:  # nosec B310 - esquema validado arriba (solo http/https)
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return json.loads(e.read())
@@ -120,6 +123,7 @@ def parse_decision(msg_data: dict) -> dict:
         "DURATION_MS":   int(msg_data.get("DURATION_MS", 0)),
         "SERVER_FLAGS":  int(msg_data.get("SERVER_FLAGS", 0)),
         "model_version": msg_data.get("model_version", ""),
+        "latency_ms":    float(msg_data.get("latency_ms", 0)),
     }
 
 def index_decision(doc: dict, prev_hash: str) -> str:
