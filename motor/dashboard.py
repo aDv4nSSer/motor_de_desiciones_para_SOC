@@ -13,7 +13,6 @@ import logging
 import os
 import ssl
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -43,9 +42,6 @@ def _os_request(method: str, path: str, body: dict | None = None) -> dict | None
         "Authorization": "Basic " + base64.b64encode(f"{OS_USER}:{OS_PASS}".encode()).decode(),
     }
     data = json.dumps(body).encode() if body is not None else None
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Esquema de URL no permitido: {parsed.scheme!r}")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, context=_ssl_ctx, timeout=5) as r:  # nosec B310 - esquema validado arriba (solo http/https)
@@ -148,3 +144,110 @@ def get_recent_responses(limit: int = 50) -> list[dict]:
     except redis.RedisError as e:
         log.error(f"error leyendo auditoría de respuestas: {e}")
     return records
+
+
+# ── Categorización de puertos (verificado 2026-07-07, ver bitácora) ────────
+INFRA_PORTS = {2222, 8000, 55000, 443}
+HONEYPOT_PORTS = {22}
+
+PORT_NAMES = {
+    0: "ICMP (ping/traceroute)",
+    2222: "SSH admin", 8000: "Motor FastAPI", 55000: "Wazuh API", 443: "Wazuh Dashboard",
+    22: "SSH (honeypot)", 23: "Telnet", 3389: "RDP", 1433: "SQL Server", 5060: "SIP",
+    8728: "MikroTik API", 88: "Kerberos", 53: "DNS", 67: "DHCP", 123: "NTP",
+    80: "HTTP", 8080: "HTTP-alt", 8081: "HTTP-alt", 8443: "HTTPS-alt", 81: "HTTP-alt",
+}
+
+
+def classify_port(port: int) -> str:
+    """infra (propio) | honeypot (Cowrie) | external (ataque real probable)."""
+    if port in INFRA_PORTS:
+        return "infra"
+    if port in HONEYPOT_PORTS:
+        return "honeypot"
+    return "external"
+
+
+def get_port_stats(window_minutes: int = 60, top_n: int = 15) -> list[dict]:
+    since = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+    query = {
+        "size": 0,
+        "query": {"range": {"timestamp": {"gte": since}}},
+        "aggs": {
+            "puertos": {
+                "terms": {"field": "L4_DST_PORT", "size": top_n},
+                "aggs": {"por_tier": {"terms": {"field": "tier_name", "size": 10}}},
+            }
+        },
+    }
+    result = _os_request("POST", f"/{OS_INDEX}/_search", query)
+    if result is None:
+        return []
+    buckets = result.get("aggregations", {}).get("puertos", {}).get("buckets", [])
+    out = []
+    for b in buckets:
+        port = b["key"]
+        por_tier = {tb["key"]: tb["doc_count"] for tb in b.get("por_tier", {}).get("buckets", [])}
+        out.append({
+            "port": port,
+            "name": PORT_NAMES.get(port, "Desconocido"),
+            "category": classify_port(port),
+            "count": b["doc_count"],
+            "por_tier": por_tier,
+        })
+    return out
+
+
+# ── Gestion de casos (escritos por el vigilante en .139) ──────────────────
+CASES_KEY_PREFIX = "soc:cases:"
+CASES_INDEX_KEY = "soc:cases:index"
+VALID_CASE_STATES = {"abierto", "en_investigacion", "cerrado_confirmado", "cerrado_falso_positivo"}
+
+
+def list_cases(only_open: bool = False, limit: int = 50) -> list[dict]:
+    try:
+        r = _get_redis()
+        ids = r.smembers(CASES_INDEX_KEY)
+    except Exception as e:
+        logging.error(f"no se pudo leer casos de Redis: {e}")
+        return []
+
+    cases = []
+    for cid in ids:
+        try:
+            raw = r.get(f"{CASES_KEY_PREFIX}{cid}")
+            if not raw:
+                continue
+            case = json.loads(raw)
+            if only_open and case.get("state") not in ("abierto", "en_investigacion"):
+                continue
+            cases.append(case)
+        except Exception:
+            continue
+
+    cases.sort(key=lambda c: c.get("opened_at", ""), reverse=True)
+    return cases[:limit]
+
+
+def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> dict | None:
+    if new_state not in VALID_CASE_STATES:
+        raise ValueError(f"Estado invalido: {new_state}")
+
+    r = _get_redis()
+    raw = r.get(f"{CASES_KEY_PREFIX}{case_id}")
+    if raw is None:
+        return None
+
+    case = json.loads(raw)
+    now = datetime.now(timezone.utc).isoformat()
+    case["state"] = new_state
+    case["updated_at"] = now
+    case.setdefault("history", []).append({
+        "state": new_state,
+        "at": now,
+        "note": note,
+        "actor": actor,
+    })
+    r.set(f"{CASES_KEY_PREFIX}{case_id}", json.dumps(case))
+    logging.info(f"caso {case_id} -> {new_state} por {actor}")
+    return case

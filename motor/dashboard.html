@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motor de decisiones · Panel de operación</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --page:       #0A0E16;
+    --paper:      #0A0E16;
+    --card:       #121826;
+    --card-2:     #161D2E;
+    --hairline:   #232B3D;
+    --hairline-2: #1B2233;
+    --ink:        #ECEFF4;
+    --graphite:   #9AA5B8;
+    --pewter:     #6B7688;
+    --ash:        #4A5568;
+    --dust:       #2A3244;
+    --signal:     #F0475C;
+    --signal-dim: rgba(240, 71, 92, 0.12);
+    --warn:       #F0A93C;
+    --warn-dim:   rgba(240, 169, 60, 0.12);
+    --cyan:       #2DD4C8;
+    --purple:     #8B7FF0;
+    --mono:  "IBM Plex Mono", ui-monospace, Consolas, monospace;
+    --sans:  "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+    --cond:  "IBM Plex Sans Condensed", "IBM Plex Sans", sans-serif;
+    --radius: 16px;
+    --radius-sm: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.45;
+    padding: 0 0 60px; -webkit-font-smoothing: antialiased;
+    background-image:
+      radial-gradient(ellipse 900px 500px at 15% -10%, rgba(45,212,200,0.06), transparent),
+      radial-gradient(ellipse 700px 500px at 100% 10%, rgba(139,127,240,0.05), transparent);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 24px 28px 0; }
+
+  header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    flex-wrap: wrap; gap: 12px 24px; padding: 4px 4px 20px;
+  }
+  .title { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  h1 { font-family: var(--cond); font-size: 21px; font-weight: 700; letter-spacing: -0.2px; margin: 0; text-transform: uppercase; color: var(--ink); }
+  .subtitle { font-family: var(--mono); font-size: 11px; color: var(--pewter); }
+  .header-controls { display: flex; align-items: center; gap: 20px; }
+  select {
+    background: var(--card); color: var(--ink); border: 1px solid var(--hairline);
+    font-family: var(--mono); font-size: 12px; padding: 8px 12px; border-radius: var(--radius-sm); cursor: pointer;
+  }
+  .status { font-family: var(--mono); font-size: 11px; color: var(--pewter); display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .heartbeat { width: 7px; height: 7px; background: var(--cyan); border-radius: 50%; animation: beat 2.4s ease-in-out infinite; box-shadow: 0 0 8px var(--cyan); }
+  .heartbeat.stale { background: var(--signal); box-shadow: 0 0 8px var(--signal); animation: none; }
+  @keyframes beat { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  @media (prefers-reduced-motion: reduce) { .heartbeat { animation: none; } }
+  .freshness { font-size: 10px; color: var(--ash); }
+  .freshness.stale { color: var(--signal); }
+
+  /* ── Tarjetas base ── */
+  .card {
+    background: var(--card); border: 1px solid var(--hairline); border-radius: var(--radius);
+    margin-bottom: 18px;
+  }
+  .card-pad { padding: 24px 28px; }
+
+  .decision-band { display: grid; grid-template-columns: 1.1fr 1fr; }
+  .queue-block { padding: 26px 32px; border-right: 1px solid var(--hairline); display: flex; flex-direction: column; justify-content: center; }
+  .queue-figure { display: flex; align-items: baseline; gap: 16px; }
+  .queue-n { font-family: var(--cond); font-size: 78px; font-weight: 700; line-height: 0.82; letter-spacing: -3px; }
+  .queue-n.zero { color: var(--cyan); text-shadow: 0 0 24px rgba(45,212,200,0.35); }
+  .queue-n.hot { color: var(--signal); text-shadow: 0 0 24px rgba(240,71,92,0.35); }
+  .queue-copy .lead { font-family: var(--cond); font-size: 17px; font-weight: 600; margin-bottom: 2px; color: var(--ink); }
+  .queue-copy .sub { font-size: 12px; color: var(--graphite); max-width: 320px; }
+  .queue-breakdown { display: flex; gap: 22px; margin-top: 16px; font-family: var(--mono); font-size: 11px; }
+  .queue-breakdown .item { display: flex; align-items: center; gap: 6px; color: var(--graphite); }
+  .queue-breakdown .item.hot { color: var(--signal); font-weight: 500; }
+  .queue-breakdown .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--graphite); flex-shrink: 0; }
+  .queue-breakdown .item.hot .dot { background: var(--signal); box-shadow: 0 0 6px var(--signal); }
+  .queue-breakdown .item.warn .dot { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  .queue-breakdown .item.warn { color: var(--warn); }
+
+  .relief-block { padding: 26px 32px; display: flex; flex-direction: column; justify-content: center; }
+  .relief-top { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
+  .relief-pct { font-family: var(--cond); font-size: 40px; font-weight: 700; letter-spacing: -1px; line-height: 0.9; color: var(--cyan); }
+  .relief-label { font-family: var(--cond); font-size: 13px; font-weight: 600; max-width: 220px; line-height: 1.25; color: var(--graphite); }
+  .load-bar { display: flex; height: 24px; width: 100%; border-radius: var(--radius-sm); background: var(--card-2); overflow: hidden; border: 1px solid var(--hairline); }
+  .load-seg { height: 100%; transition: width .5s cubic-bezier(.4,0,.2,1); box-shadow: inset -1px 0 0 var(--card); }
+  .load-seg.escalated { background: var(--signal); box-shadow: none; }
+  .load-key { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 11px; font-family: var(--mono); font-size: 10px; color: var(--graphite); }
+  .load-key .k { display: flex; align-items: center; gap: 6px; }
+  .load-key .sw { width: 10px; height: 10px; border-radius: 3px; }
+  .load-key .k.signal { color: var(--signal); font-weight: 500; }
+
+  .ops { display: grid; grid-template-columns: repeat(5, 1fr); }
+  .op { padding: 20px 22px; border-right: 1px solid var(--hairline); }
+  .op:last-child { border-right: none; }
+  .op .cap { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--pewter); }
+  .op .n { font-family: var(--cond); font-size: 26px; font-weight: 600; margin-top: 5px; letter-spacing: -0.4px; color: var(--ink); }
+  .op .n .unit { font-size: 13px; color: var(--pewter); font-weight: 400; margin-left: 1px; }
+  .op .foot { font-size: 10.5px; color: var(--pewter); margin-top: 3px; }
+
+  .sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+  h2 { font-family: var(--cond); font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.9px; margin: 0; color: var(--ink); }
+  .sec-note { font-size: 11px; color: var(--pewter); }
+
+  .chips { display: flex; gap: 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 10px; padding: 7px 13px; background: var(--card-2); color: var(--graphite);
+    cursor: pointer; user-select: none; text-transform: uppercase; letter-spacing: 0.4px;
+    border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+  }
+  .chip:hover { border-color: var(--cyan); color: var(--ink); }
+  .chip.active { background: var(--cyan); border-color: var(--cyan); color: #05161a; font-weight: 600; }
+
+  .case-row { display: flex; align-items: center; gap: 16px; padding: 14px 16px; border-radius: var(--radius-sm); background: var(--card-2); margin-bottom: 10px; border: 1px solid var(--hairline); }
+  .case-row:last-child { margin-bottom: 0; }
+  .case-flag { align-self: stretch; width: 3px; border-radius: 2px; background: var(--ash); flex-shrink: 0; }
+  .case-row.p-abierto .case-flag { background: var(--signal); box-shadow: 0 0 8px var(--signal); }
+  .case-row.p-en_investigacion .case-flag { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .case-body { min-width: 0; flex: 1; }
+  .case-id-line { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; flex-wrap: wrap; }
+  .case-path { font-family: var(--mono); font-size: 12.5px; word-break: break-all; color: var(--ink); }
+  .case-state { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 7px; border-radius: 8px; border: 1px solid var(--ash); color: var(--graphite); white-space: nowrap; }
+  .case-state.abierto { border-color: var(--signal); color: var(--signal); background: var(--signal-dim); }
+  .case-state.en_investigacion { border-color: var(--warn); color: var(--warn); background: var(--warn-dim); }
+  .case-state.cerrado_confirmado { border-color: var(--ash); color: var(--graphite); }
+  .case-state.cerrado_falso_positivo { border-color: var(--ash); color: var(--pewter); }
+  .case-meta { font-family: var(--mono); font-size: 10.5px; color: var(--pewter); display: flex; gap: 14px; flex-wrap: wrap; }
+  .case-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .case-btn { font-family: var(--mono); font-size: 10px; padding: 7px 12px; border: 1px solid var(--hairline); background: var(--card); color: var(--ink); cursor: pointer; white-space: nowrap; text-transform: uppercase; letter-spacing: 0.3px; border-radius: var(--radius-sm); }
+  .case-btn:hover { background: var(--ink); color: var(--card); border-color: var(--ink); }
+  .case-btn.confirm { border-color: var(--signal); color: var(--signal); }
+  .case-btn.confirm:hover { background: var(--signal); color: #fff; border-color: var(--signal); }
+  .case-btn:disabled { opacity: 0.4; cursor: wait; }
+  .queue-clear { display: flex; align-items: center; gap: 10px; padding: 10px 4px; color: var(--graphite); font-size: 12.5px; }
+  .queue-clear .mark { font-family: var(--cond); font-size: 18px; font-weight: 700; color: var(--cyan); }
+
+  .port-row { display: grid; grid-template-columns: 190px 1fr 56px; align-items: center; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--hairline-2); }
+  .port-row:last-child { border-bottom: none; }
+  .port-id { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+  .port-tag { font-family: var(--mono); font-size: 8.5px; letter-spacing: 0.5px; border: 1px solid var(--ash); color: var(--pewter); padding: 2px 5px; border-radius: 5px; flex-shrink: 0; text-transform: uppercase; }
+  .port-tag.external { border-color: var(--cyan); color: var(--cyan); }
+  .port-name { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+  .port-num { font-family: var(--mono); font-size: 10px; color: var(--pewter); flex-shrink: 0; }
+  .port-track { height: 15px; background: var(--card-2); border: 1px solid var(--hairline-2); border-radius: 4px; overflow: hidden; }
+  .port-bar { display: flex; height: 100%; transition: width .45s ease; }
+  .port-seg { height: 100%; box-shadow: inset -1px 0 0 var(--card-2); }
+  .port-n { font-family: var(--mono); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
+  .port-n.hot { color: var(--signal); font-weight: 600; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .dist-row { display: grid; grid-template-columns: 108px 1fr 48px; align-items: center; gap: 12px; margin-bottom: 9px; font-family: var(--mono); font-size: 11px; }
+  .dist-row .lbl { color: var(--graphite); }
+  .dist-row.signal .lbl, .dist-row.signal .n { color: var(--signal); font-weight: 500; }
+  .dist-track { height: 14px; background: var(--card-2); border: 1px solid var(--hairline-2); border-radius: 4px; overflow: hidden; }
+  .dist-fill { height: 100%; transition: width .45s ease; }
+  .dist-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
+
+  .tables { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .scroll { max-height: 320px; overflow-y: auto; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 320px; }
+  th { text-align: left; font-family: var(--mono); font-weight: 400; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--pewter); border-bottom: 1px solid var(--hairline); padding: 5px 10px 8px 0; position: sticky; top: 0; background: var(--card); white-space: nowrap; }
+  th.r, td.r { text-align: right; }
+  td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--hairline-2); font-family: var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--ink); }
+  tr:last-child td { border-bottom: none; }
+  tr.escalated td { background: var(--signal-dim); }
+  tr.escalated td:first-child { box-shadow: inset 2px 0 0 var(--signal); }
+  .dim { color: var(--pewter); }
+  .action { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.5px; border: 1px solid var(--ash); padding: 2px 6px; border-radius: 6px; color: var(--graphite); }
+  .action.hot { border-color: var(--signal); color: var(--signal); background: var(--signal-dim); }
+  .empty { color: var(--pewter); font-style: italic; padding: 20px 0; text-align: center; font-family: var(--sans); }
+
+  ::-webkit-scrollbar { width: 7px; height: 7px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--hairline); border-radius: 4px; }
+
+  @media (max-width: 980px) {
+    .wrap { padding: 20px 18px 0; }
+    .decision-band { grid-template-columns: 1fr; }
+    .queue-block { border-right: none; border-bottom: 1px solid var(--hairline); }
+    .ops { grid-template-columns: repeat(3, 1fr); }
+    .ops .op:nth-child(3) { border-right: none; }
+    .grid2, .tables { grid-template-columns: 1fr; gap: 20px; }
+    .queue-n { font-size: 60px; }
+  }
+  @media (max-width: 560px) {
+    .wrap { padding: 16px 12px 0; }
+    .card-pad { padding: 18px 16px; }
+    .queue-block, .relief-block { padding: 20px 18px; }
+    .queue-n { font-size: 48px; }
+    .ops { grid-template-columns: 1fr 1fr; }
+    .op { padding: 16px; }
+    .op:nth-child(2n) { border-right: none; }
+    .op:nth-child(-n+4) { border-bottom: 1px solid var(--hairline); }
+    .port-row { grid-template-columns: 120px 1fr 42px; gap: 10px; }
+    .port-num { display: none; }
+    .dist-row { grid-template-columns: 84px 1fr 40px; }
+    .chips { width: 100%; }
+    .chip { flex: 1; text-align: center; }
+    .case-row { flex-wrap: wrap; }
+    .case-actions { width: 100%; margin-top: 4px; flex-wrap: wrap; }
+    .case-btn { flex: 1; text-align: center; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="title">
+    <h1>Motor de decisiones</h1>
+    <div class="subtitle">semillero de investigación · ciberseguridad · UBO</div>
+  </div>
+  <div class="header-controls">
+    <select id="windowSelect" aria-label="Ventana de tiempo">
+      <option value="15">Últimos 15 min</option>
+      <option value="60" selected>Última hora</option>
+      <option value="360">Últimas 6 horas</option>
+      <option value="1440">Últimas 24 horas</option>
+    </select>
+    <div class="status">
+      <span class="heartbeat" id="beat"></span>
+      <span id="statusText">conectando</span>
+      <span class="freshness" id="freshness"></span>
+    </div>
+  </div>
+</header>
+
+<div class="card">
+  <div class="decision-band">
+    <div class="queue-block" id="queueBlock">
+      <div class="queue-figure">
+        <div class="queue-n" id="queueN">—</div>
+        <div class="queue-copy">
+          <div class="lead" id="queueLead">casos requieren revisión humana</div>
+          <div class="sub" id="queueSub">Cargando cola de trabajo…</div>
+        </div>
+      </div>
+      <div class="queue-breakdown" id="queueBreakdown"></div>
+    </div>
+
+    <div class="relief-block">
+      <div class="relief-top">
+        <div class="relief-pct" id="reliefPct">—</div>
+        <div class="relief-label">de los flujos evaluados se resolvieron sin abrir un caso</div>
+      </div>
+      <div class="load-bar" id="loadBar"></div>
+      <div class="load-key">
+        <div class="k"><span class="sw" style="background:var(--dust)"></span>Permitido</div>
+        <div class="k"><span class="sw" style="background:var(--ash)"></span>Registrado</div>
+        <div class="k"><span class="sw" style="background:var(--graphite)"></span>Bloqueado por el motor</div>
+        <div class="k signal"><span class="sw" style="background:var(--signal)"></span>Escalado</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="ops">
+    <div class="op"><div class="cap">Decisiones evaluadas</div><div class="n" id="opTotal">—</div><div class="foot" id="opRate">—</div></div>
+    <div class="op"><div class="cap">Latencia mediana</div><div class="n" id="opAvg">—<span class="unit">ms</span></div><div class="foot">inferencia por flujo</div></div>
+    <div class="op"><div class="cap">Latencia p95</div><div class="n" id="opP95">—<span class="unit">ms</span></div><div class="foot">cola de peor caso</div></div>
+    <div class="op"><div class="cap">Bloqueos vigentes</div><div class="n" id="opBlocks">—</div><div class="foot">respuesta automática R2</div></div>
+    <div class="op"><div class="cap">Ataques externos</div><div class="n" id="opExternal">—</div><div class="foot" id="opExternalTop">—</div></div>
+  </div>
+</div>
+
+<div class="card card-pad">
+  <div class="sec-head">
+    <div>
+      <h2>Casos</h2>
+      <div class="sec-note">Cada fila es una decisión pendiente de un humano. El orden es el orden de trabajo.</div>
+    </div>
+    <div class="chips" id="caseFilters">
+      <div class="chip active" data-filter="open">Abiertos</div>
+      <div class="chip" data-filter="all">Todos</div>
+    </div>
+  </div>
+  <div id="casesList"></div>
+</div>
+
+<div class="card card-pad">
+  <div class="sec-head">
+    <div>
+      <h2>Superficie bajo ataque</h2>
+      <div class="sec-note">Destino de los flujos evaluados en la ventana seleccionada.</div>
+    </div>
+    <div class="chips" id="portFilters">
+      <div class="chip active" data-filter="all">Todos</div>
+      <div class="chip" data-filter="external">Externo</div>
+      <div class="chip" data-filter="honeypot">Honeypot</div>
+      <div class="chip" data-filter="infra">Propio</div>
+    </div>
+  </div>
+  <div id="portsList"></div>
+</div>
+
+<div class="card card-pad">
+  <div class="grid2">
+    <div><div class="sec-head"><h2>Clasificación del modelo</h2></div><div id="tierBars"></div></div>
+    <div><div class="sec-head"><h2>Acción ejecutada</h2></div><div id="decisionBars"></div></div>
+  </div>
+</div>
+
+<div class="card card-pad">
+  <div class="tables">
+    <div>
+      <div class="sec-head"><h2>Bloqueos activos</h2><div class="sec-note"><span id="blocksCount">0</span> IP con TTL vigente</div></div>
+      <div class="scroll">
+        <table><thead><tr><th>Origen</th><th>TTL</th><th>Traza</th></tr></thead><tbody id="blocksBody"></tbody></table>
+      </div>
+    </div>
+    <div>
+      <div class="sec-head"><h2>Respuesta automática</h2><div class="sec-note">Enriquecimiento R1 y contención R2</div></div>
+      <div class="scroll">
+        <table><thead><tr><th>Origen</th><th class="r">Abuse</th><th>País</th><th>Acción</th></tr></thead><tbody id="responsesBody"></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card card-pad">
+  <div class="sec-head"><h2>Bitácora de decisiones</h2><div class="sec-note">Las filas marcadas son tier crítico.</div></div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Hace</th><th>Tier</th><th class="r">Score</th><th class="r">Puerto</th><th>Destino</th><th class="r">Latencia</th><th>Traza</th></tr></thead>
+      <tbody id="decisionsBody"></tbody>
+    </table>
+  </div>
+</div>
+
+</div>
+
+<script>
+const REFRESH_MS = 5000;
+const ABSORBED = ['ALLOW', 'LOG', 'BLOCK'];
+const ESCALATED = 'ALERT';
+const DECISION_COLOR = { ALLOW:'var(--dust)', LOG:'var(--ash)', BLOCK:'var(--graphite)', ALERT:'var(--signal)' };
+const TIER_KEYS = ['T0_BENIGNO','T1_BAJO','T2_MEDIO','T3_CRITICO'];
+const TIER_LABEL = { T0_BENIGNO:'T0 benigno', T1_BAJO:'T1 bajo', T2_MEDIO:'T2 medio', T3_CRITICO:'T3 crítico' };
+const TIER_FILL  = { T0_BENIGNO:'var(--dust)', T1_BAJO:'var(--ash)', T2_MEDIO:'var(--warn)', T3_CRITICO:'var(--signal)' };
+const TIER_SHORT = { 0:'T0', 1:'T1', 2:'T2', 3:'T3' };
+const CAT_LABEL  = { external:'ext', honeypot:'hpot', infra:'propio' };
+const CASE_STATE_LABEL = { abierto:'Abierto', en_investigacion:'En investigación', cerrado_confirmado:'Confirmado', cerrado_falso_positivo:'Falso positivo' };
+
+let portFilter = 'all';
+let caseFilter = 'open';
+let lastPorts = [];
+let lastSuccessAt = null;
+
+const $ = id => document.getElementById(id);
+const esc = v => (v === null || v === undefined || v === '') ? '—' : String(v);
+const shortId = id => id ? id.slice(0, 8) : '—';
+const num = n => Number(n).toLocaleString('es-CL');
+
+function fmtAgo(iso) {
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m`;
+  if (s < 86400) return `${Math.floor(s/3600)}h`;
+  return `${Math.floor(s/86400)}d`;
+}
+function fmtTTL(sec) { const m = Math.floor(sec/60), s = sec%60; return `${m}:${String(s).padStart(2,'0')}`; }
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
+}
+
+function renderQueue(openCases) {
+  const n = openCases.length;
+  const nEl = $('queueN');
+  nEl.textContent = num(n);
+  nEl.className = 'queue-n ' + (n === 0 ? 'zero' : 'hot');
+  $('queueLead').textContent = n === 1 ? 'caso requiere revisión humana' : 'casos requieren revisión humana';
+  $('queueSub').textContent = n === 0
+    ? 'Nada pendiente. El motor está resolviendo todo dentro de su umbral de confianza.'
+    : 'Cada uno es un hallazgo que el motor no puede cerrar solo — requiere criterio humano.';
+
+  const abiertos = openCases.filter(c => c.state === 'abierto').length;
+  const investigacion = openCases.filter(c => c.state === 'en_investigacion').length;
+  $('queueBreakdown').innerHTML = n === 0 ? '' : `
+    <div class="item hot"><span class="dot"></span>${num(abiertos)} sin asignar</div>
+    <div class="item warn"><span class="dot"></span>${num(investigacion)} en investigación</div>
+  `;
+}
+
+function renderRelief(porDecision, windowMin) {
+  const dist = porDecision || {};
+  const total = Object.values(dist).reduce((a,b) => a+b, 0);
+  const escalated = dist[ESCALATED] || 0;
+  const pct = total > 0 ? ((total - escalated) / total) * 100 : 0;
+  $('reliefPct').textContent = total > 0 ? pct.toFixed(1).replace('.', ',') + '%' : '—';
+
+  const order = [...ABSORBED, ESCALATED];
+  $('loadBar').innerHTML = order.map(k => {
+    const c = dist[k] || 0;
+    if (!c) return '';
+    const w = (c / (total || 1)) * 100;
+    const cls = k === ESCALATED ? 'load-seg escalated' : 'load-seg';
+    const style = k === ESCALATED ? '' : `background:${DECISION_COLOR[k]};`;
+    return `<div class="${cls}" style="${style}width:${w}%" title="${k}: ${num(c)} (${w.toFixed(1)}%)"></div>`;
+  }).join('');
+
+  const perMin = windowMin > 0 ? (total / windowMin) : 0;
+  $('opTotal').textContent = num(total);
+  $('opRate').textContent = total > 0 ? `${perMin.toFixed(1)} por minuto` : '—';
+}
+
+function renderDist(containerId, dist, order, labelMap, fillMap, signalKey) {
+  const el = $(containerId);
+  const total = Object.values(dist).reduce((a,b) => a+b, 0) || 1;
+  el.innerHTML = order.map(k => {
+    const c = dist[k] || 0;
+    const pct = (c / total) * 100;
+    const cls = k === signalKey ? 'dist-row signal' : 'dist-row';
+    return `<div class="${cls}">
+      <div class="lbl">${labelMap[k] || k}</div>
+      <div class="dist-track"><div class="dist-fill" style="width:${pct}%;background:${fillMap[k]}"></div></div>
+      <div class="n">${num(c)}</div>
+    </div>`;
+  }).join('');
+}
+
+async function handleCaseAction(caseId, newState, btn) {
+  const notes = {
+    en_investigacion: 'Marcado en investigación desde el panel',
+    cerrado_confirmado: 'Confirmado como amenaza real desde el panel',
+    cerrado_falso_positivo: 'Cerrado como falso positivo desde el panel',
+  };
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = '···';
+  try {
+    await fetchJSON(`/api/dashboard/cases/${caseId}/state`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ state: newState, note: notes[newState] || '' }),
+    });
+    await refresh();
+  } catch (e) {
+    alert('No se pudo actualizar el caso: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+window.handleCaseAction = handleCaseAction;
+
+function renderCases(cases) {
+  const el = $('casesList');
+  if (!cases.length) {
+    el.innerHTML = `<div class="queue-clear"><span class="mark">—</span> ${caseFilter === 'open' ? 'Sin casos abiertos. Nada pendiente de revisión.' : 'Sin casos registrados en el historial.'}</div>`;
+    return;
+  }
+  const rank = { abierto: 0, en_investigacion: 1, cerrado_confirmado: 2, cerrado_falso_positivo: 3 };
+  const sorted = [...cases].sort((a,b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || new Date(a.opened_at) - new Date(b.opened_at));
+
+  el.innerHTML = sorted.map(c => {
+    const detail = c.detail || {};
+    const isOpen = c.state === 'abierto' || c.state === 'en_investigacion';
+    let actions = '';
+    if (isOpen) {
+      actions = '<div class="case-actions">';
+      if (c.state === 'abierto') {
+        actions += `<button class="case-btn" onclick="handleCaseAction('${c.case_id}','en_investigacion',this)">Investigar</button>`;
+      }
+      actions += `<button class="case-btn confirm" onclick="handleCaseAction('${c.case_id}','cerrado_confirmado',this)">Confirmar amenaza</button>`;
+      actions += `<button class="case-btn" onclick="handleCaseAction('${c.case_id}','cerrado_falso_positivo',this)">Falso positivo</button>`;
+      actions += '</div>';
+    }
+    return `<div class="case-row p-${c.state}">
+      <div class="case-flag"></div>
+      <div class="case-body">
+        <div class="case-id-line">
+          <span class="case-path">${esc(detail.file_path || c.kind)}</span>
+          <span class="case-state ${c.state}">${CASE_STATE_LABEL[c.state] || c.state}</span>
+        </div>
+        <div class="case-meta">
+          <span>${esc(c.host)}</span>
+          ${detail.sha256 ? `<span>sha256 ${detail.sha256.slice(0,16)}…</span>` : ''}
+          <span>abierto hace ${fmtAgo(c.opened_at)}</span>
+        </div>
+      </div>
+      ${actions}
+    </div>`;
+  }).join('');
+}
+
+function renderPorts(ports) {
+  lastPorts = ports || [];
+  const filtered = portFilter === 'all' ? lastPorts : lastPorts.filter(p => p.category === portFilter);
+  const el = $('portsList');
+  if (!filtered.length) { el.innerHTML = `<div class="empty">Sin actividad en esta categoría</div>`; return; }
+
+  const maxCount = Math.max(...filtered.map(p => p.count), 1);
+  el.innerHTML = filtered.map(p => {
+    const total = p.count || 1;
+    const crit = (p.por_tier && p.por_tier.T3_CRITICO) || 0;
+    const trackPct = Math.max(2, (p.count / maxCount) * 100);
+    const segs = TIER_KEYS.map(t => {
+      const c = (p.por_tier && p.por_tier[t]) || 0;
+      if (!c) return '';
+      const w = (c / total) * 100;
+      return `<div class="port-seg" style="width:${w}%;background:${TIER_FILL[t]}" title="${TIER_LABEL[t]}: ${num(c)}"></div>`;
+    }).join('');
+    const tagCls = p.category === 'external' ? 'port-tag external' : 'port-tag';
+    return `<div class="port-row">
+      <div class="port-id">
+        <span class="${tagCls}">${CAT_LABEL[p.category] || '—'}</span>
+        <span class="port-name" title="${esc(p.name)}">${esc(p.name)}</span>
+        <span class="port-num">:${p.port}</span>
+      </div>
+      <div class="port-track"><div class="port-bar" style="width:${trackPct}%">${segs}</div></div>
+      <div class="port-n ${crit > 0 ? 'hot' : ''}">${num(p.count)}</div>
+    </div>`;
+  }).join('');
+
+  const externalPorts = lastPorts.filter(p => p.category === 'external');
+  const externalTotal = externalPorts.reduce((a,p) => a + p.count, 0);
+  $('opExternal').textContent = num(externalTotal);
+  if (externalPorts.length) {
+    const top = [...externalPorts].sort((a,b) => b.count - a.count)[0];
+    $('opExternalTop').textContent = `top: ${top.name} (:${top.port})`;
+  } else {
+    $('opExternalTop').textContent = 'sin actividad';
+  }
+}
+
+function renderBlocks(blocks) {
+  $('blocksCount').textContent = blocks.length;
+  $('opBlocks').textContent = num(blocks.length);
+  const body = $('blocksBody');
+  if (!blocks.length) { body.innerHTML = `<tr><td colspan="3" class="empty">Sin bloqueos vigentes</td></tr>`; return; }
+  body.innerHTML = blocks.slice(0, 100).map(b => `
+    <tr><td>${esc(b.ip)}</td><td>${fmtTTL(b.ttl_seconds)}</td><td class="dim">${shortId(b.trace_id)}</td></tr>`).join('');
+}
+
+function renderResponses(records) {
+  const body = $('responsesBody');
+  if (!records.length) { body.innerHTML = `<tr><td colspan="4" class="empty">Sin actividad reciente</td></tr>`; return; }
+  body.innerHTML = records.slice(0, 50).map(r => {
+    const en = r.enrichment || {};
+    const bl = r.block || null;
+    let label, hot = false;
+    if (bl) { label = bl.enforced ? 'contenido' : String(bl.action || '').toLowerCase(); hot = !!bl.enforced; }
+    else { label = 'enriquecido'; }
+    return `<tr><td>${esc(r.src_ip)}</td><td class="r">${en.abuseipdb_score ?? '—'}</td><td class="dim">${esc(en.abuseipdb_country)}</td><td><span class="action ${hot ? 'hot' : ''}">${label}</span></td></tr>`;
+  }).join('');
+}
+
+function renderDecisions(decisions) {
+  const body = $('decisionsBody');
+  if (!decisions.length) { body.innerHTML = `<tr><td colspan="7" class="empty">Sin decisiones en la ventana</td></tr>`; return; }
+  const portMeta = Object.fromEntries(lastPorts.map(p => [p.port, p]));
+  body.innerHTML = decisions.slice(0, 60).map(d => {
+    const isCrit = d.tier === 3;
+    const meta = portMeta[d.L4_DST_PORT];
+    return `<tr class="${isCrit ? 'escalated' : ''}">
+      <td class="dim">${fmtAgo(d.timestamp)}</td>
+      <td>${TIER_SHORT[d.tier] ?? '—'}</td>
+      <td class="r">${d.risk_score != null ? d.risk_score.toFixed(3) : '—'}</td>
+      <td class="r">${esc(d.L4_DST_PORT)}</td>
+      <td class="dim">${meta ? esc(meta.name) : '—'}</td>
+      <td class="r">${d.latency_ms != null ? d.latency_ms.toFixed(1) : '—'}</td>
+      <td class="dim">${shortId(d.trace_id)}</td>
+    </tr>`;
+  }).join('');
+}
+
+$('portFilters').addEventListener('click', e => {
+  const chip = e.target.closest('.chip'); if (!chip) return;
+  document.querySelectorAll('#portFilters .chip').forEach(c => c.classList.remove('active'));
+  chip.classList.add('active'); portFilter = chip.dataset.filter; renderPorts(lastPorts);
+});
+$('caseFilters').addEventListener('click', e => {
+  const chip = e.target.closest('.chip'); if (!chip) return;
+  document.querySelectorAll('#caseFilters .chip').forEach(c => c.classList.remove('active'));
+  chip.classList.add('active'); caseFilter = chip.dataset.filter; refresh();
+});
+
+async function refresh() {
+  const windowMin = Number($('windowSelect').value);
+  try {
+    const [stats, decisions, blocks, responses, ports, openCases, listedCases] = await Promise.all([
+      fetchJSON(`/api/dashboard/stats?window_minutes=${windowMin}`),
+      fetchJSON(`/api/dashboard/decisions?limit=100`),
+      fetchJSON(`/api/dashboard/blocks/active`),
+      fetchJSON(`/api/dashboard/blocks/recent?limit=50`),
+      fetchJSON(`/api/dashboard/ports?window_minutes=${windowMin}&top_n=15`),
+      fetchJSON(`/api/dashboard/cases?only_open=true&limit=100`),
+      fetchJSON(`/api/dashboard/cases?only_open=${caseFilter === 'open'}&limit=50`),
+    ]);
+
+    lastSuccessAt = new Date();
+    $('beat').classList.remove('stale');
+    $('statusText').textContent = 'en vivo · ' + lastSuccessAt.toLocaleTimeString('es-CL');
+    $('freshness').textContent = '';
+    $('freshness').classList.remove('stale');
+
+    renderQueue(openCases);
+    renderCases(listedCases);
+
+    if (stats.available) {
+      renderRelief(stats.por_decision, windowMin);
+      $('opAvg').innerHTML = (stats.latencia_avg_ms ?? '—') + '<span class="unit">ms</span>';
+      $('opP95').innerHTML = (stats.latencia_p95_ms ?? '—') + '<span class="unit">ms</span>';
+      renderDist('tierBars', stats.por_tier || {}, TIER_KEYS, TIER_LABEL, TIER_FILL, 'T3_CRITICO');
+      renderDist('decisionBars', stats.por_decision || {},
+        ['ALLOW','LOG','BLOCK','ALERT'],
+        {ALLOW:'Permitir', LOG:'Registrar', BLOCK:'Bloquear', ALERT:'Escalar'},
+        DECISION_COLOR, 'ALERT');
+    }
+
+    renderPorts(ports);
+    renderDecisions(decisions);
+    renderBlocks(blocks);
+    renderResponses(responses);
+  } catch (e) {
+    $('beat').classList.add('stale');
+    $('statusText').textContent = 'sin conexión · reintentando';
+    if (lastSuccessAt) {
+      $('freshness').textContent = `último dato hace ${fmtAgo(lastSuccessAt.toISOString())}`;
+      $('freshness').classList.add('stale');
+    }
+    console.error(e);
+  }
+}
+
+$('windowSelect').addEventListener('change', refresh);
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

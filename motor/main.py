@@ -4,7 +4,7 @@ FastAPI: recibe flows de Vector (single o batch), clasifica con ML, publica a Re
 Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
 import uuid, logging, time
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
 
@@ -12,7 +12,11 @@ from schemas import FlowFeatures, DecisionResponse, RiskTier
 from model import get_model
 from redis_client import publish_decision, publish_flow
 from response.queue import enqueue_response_task
-from dashboard import get_stats, get_recent_decisions, get_active_blocks, get_recent_responses
+from dashboard import (
+    get_stats, get_recent_decisions, get_active_blocks, get_recent_responses,
+    get_port_stats, list_cases, update_case_state,
+)
+from auth import verify_credentials
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,22 +150,49 @@ async def root():
 
 # ── Dashboard: endpoints de solo lectura ────────────────────────────────────
 @app.get("/api/dashboard/stats")
-async def dashboard_stats(window_minutes: int = 60):
+async def dashboard_stats(window_minutes: int = 60, user: str = Depends(verify_credentials)):
     return get_stats(window_minutes)
 
 @app.get("/api/dashboard/decisions")
-async def dashboard_decisions(limit: int = 50):
+async def dashboard_decisions(limit: int = 50, user: str = Depends(verify_credentials)):
     return get_recent_decisions(min(limit, 200))
 
 @app.get("/api/dashboard/blocks/active")
-async def dashboard_blocks_active():
+async def dashboard_blocks_active(user: str = Depends(verify_credentials)):
     return get_active_blocks()
 
 @app.get("/api/dashboard/blocks/recent")
-async def dashboard_blocks_recent(limit: int = 50):
+async def dashboard_blocks_recent(limit: int = 50, user: str = Depends(verify_credentials)):
     return get_recent_responses(min(limit, 200))
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page():
+async def dashboard_page(user: str = Depends(verify_credentials)):
     with open("dashboard.html", encoding="utf-8") as f:
         return f.read()
+
+@app.get("/api/dashboard/ports")
+async def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: str = Depends(verify_credentials)):
+    return get_port_stats(window_minutes, top_n)
+
+
+# ── Casos (requieren autenticacion) ──────────────────────────────────────
+@app.get("/api/dashboard/cases")
+async def dashboard_cases(only_open: bool = False, limit: int = 50, user: str = Depends(verify_credentials)):
+    return list_cases(only_open=only_open, limit=limit)
+
+
+@app.post("/api/dashboard/cases/{case_id}/state")
+async def dashboard_update_case(
+    case_id: str,
+    payload: dict,
+    user: str = Depends(verify_credentials),
+):
+    new_state = payload.get("state", "")
+    note = payload.get("note", "")
+    try:
+        case = update_case_state(case_id, new_state, note, actor=user)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if case is None:
+        raise HTTPException(status_code=404, detail="Caso no encontrado")
+    return case
