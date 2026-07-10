@@ -1,0 +1,17 @@
+[Unit]
+Description=Motor SOC - Vigilante FIM (cuarentena automatica + casos + correo)
+After=network.target wazuh-manager.service
+Requires=wazuh-manager.service
+
+[Service]
+Type=simple
+User=aiayala
+WorkingDirectory=/home/aiayala/tesis/vigilante
+EnvironmentFile=/etc/motor-soc/watcher.env
+EnvironmentFile=/etc/motor-soc/notify.env
+ExecStart=/usr/bin/python3 /home/aiayala/tesis/vigilante/watcher.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
