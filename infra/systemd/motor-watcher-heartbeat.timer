@@ -1,0 +1,10 @@
+[Unit]
+Description=Corre el chequeo de heartbeat del vigilante FIM cada 15 minutos
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=motor-watcher-heartbeat.service
+
+[Install]
+WantedBy=timers.target

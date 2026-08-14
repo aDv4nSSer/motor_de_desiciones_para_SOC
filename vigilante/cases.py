@@ -19,6 +19,7 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
 
 CASES_KEY_PREFIX = "soc:cases:"
 CASES_INDEX_KEY = "soc:cases:index"  # set con todos los case_id, para listarlos
+HEARTBEAT_KEY = "soc:watcher:heartbeat"  # ultimo tick vivo de watcher.py, ver heartbeat_check.py
 
 VALID_STATES = {"abierto", "en_investigacion", "cerrado_confirmado", "cerrado_falso_positivo"}
 
@@ -72,6 +73,16 @@ def update_case_state(case_id: str, new_state: str, note: str = "") -> dict | No
     case["history"].append({"state": new_state, "at": now, "note": note})
     r.set(f"{CASES_KEY_PREFIX}{case_id}", json.dumps(case))
     return case
+
+
+def write_heartbeat() -> None:
+    """Marca que watcher.py sigue vivo y su loop principal esta corriendo.
+
+    Agnostico a si hay alertas reales -- se llama aunque no pase nada, para
+    que heartbeat_check.py pueda distinguir "sin ataques" de "proceso muerto".
+    """
+    r = _get_redis()
+    r.set(HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
 
 
 def get_case(case_id: str) -> dict | None:

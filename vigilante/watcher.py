@@ -15,7 +15,7 @@ import time
 import requests
 import urllib3
 
-from cases import open_case
+from cases import open_case, write_heartbeat
 from notify import send_case_email
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -37,6 +37,8 @@ WATCHED_PATH_FRAGMENT = "/wp-content/uploads/"
 
 # Idempotencia: no volver a abrir caso para el mismo path en esta ejecucion.
 _seen_paths: set[str] = set()
+
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 def get_wazuh_token() -> str | None:
@@ -142,9 +144,18 @@ Se requiere revision humana antes de restaurar el archivo o cerrar el caso.
 
 def tail_alerts():
     log.info(f"iniciando vigilancia de {ALERTS_FILE}")
+    last_heartbeat = 0.0
     with open(ALERTS_FILE, "r", errors="replace") as f:
         f.seek(0, os.SEEK_END)
         while True:
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                try:
+                    write_heartbeat()
+                except Exception as e:
+                    log.error(f"no se pudo escribir heartbeat (no fatal): {e}")
+                last_heartbeat = now
+
             line = f.readline()
             if not line:
                 time.sleep(1)
