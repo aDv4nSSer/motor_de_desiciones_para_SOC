@@ -1,0 +1,20 @@
+[Unit]
+Description=Motor SOC — Worker de respuesta (R1 enrich / R2 block)
+After=network.target redis-server.service
+Requires=redis-server.service
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=aiayala
+WorkingDirectory=/home/aiayala/tesis/motor
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m response.worker
+StandardOutput=append:/home/aiayala/tesis/motor/logs/worker.log
+StandardError=append:/home/aiayala/tesis/motor/logs/worker.log
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

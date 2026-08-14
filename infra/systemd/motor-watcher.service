@@ -2,6 +2,7 @@
 Description=Motor SOC - Vigilante FIM (cuarentena automatica + casos + correo)
 After=network.target wazuh-manager.service
 Requires=wazuh-manager.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
