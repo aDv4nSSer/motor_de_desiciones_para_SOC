@@ -2,7 +2,8 @@
 """
 etiquetador_diario.py v2 — Etiqueta flows usando AbuseIPDB para TODAS las IPs externas
 Tesis UBO — Motor de Decisiones SOC
-Cron en .139: 30 3 * * * ABUSEIPDB_KEY=xxx python3 /home/aiayala/tesis/ataques/etiquetador_diario.py
+Cron en .139: 30 3 * * * . /home/aiayala/tesis/ataques/.env && python3 /home/aiayala/tesis/ataques/etiquetador_diario.py
+Key leida desde /home/aiayala/tesis/ataques/.env (export ABUSEIPDB_KEY=...) — nunca inline en el cron.
 
 CAMBIO v2: consulta AbuseIPDB para todas las IPs externas (no solo alertadas),
            priorizando por volumen de flows para maximizar cobertura con el
