@@ -139,9 +139,16 @@ Todos los índices: `number_of_replicas: 0`, `index.codec: best_compression`. IS
 
 | Host | IP | Rol |
 |---|---|---|
-| Gen 10 | 200.54.12.139 | SOC principal: Suricata, Vector, Wazuh, Motor, Redis |
+| Gen 10 | 200.54.12.139 | Suricata, Wazuh Manager, honeypot Cowrie |
 | Gen 9 A | 200.54.12.138 | Web: nginx + WordPress + MariaDB (fuente de tráfico real) |
-| Gen 9 B | 200.54.12.142 | Secundario / entrenamiento / ataques controlados |
+| Lenovo | 200.54.12.140 | Motor FastAPI + Redis + OpenSearch (Docker) |
+
+> **Nota de migración (jul 2026):** esta tabla documentaba originalmente una arquitectura
+> "todo en `.139`" (Suricata, Vector, Wazuh, Motor, Redis) con `.142` (Gen 9 B) como
+> secundario/entrenamiento. El motor y Redis se migraron después a un host dedicado nuevo,
+> `.140` (Lenovo); `.142` quedó sin asignar. No es un error de esta sección — es una
+> migración de arquitectura posterior a la versión original. Ver variables de host en
+> `motor/response/config.py` y `.env` para el detalle operativo actual.
 
 Acceso: SSH desde PowerShell (Windows) + WSL2 (Ubuntu).
 Servicios nuevos en Docker, red interna Docker. Solo dashboard expuesto externamente.

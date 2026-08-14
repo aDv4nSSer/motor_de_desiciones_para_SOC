@@ -290,6 +290,52 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ---
 
+## H15 — Caída de Redis expone falta de supervisión de proceso en response.worker
+
+**Fecha:** 2026-08-11
+
+**Contexto:** `redis-server.service` (`.140`) dejó de estar disponible entre las 06:49 y las 22:34 (~15.5h). `motor-soc` (FastAPI, Fast Path) degradó con gracia como estaba diseñado — decisiones provisionales continuaron sin bloquear por IO externo. `response.worker`, en cambio, corría en ese momento como proceso sin supervisión de systemd (lanzado manualmente, sin unit propio), sin `Requires=redis-server.service` ni política de `Restart=`.
+
+**Hallazgo:** Al perder la conexión a Redis, `response.worker` no terminó ni entró en un ciclo de retry visible — quedó como proceso vivo pero funcionalmente muerto (zombie): sin consumir la stream `soc:response:tasks`, sin nuevas líneas `[ENFORCE]` en `worker.log`, sin excepción no capturada que un supervisor pudiera detectar. Cuando `redis-server.service` volvió a las 22:34, el worker **no** retomó el consumo por sí solo — siguió colgado en el mismo estado hasta que se lo mató manualmente (`kill`/`pkill`) y se relanzó a mano. El motor (FastAPI) sí se recuperó automáticamente al reconectar con Redis, confirmando que la degradación con gracia funciona correctamente en el Fast Path — el punto ciego era exclusivamente el worker.
+
+**Causa raíz:** Evento de reinicio masivo de servicios a las 06:49:02, patrón consistente con `unattended-upgrades`/`needrestart` tras la actualización de una librería compartida (121 actualizaciones pendientes, flag "system restart required" confirmado en el sistema). Docenas de servicios no relacionados se reiniciaron limpio en esa misma ventana; `redis-server` fue de los pocos en fallar el reinicio automático — exit-code 1, 5 intentos agotados antes de que systemd desistiera con "Start request repeated too quickly for redis-server.service".
+
+**Factor contribuyente:** `vm.overcommit_memory=0` en el host. El propio log de Redis advierte explícitamente que este valor puede causar fallos de arranque incluso sin baja memoria real (Redis necesita poder hacer `fork()` para el guardado en background del RDB; con overcommit=0 el kernel puede rechazar esa asignación bajo ciertas condiciones de memoria virtual comprometida). **Recomendación pendiente de aplicar** — al 2026-08-12 el valor sigue en `0`; no se cambió a `vm.overcommit_memory=1` (sin acceso SSH a `.140` para ejecutarlo o confirmarlo; ver bloqueo de acceso registrado en la sesión de auditoría del 2026-08-12).
+
+**Decisión:** Diseñar `response-worker.service` (systemd) con `Requires=redis-server.service`, `Restart=on-failure`, `RestartSec=5`, y `StartLimitIntervalSec=300`/`StartLimitBurst=6` calibrados para tolerar una reconexión breve pero no una caída sostenida — tras agotar el burst, el servicio queda en `failed` de forma visible en lugar de reintentar indefinidamente en silencio, forzando intervención humana ante un corte largo de Redis en vez de repetir el zombie de hoy en otra forma. Logging mantenido en `worker.log` (vía `StandardOutput=append:`) para no romper el paso 1 de la metodología de auditoría del skill `soc-audit`, que cuenta líneas `[ENFORCE]` ahí.
+
+**Evidencia:** Ventana de caída confirmada 06:49–22:34 (2026-08-11) en `journalctl -u redis-server` / ausencia de `[ENFORCE]` nuevos en `worker.log` durante ese rango. Proceso `response.worker` confirmado vivo pero sin actividad (`ps aux` mostraba PID activo sin avance de logs) antes del kill manual. El log específico de `redis-server` para la ventana del incidente (11 de agosto) ya no existe por rotación semanal — la causa raíz se reconstruyó vía `journalctl` del sistema (timestamps, exit codes y unidades reiniciadas), no del log de Redis mismo.
+
+**Nota metodológica — impacto en auditorías futuras:** el paso 1 de la metodología de `soc-audit` (comparar 1:1 líneas `[ENFORCE]` de `worker.log` contra `"command":"add"` en `active-responses.log` de `.138`) **debe excluir o marcar por separado la ventana 06:49–22:34 del 2026-08-11** al calcular cualquier discrepancia de conteo que abarque este día. Durante esa ventana el worker no procesó tareas por el zombie documentado acá, no por pérdida o duplicación real del pipeline — cualquier auditoría que cubra este rango sin anotar la exclusión reportaría una discrepancia inexplicada que en realidad ya está explicada y resuelta en este hallazgo.
+
+---
+
+## H16 — Punto ciego estructural: Suricata no ve tráfico directo al uplink ISP de .138
+
+**Fecha:** 2026-08-13
+
+**Contexto:** Al probar end-to-end la Parte A de detección experimental L7 (Suricata + los 9 SIDs de scanner/herramienta curados en `infra/suricata/enable.conf`), se envió tráfico de prueba real contra la landing page desplegada en `.138` (`curl` con payload de SQLi genérico `UNION ALL SELECT` y de path traversal unicode `..%c0%af..`, desde una IP pública externa real). Las alertas esperadas nunca aparecieron en `eve.json` de `.139` — ni siquiera como evento `http` normal sin alerta, lo que descartó de entrada explicaciones de encoding del payload o de umbral de regla (`sid:2012754` tiene además un `detection_filter` de 4 hits/20s, pero eso por sí solo no explica la ausencia total de cualquier rastro del tráfico).
+
+**Hallazgo:** `.138` tiene dos interfaces de red físicas con rutas por defecto independientes:
+```
+eno1: 200.54.12.138/29 → gateway 200.54.12.137    (uplink directo al ISP)
+eno2: 192.168.153.41/24 → gateway 192.168.153.254  (LAN interna del proyecto, DHCP)
+```
+El tráfico de prueba, dirigido directamente a la IP pública `200.54.12.138`, entra por `eno1` y nunca atraviesa ningún segmento visible para `.139`. La interfaz que Suricata captura en `.139` (`af-packet: interface: eno2`, IP `200.54.12.139/29`) está en el **mismo bloque `/29`** que `eno1` de `.138` — pero pertenecer al mismo subnet IP no implica visibilidad de captura en una red conmutada: un switch solo entrega a un puerto el tráfico dirigido a su propia MAC, salvo que exista un puerto espejo (SPAN/mirror) configurado explícitamente, y no hay evidencia de que exista tal mirror. Por eso Suricata solo ve tráfico donde `.139` mismo es origen o destino directo — confirmado con tráfico real ya presente en `eve.json`: scraping de Prometheus `.138→.139:9100`, un flow `.139→.138:80` originado por el propio `.139`, y peticiones del scanner externo real `l9explore` que sí aparecen logueadas — pero con `src_ip:200.54.12.139` en vez de la IP real del scanner (`45.148.10.125`, visible solo en un campo adicional), es decir, ese tráfico llegó a `.138` relayado a través de `.139` por algún mecanismo no investigado en esta sesión, no entrando directo por el ISP.
+
+**Decisión:** No se investiga ni se configura el puerto espejo esta semana — requiere acceso físico al switch (fuera del control directo del proyecto) y no hay tiempo de validarlo con seguridad antes de la próxima sesión. Se documenta como punto ciego estructural conocido de la Parte A. La detección L7 experimental sigue siendo válida para tráfico que efectivamente atraviese `.139` (confirmado con `l9explore`), pero **no detecta tráfico dirigido directamente a la IP pública de `.138` vía su uplink ISP propio** — que es, en un escenario realista, el camino más probable de un atacante apuntando directo a la IP publicada.
+
+**Evidencia:**
+- `curl -v "http://200.54.12.138/?id=1%20UNION%20ALL%20SELECT%20NULL--%20AND%201=1"` desde IP pública `201.188.180.46`, corrido dos veces (`05:27:50 UTC` y `06:27:51 UTC`) — confirmado `200 OK` real vía `docker logs demo-landing` en `.138` (contenedor nginx que sirve la landing page).
+- Cero coincidencias en `eve.json` completo (14.6GB) para `UNION%20ALL` y para `c0%af` (payload de traversal), en cualquier punto del archivo — no solo en la ventana de tiempo del test.
+- `ip -4 addr show` en `.138`: `eno1: 200.54.12.138/29`, `eno2: 192.168.153.41/24`; `ip route show default` confirma dos rutas por defecto independientes, una por interfaz.
+- `ip -4 addr show eno2` en `.139`: `200.54.12.139/29` — mismo `/29` que `eno1` de `.138`.
+- Tráfico del scanner `l9explore` (IP real `45.148.10.125`) presente en `eve.json` con `src_ip:200.54.12.139`, confirmando que Suricata ve tráfico que efectivamente pasa por `.139`, pero no el que entra directo por `eno1` de `.138`.
+
+**Lección de diseño:** estar en el mismo subnet IP no implica estar en el mismo dominio de visibilidad de captura de paquetes en una red conmutada. Cualquier arquitectura de monitoreo pasivo (Suricata, tcpdump, o similar) en un solo host necesita puerto espejo explícito hacia cada segmento físico que se quiera observar — la topología IP por sí sola no lo garantiza. Vale como advertencia general para cualquier despliegue futuro de sensores de red en este proyecto, no solo para `.138`.
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - **Inestabilidad de conexión periódica agente-manager:** patrón recurrente (~cada hora) de "Agent key already in use", "Response timeout", "Cannot send request to agent" entre .139 y .138. Causa no confirmada — candidatos: desincronización de reloj, proceso periódico en .138 reiniciando la conexión, configuración de keepalive. Pendiente investigar antes de noviembre, puede explicar fallos silenciosos de Active Response a futuro.
