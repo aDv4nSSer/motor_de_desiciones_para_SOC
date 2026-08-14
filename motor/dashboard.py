@@ -198,6 +198,166 @@ def get_port_stats(window_minutes: int = 60, top_n: int = 15) -> list[dict]:
     return out
 
 
+# ── Precisión corroborada (metodología: .claude/skills/soc-audit/SKILL.md) ──
+ABUSEIPDB_HIGH_SCORE_THRESHOLD = 40  # score >= 40 AbuseIPDB = corroboración real (ver H3, BITACORA_TECNICA.md)
+PRECISION_SCAN_LIMIT = 60_000        # tope de entradas de soc:response:audit a inspeccionar por consulta
+                                      # (margen ~1.6x sobre 24h de tráfico real medido el 2026-08-12, ~1559/h)
+
+
+def get_precision_stats(window_minutes: int = 60) -> dict:
+    """Precisión de bloqueos R2 corroborada externamente por AbuseIPDB.
+
+    Separa siempre decisiones con corroboración disponible de las que no la
+    tienen (cuota de API u otro fallo) — nunca se mezclan en una sola cifra
+    de precisión, siguiendo la metodología de auditoría del proyecto.
+
+    Args:
+        window_minutes: ventana de tiempo hacia atrás desde ahora.
+
+    Returns:
+        dict con total de bloqueos, desglose corroborado/sin-corroborar y
+        el % de corroborados con score alto. `available=False` si Redis falla.
+    """
+    since_ts = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).timestamp()
+
+    r = _get_redis()
+    try:
+        entries = r.xrevrange(RESPONSE_AUDIT_STREAM, count=PRECISION_SCAN_LIMIT)
+    except redis.RedisError as e:
+        log.error(f"error leyendo auditoría de respuestas para precisión: {e}")
+        return {"available": False, "window_minutes": window_minutes}
+
+    corroborated_total = 0
+    corroborated_high = 0
+    uncorroborated_total = 0
+
+    for _msg_id, fields in entries:
+        try:
+            record = json.loads(fields.get("data", "{}"))
+        except json.JSONDecodeError:
+            continue
+
+        if record.get("processed_at", 0.0) < since_ts:
+            break  # xrevrange es descendente en el tiempo — el resto es aún más viejo
+
+        block = record.get("block") or {}
+        if block.get("action") != "block":
+            continue
+
+        enrichment = record.get("enrichment") or {}
+        if enrichment.get("abuseipdb_available"):
+            corroborated_total += 1
+            score = enrichment.get("abuseipdb_score")
+            if score is not None and score >= ABUSEIPDB_HIGH_SCORE_THRESHOLD:
+                corroborated_high += 1
+        else:
+            uncorroborated_total += 1
+
+    precision_pct = (
+        round(100 * corroborated_high / corroborated_total, 1)
+        if corroborated_total > 0 else None
+    )
+
+    return {
+        "available": True,
+        "window_minutes": window_minutes,
+        "total_blocks": corroborated_total + uncorroborated_total,
+        "corroborated": {
+            "count": corroborated_total,
+            "high_score_count": corroborated_high,
+            "precision_pct": precision_pct,
+            "threshold": ABUSEIPDB_HIGH_SCORE_THRESHOLD,
+        },
+        "uncorroborated": {
+            "count": uncorroborated_total,
+        },
+    }
+
+
+# ── Salud del vigilante FIM (heartbeat, ver vigilante/cases.py:write_heartbeat) ─
+WATCHER_HEARTBEAT_KEY = "soc:watcher:heartbeat"
+HEARTBEAT_GREEN_MAX_MINUTES = 15
+HEARTBEAT_YELLOW_MAX_MINUTES = 60
+
+
+def get_watcher_heartbeat() -> dict:
+    """Estado del último heartbeat del vigilante FIM (motor-watcher.service en .139).
+
+    Returns:
+        dict con `status` (green/yellow/red), `age_minutes` y `last_seen` ISO.
+        `status="red"` si la key no existe, el formato es inválido, o Redis falla.
+    """
+    r = _get_redis()
+    try:
+        raw = r.get(WATCHER_HEARTBEAT_KEY)
+    except redis.RedisError as e:
+        log.error(f"error leyendo heartbeat del vigilante: {e}")
+        return {"available": False, "status": "red", "age_minutes": None, "last_seen": None}
+
+    if raw is None:
+        return {"available": True, "status": "red", "age_minutes": None, "last_seen": None}
+
+    try:
+        last = datetime.fromisoformat(raw)
+    except ValueError:
+        log.error(f"heartbeat con formato inválido en redis: {raw!r}")
+        return {"available": True, "status": "red", "age_minutes": None, "last_seen": None}
+
+    age_minutes = (datetime.now(timezone.utc) - last).total_seconds() / 60
+    if age_minutes < HEARTBEAT_GREEN_MAX_MINUTES:
+        status = "green"
+    elif age_minutes < HEARTBEAT_YELLOW_MAX_MINUTES:
+        status = "yellow"
+    else:
+        status = "red"
+
+    return {
+        "available": True,
+        "status": status,
+        "age_minutes": round(age_minutes, 1),
+        "last_seen": raw,
+    }
+
+
+# ── Detección experimental L7 + DNS/DGA (modo observación pura) ────────────
+# Ver vigilante/shadow_detect.py -- nunca conectado a R1/R2 ni a soc-decisions.
+EXPERIMENTAL_INDEX = "soc-experimental-detections"
+
+
+def get_experimental_detections(limit: int = 20) -> dict:
+    """Hallazgos experimentales en modo observación pura (L7 + DNS/DGA).
+
+    Lee soc-experimental-detections -- índice separado, sin relación con
+    R1/R2 ni con el pipeline de decisión real. Las dos fuentes (l7_shadow,
+    dga_shadow) se devuelven en listas separadas, nunca mezcladas.
+
+    Args:
+        limit: máximo de hallazgos a devolver por fuente.
+
+    Returns:
+        dict con `available`, `l7` (lista) y `dns_dga` (lista).
+        `available=False` si OpenSearch no responde para alguna de las dos.
+    """
+    def _search(source: str) -> list[dict] | None:
+        query = {
+            "size": limit,
+            "sort": [{"detected_at": {"order": "desc"}}],
+            "query": {"term": {"source.keyword": source}},
+        }
+        result = _os_request("POST", f"/{EXPERIMENTAL_INDEX}/_search", query)
+        if result is None:
+            return None
+        return [h["_source"] for h in result.get("hits", {}).get("hits", [])]
+
+    l7 = _search("l7_shadow")
+    dns_dga = _search("dga_shadow")
+
+    if l7 is None or dns_dga is None:
+        return {"available": False}
+
+    return {"available": True, "l7": l7, "dns_dga": dns_dga}
+
+
 # ── Gestion de casos (escritos por el vigilante en .139) ──────────────────
 CASES_KEY_PREFIX = "soc:cases:"
 CASES_INDEX_KEY = "soc:cases:index"

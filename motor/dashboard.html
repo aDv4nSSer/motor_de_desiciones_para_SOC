@@ -178,6 +178,40 @@
   .action.hot { border-color: var(--signal); color: var(--signal); background: var(--signal-dim); }
   .empty { color: var(--pewter); font-style: italic; padding: 20px 0; text-align: center; font-family: var(--sans); }
 
+  .precision-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+  .precision-sub { padding: 18px 20px; background: var(--card-2); border: 1px solid var(--hairline-2); border-radius: var(--radius-sm); }
+  .precision-sub h3 { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--pewter); margin: 0 0 12px; font-weight: 400; }
+
+  .precision-pct-big { font-family: var(--cond); font-size: 34px; font-weight: 700; letter-spacing: -0.6px; color: var(--cyan); line-height: 1; }
+  .precision-pct-big.na { color: var(--pewter); font-size: 20px; }
+  .precision-caption { font-size: 11px; color: var(--graphite); margin-top: 6px; line-height: 1.4; min-height: 30px; }
+  .precision-split { display: flex; gap: 18px; margin-top: 14px; font-family: var(--mono); font-size: 11px; }
+  .precision-split .item { flex: 1; }
+  .precision-split .item .lbl { color: var(--pewter); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .precision-split .item .val { font-family: var(--cond); font-size: 20px; font-weight: 600; color: var(--ink); margin-top: 3px; }
+  .precision-split .item.dim .val { color: var(--graphite); }
+  .precision-note { font-size: 10px; color: var(--pewter); margin-top: 10px; line-height: 1.4; }
+
+  .heartbeat-row { display: flex; align-items: center; gap: 12px; }
+  .heartbeat-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; background: var(--ash); }
+  .heartbeat-dot.green { background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
+  .heartbeat-dot.yellow { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+  .heartbeat-dot.red { background: var(--signal); box-shadow: 0 0 10px var(--signal); }
+  .heartbeat-text .lead { font-family: var(--cond); font-size: 15px; font-weight: 600; color: var(--ink); }
+  .heartbeat-text .sub { font-size: 11px; color: var(--pewter); margin-top: 4px; line-height: 1.4; }
+
+  .experimental-card { border-left: 3px solid var(--cyan); }
+  .exp-badge {
+    display: inline-block; margin-left: 10px; font-family: var(--mono); font-size: 9px;
+    text-transform: uppercase; letter-spacing: 0.5px; padding: 3px 8px; border-radius: 8px;
+    border: 1px solid var(--cyan); color: var(--cyan); background: rgba(45,212,200,0.08);
+    vertical-align: middle; white-space: nowrap;
+  }
+  .experimental-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .exp-source { padding: 18px 20px; background: var(--card-2); border: 1px solid var(--hairline-2); border-radius: var(--radius-sm); }
+  .exp-source h3 { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--pewter); margin: 0 0 12px; font-weight: 400; }
+  .exp-source .scroll { max-height: 260px; }
+
   ::-webkit-scrollbar { width: 7px; height: 7px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--hairline); border-radius: 4px; }
@@ -188,7 +222,7 @@
     .queue-block { border-right: none; border-bottom: 1px solid var(--hairline); }
     .ops { grid-template-columns: repeat(3, 1fr); }
     .ops .op:nth-child(3) { border-right: none; }
-    .grid2, .tables { grid-template-columns: 1fr; gap: 20px; }
+    .grid2, .tables, .precision-grid, .experimental-grid { grid-template-columns: 1fr; gap: 20px; }
     .queue-n { font-size: 60px; }
   }
   @media (max-width: 560px) {
@@ -250,21 +284,21 @@
     <div class="relief-block">
       <div class="relief-top">
         <div class="relief-pct" id="reliefPct">—</div>
-        <div class="relief-label">de los flujos evaluados se resolvieron sin abrir un caso</div>
+        <div class="relief-label">de los flujos evaluados no dispararon una alerta T2 (riesgo medio)</div>
       </div>
       <div class="load-bar" id="loadBar"></div>
       <div class="load-key">
         <div class="k"><span class="sw" style="background:var(--dust)"></span>Permitido</div>
         <div class="k"><span class="sw" style="background:var(--ash)"></span>Registrado</div>
         <div class="k"><span class="sw" style="background:var(--graphite)"></span>Bloqueado por el motor</div>
-        <div class="k signal"><span class="sw" style="background:var(--signal)"></span>Escalado</div>
+        <div class="k signal"><span class="sw" style="background:var(--signal)"></span>Alerta (T2)</div>
       </div>
     </div>
   </div>
 
   <div class="ops">
     <div class="op"><div class="cap">Decisiones evaluadas</div><div class="n" id="opTotal">—</div><div class="foot" id="opRate">—</div></div>
-    <div class="op"><div class="cap">Latencia mediana</div><div class="n" id="opAvg">—<span class="unit">ms</span></div><div class="foot">inferencia por flujo</div></div>
+    <div class="op"><div class="cap">Latencia promedio</div><div class="n" id="opAvg">—<span class="unit">ms</span></div><div class="foot">inferencia por flujo</div></div>
     <div class="op"><div class="cap">Latencia p95</div><div class="n" id="opP95">—<span class="unit">ms</span></div><div class="foot">cola de peor caso</div></div>
     <div class="op"><div class="cap">Bloqueos vigentes</div><div class="n" id="opBlocks">—</div><div class="foot">respuesta automática R2</div></div>
     <div class="op"><div class="cap">Ataques externos</div><div class="n" id="opExternal">—</div><div class="foot" id="opExternalTop">—</div></div>
@@ -283,6 +317,76 @@
     </div>
   </div>
   <div id="casesList"></div>
+</div>
+
+<div class="card card-pad">
+  <div class="sec-head">
+    <div>
+      <h2>Precisión y calibración</h2>
+      <div class="sec-note">Distribución por tier, corroboración externa del bloqueo automático, y salud del vigilante FIM.</div>
+    </div>
+  </div>
+  <div class="precision-grid">
+    <div class="precision-sub">
+      <h3>Desglose por tier</h3>
+      <div id="precisionTierBars"></div>
+    </div>
+    <div class="precision-sub">
+      <h3>Precisión corroborada (AbuseIPDB)</h3>
+      <div class="precision-pct-big" id="precisionPct">—</div>
+      <div class="precision-caption" id="precisionCaption">Cargando…</div>
+      <div class="precision-split">
+        <div class="item">
+          <div class="lbl">Corroboradas</div>
+          <div class="val" id="precisionCorroborated">—</div>
+        </div>
+        <div class="item dim">
+          <div class="lbl">Sin corroboración</div>
+          <div class="val" id="precisionUncorroborated">—</div>
+        </div>
+      </div>
+      <div class="precision-note">Sin corroboración = cuota de API u otro fallo de AbuseIPDB, no un error del modelo. Nunca se mezcla con la cifra de precisión.</div>
+    </div>
+    <div class="precision-sub">
+      <h3>Salud del vigilante FIM</h3>
+      <div class="heartbeat-row">
+        <div class="heartbeat-dot" id="watcherDot"></div>
+        <div class="heartbeat-text">
+          <div class="lead" id="watcherLead">—</div>
+          <div class="sub" id="watcherSub">Cargando…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card card-pad experimental-card">
+  <div class="sec-head">
+    <div>
+      <h2>Detección Experimental (L7 + DNS)<span class="exp-badge">Modo observación</span></h2>
+      <div class="sec-note">No conectado a bloqueo automático (R1/R2). Señales de investigación, no decisiones del motor.</div>
+    </div>
+  </div>
+  <div class="experimental-grid">
+    <div class="exp-source">
+      <h3>Alertas L7 (Suricata — scanners/herramientas, ver enable.conf)</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Hace</th><th>Firma</th><th>Origen</th><th class="r">Puerto</th></tr></thead>
+          <tbody id="expL7Body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="exp-source">
+      <h3>Dominios DGA sospechosos (entropía de Shannon)</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Hace</th><th>Dominio</th><th class="r">Entropía</th><th>Origen</th></tr></thead>
+          <tbody id="expDnsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="card card-pad">
@@ -381,8 +485,8 @@ function renderQueue(openCases) {
   nEl.className = 'queue-n ' + (n === 0 ? 'zero' : 'hot');
   $('queueLead').textContent = n === 1 ? 'caso requiere revisión humana' : 'casos requieren revisión humana';
   $('queueSub').textContent = n === 0
-    ? 'Nada pendiente. El motor está resolviendo todo dentro de su umbral de confianza.'
-    : 'Cada uno es un hallazgo que el motor no puede cerrar solo — requiere criterio humano.';
+    ? 'Nada pendiente. El vigilante FIM no detectó incidentes nuevos.'
+    : 'Cada uno es un hallazgo del vigilante FIM que requiere criterio humano para cerrarse.';
 
   const abiertos = openCases.filter(c => c.state === 'abierto').length;
   const investigacion = openCases.filter(c => c.state === 'en_investigacion').length;
@@ -527,10 +631,74 @@ function renderPorts(ports) {
   $('opExternal').textContent = num(externalTotal);
   if (externalPorts.length) {
     const top = [...externalPorts].sort((a,b) => b.count - a.count)[0];
-    $('opExternalTop').textContent = `top: ${top.name} (:${top.port})`;
+    $('opExternalTop').textContent = `top: ${top.name} (:${top.port}) · ${num(top.count)}`;
   } else {
     $('opExternalTop').textContent = 'sin actividad';
   }
+}
+
+function renderPrecision(p) {
+  if (!p.available) {
+    $('precisionPct').classList.add('na');
+    $('precisionPct').textContent = '—';
+    $('precisionCaption').textContent = 'Sin datos disponibles.';
+    $('precisionCorroborated').textContent = '—';
+    $('precisionUncorroborated').textContent = '—';
+    return;
+  }
+  const c = p.corroborated || {};
+  const u = p.uncorroborated || {};
+  const pctEl = $('precisionPct');
+  if (c.precision_pct == null) {
+    pctEl.classList.add('na');
+    pctEl.textContent = 'N/D';
+    $('precisionCaption').textContent = 'Sin bloqueos corroborados en esta ventana.';
+  } else {
+    pctEl.classList.remove('na');
+    pctEl.textContent = String(c.precision_pct).replace('.', ',') + '%';
+    $('precisionCaption').textContent = `${num(c.high_score_count)} de ${num(c.count)} bloqueos corroborados con score AbuseIPDB alto (≥${c.threshold})`;
+  }
+  $('precisionCorroborated').textContent = num(c.count || 0);
+  $('precisionUncorroborated').textContent = num(u.count || 0);
+}
+
+function renderWatcherHeartbeat(h) {
+  const dot = $('watcherDot');
+  dot.className = 'heartbeat-dot ' + (h.status || 'red');
+  if (h.last_seen == null) {
+    $('watcherLead').textContent = 'Sin heartbeat registrado';
+    $('watcherSub').textContent = 'El vigilante FIM nunca reportó actividad, o Redis no responde.';
+    return;
+  }
+  const mins = h.age_minutes;
+  const ago = mins < 60 ? `hace ${mins.toFixed(0)} min` : `hace ${(mins/60).toFixed(1)} h`;
+  $('watcherLead').textContent = `Última actividad: ${ago}`;
+  $('watcherSub').textContent = h.status === 'green' ? 'Operando con normalidad.'
+    : h.status === 'yellow' ? 'Sin confirmar en el último tramo — vigilar.'
+    : 'Posible caída del vigilante — revisar systemctl status motor-watcher en .139.';
+}
+
+function renderExperimental(data) {
+  const l7Body = $('expL7Body');
+  const dnsBody = $('expDnsBody');
+
+  if (!data.available) {
+    l7Body.innerHTML = `<tr><td colspan="4" class="empty">Sin datos disponibles</td></tr>`;
+    dnsBody.innerHTML = `<tr><td colspan="4" class="empty">Sin datos disponibles</td></tr>`;
+    return;
+  }
+
+  const l7 = data.l7 || [];
+  l7Body.innerHTML = !l7.length
+    ? `<tr><td colspan="4" class="empty">Sin alertas L7 experimentales</td></tr>`
+    : l7.map(f => `
+      <tr><td class="dim">${fmtAgo(f.timestamp)}</td><td>${esc(f.signature)}</td><td class="dim">${esc(f.src_ip)}</td><td class="r">${esc(f.dest_port)}</td></tr>`).join('');
+
+  const dnsDga = data.dns_dga || [];
+  dnsBody.innerHTML = !dnsDga.length
+    ? `<tr><td colspan="4" class="empty">Sin dominios sospechosos</td></tr>`
+    : dnsDga.map(f => `
+      <tr><td class="dim">${fmtAgo(f.timestamp)}</td><td>${esc(f.domain)}</td><td class="r">${f.entropy != null ? f.entropy.toFixed(2) : '—'}</td><td class="dim">${esc(f.src_ip)}</td></tr>`).join('');
 }
 
 function renderBlocks(blocks) {
@@ -588,7 +756,7 @@ $('caseFilters').addEventListener('click', e => {
 async function refresh() {
   const windowMin = Number($('windowSelect').value);
   try {
-    const [stats, decisions, blocks, responses, ports, openCases, listedCases] = await Promise.all([
+    const [stats, decisions, blocks, responses, ports, openCases, listedCases, precision, watcherHeartbeat, experimental] = await Promise.all([
       fetchJSON(`/api/dashboard/stats?window_minutes=${windowMin}`),
       fetchJSON(`/api/dashboard/decisions?limit=100`),
       fetchJSON(`/api/dashboard/blocks/active`),
@@ -596,6 +764,9 @@ async function refresh() {
       fetchJSON(`/api/dashboard/ports?window_minutes=${windowMin}&top_n=15`),
       fetchJSON(`/api/dashboard/cases?only_open=true&limit=100`),
       fetchJSON(`/api/dashboard/cases?only_open=${caseFilter === 'open'}&limit=50`),
+      fetchJSON(`/api/dashboard/precision?window_minutes=${windowMin}`),
+      fetchJSON(`/api/dashboard/watcher-heartbeat`),
+      fetchJSON(`/api/dashboard/experimental?limit=20`),
     ]);
 
     lastSuccessAt = new Date();
@@ -616,12 +787,16 @@ async function refresh() {
         ['ALLOW','LOG','BLOCK','ALERT'],
         {ALLOW:'Permitir', LOG:'Registrar', BLOCK:'Bloquear', ALERT:'Escalar'},
         DECISION_COLOR, 'ALERT');
+      renderDist('precisionTierBars', stats.por_tier || {}, TIER_KEYS, TIER_LABEL, TIER_FILL, 'T3_CRITICO');
     }
 
     renderPorts(ports);
     renderDecisions(decisions);
     renderBlocks(blocks);
     renderResponses(responses);
+    renderPrecision(precision);
+    renderWatcherHeartbeat(watcherHeartbeat);
+    renderExperimental(experimental);
   } catch (e) {
     $('beat').classList.add('stale');
     $('statusText').textContent = 'sin conexión · reintentando';

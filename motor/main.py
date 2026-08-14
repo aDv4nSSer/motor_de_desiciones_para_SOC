@@ -15,6 +15,7 @@ from response.queue import enqueue_response_task
 from dashboard import (
     get_stats, get_recent_decisions, get_active_blocks, get_recent_responses,
     get_port_stats, list_cases, update_case_state,
+    get_precision_stats, get_watcher_heartbeat, get_experimental_detections,
 )
 from auth import verify_credentials
 
@@ -173,6 +174,18 @@ async def dashboard_page(user: str = Depends(verify_credentials)):
 @app.get("/api/dashboard/ports")
 async def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: str = Depends(verify_credentials)):
     return get_port_stats(window_minutes, top_n)
+
+@app.get("/api/dashboard/precision")
+async def dashboard_precision(window_minutes: int = 60, user: str = Depends(verify_credentials)):
+    return get_precision_stats(window_minutes)
+
+@app.get("/api/dashboard/watcher-heartbeat")
+async def dashboard_watcher_heartbeat(user: str = Depends(verify_credentials)):
+    return get_watcher_heartbeat()
+
+@app.get("/api/dashboard/experimental")
+async def dashboard_experimental(limit: int = 20, user: str = Depends(verify_credentials)):
+    return get_experimental_detections(limit)
 
 
 # ── Casos (requieren autenticacion) ──────────────────────────────────────
