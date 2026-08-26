@@ -9,6 +9,37 @@ Semillero: julio 2026 (~90%) | Defensa: noviembre 2026 | Branch activo: develop
 
 ---
 
+## Contexto reciente (semana del 18–25 ago 2026)
+
+La red del laboratorio migró de subred plana a NAT/VLANs con `.139` como
+bastion/gateway obligatorio, y se corrigió un bug de firewall que dejaba a
+Suricata casi ciego pese a estar activo. No afecta al modelo, a los features
+ni al pipeline de entrenamiento — es infraestructura de red pura, a cargo de
+Antonio. Detalle completo en `docs/BITACORA_TECNICA.md` (H16–H21); estado
+operativo resumido en la sección Infraestructura más abajo.
+
+---
+
+## Para Joaquín — tu parte esta semana
+
+Tus tareas actuales, con dueño y fecha, viven en `docs/PLAN_SPRINTS.md`
+(Sprint 1 en adelante) — ahí está el detalle semana a semana de
+reentrenamiento LightGBM (Camino E, GroupKFold host-disjunto), tablas/
+gráficos comparativos de métricas, y las secciones de Marco Teórico y
+Resultados que te corresponden. Referencias técnicas de apoyo:
+`.claude/rules/model-contract.md` (contrato de features y versión activa del
+modelo — verificar siempre ahí antes de tocar el feature set o los
+thresholds) y los hallazgos H1–H10 de `docs/BITACORA_TECNICA.md` (domain
+shift, data leakage, etiquetado, límites del Isolation Forest).
+
+**No necesitás tocar** red, VLANs, Suricata, bastion host ni la sección
+Infraestructura de este documento — eso lo maneja Antonio. Si algo de esa
+parte te bloquea (por ejemplo, acceso a `.140` para correr un
+reentrenamiento), avisale a él directamente en vez de intentar resolverlo
+por tu cuenta.
+
+---
+
 ## Stack
 
 | Capa | Herramienta / Versión |
@@ -137,21 +168,41 @@ Todos los índices: `number_of_replicas: 0`, `index.codec: best_compression`. IS
 
 ## Infraestructura
 
-| Host | IP | Rol |
-|---|---|---|
-| Gen 10 | 200.54.12.139 | Suricata, Wazuh Manager, honeypot Cowrie |
-| Gen 9 A | 200.54.12.138 | Web: nginx + WordPress + MariaDB (fuente de tráfico real) |
-| Lenovo | 200.54.12.140 | Motor FastAPI + Redis + OpenSearch (Docker) |
+| Host | IP pública / privada | Rol | Estado migración |
+|---|---|---|---|
+| Gen 10 (`.139`) | 200.54.12.139 (SSH puerto 2222) | Bastion/NAT gateway in-line, Suricata, Wazuh Manager, honeypot Cowrie | Migrado — trunk VLAN vía `eno2` |
+| Lenovo (`.140`) | 10.10.10.3 (VLAN 10) | Motor FastAPI + Redis + OpenSearch (Docker) | Migrado — SSH puerto 2222 |
+| Gen 9 A (`.138`) | 200.54.12.138 (pública, aún directa) | Web: nginx + WordPress + MariaDB (fuente de tráfico real) | Pendiente (requiere acceso físico) |
+| `.141` (Eliecer, IA) | 10.20.20.2 (VLAN 20, aún no operativo) | Servidor de terceros | Pendiente |
+| `.142` (Agustín, emprendedores) | 10.20.20.3 (VLAN 20, aún no operativo) | Servidor de terceros | Pendiente, falta cablear al switch |
 
-> **Nota de migración (jul 2026):** esta tabla documentaba originalmente una arquitectura
-> "todo en `.139`" (Suricata, Vector, Wazuh, Motor, Redis) con `.142` (Gen 9 B) como
-> secundario/entrenamiento. El motor y Redis se migraron después a un host dedicado nuevo,
-> `.140` (Lenovo); `.142` quedó sin asignar. No es un error de esta sección — es una
-> migración de arquitectura posterior a la versión original. Ver variables de host en
-> `motor/response/config.py` y `.env` para el detalle operativo actual.
+> **Nota de migración (ago 2026):** la topología pasó de subred plana `200.54.12.136/29`
+> compartida por todos los hosts a NAT/gateway con VLANs sobre `.139` (in-line, ya no
+> sensor pasivo con SPAN). `.139` mantiene IP pública directa (bastion/jump host
+> obligatorio); `.140` ya vive solo en VLAN 10 (`10.10.10.0/24`) sin IP pública propia.
+> `.138`, `.141`, `.142` siguen con su acceso viejo hasta que se migren físicamente.
+> Detalle completo, verificación por SSH y hallazgos (H17–H20) en `docs/BITACORA_TECNICA.md`.
+> Reemplaza la nota de jul 2026 sobre migración de Motor/Redis a `.140`, que sigue vigente
+> a nivel de servicio pero ya no a nivel de red (ese host ya no tiene IP pública).
 
-Acceso: SSH desde PowerShell (Windows) + WSL2 (Ubuntu).
-Servicios nuevos en Docker, red interna Docker. Solo dashboard expuesto externamente.
+**Acceso SSH — bastion obligatorio para todo host detrás de VLAN:**
+
+```bash
+# Directo al bastion (.139) — sigue con IP pública
+ssh -i ~/.ssh/tesis_ubo_aiayala -p 2222 aiayala@200.54.12.139
+
+# A cualquier host en VLAN (ejemplo .140 en VLAN 10) — jump host via .139
+# OJO: especificar -p 2222 tanto para el jump como para el destino final,
+# el SSH interno de cada host migrado corre en 2222, no en el 22 estándar.
+ssh -i ~/.ssh/tesis_ubo_aiayala -p 2222 -J aiayala@200.54.12.139:2222 aiayala@10.10.10.3
+```
+
+`.138`, `.141`, `.142` (no migrados aún) se siguen alcanzando por su IP pública/ruta vieja
+directa — no aplican el flujo de jump host hasta que se migren.
+
+Servicios nuevos en Docker, red interna Docker. Solo dashboard expuesto externamente
+(nginx reverse proxy en `.139` → `proxy_pass` a la IP privada de cada host, ej.
+`motor-soc-ubo.duckdns.org` → `10.10.10.3:8000`).
 Redis: `maxmemory-policy allkeys-lru`. Uvicorn: ≤2 workers por servicio (RAM limitada).
 OpenSearch heap: `Xms = Xmx ≤ 8GB`. ISM policy activa en todos los índices.
 
