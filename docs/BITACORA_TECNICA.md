@@ -13,47 +13,63 @@
 | H1 | Domain shift en datasets académicos | Alto | Documentado |
 | H2 | L4_SRC_PORT es data leakage | Alto | Resuelto |
 | H3 | Etiquetado por IP vs comportamiento | Alto | Resuelto |
-| H4 | Isolation Forest no detecta escaneos | Medio | Documentado |
+| H4 | Isolation Forest no detecta escaneos | Medio | Documentado — refinado por H6, no reemplazado |
 | H5 | Honeypot como fuente de telemetría real | Alto | Implementado |
+| H6 | Isolation Forest segmentado por presencia de respuesta | Medio | Implementado |
+| H7 | Desajuste de features IF entre entrenamiento e inferencia | Alto | Resuelto |
+| H8 | Colisión IP investigador/atacante en etiquetado por campaña | Alto | Resuelto |
+| H9 | Cowrie caído 3 días por PATH faltante en systemd | Medio | Resuelto |
+| H10 | Feature contract rechaza sesiones largas (Golden 4) | Medio | Documentado — limitación conocida, sin fix |
+| H11 | Payload incompatible en Wazuh Active Response on-demand | Alto | Resuelto |
+| H12 | FIM ampliado a WordPress + bug de detección realtime | Alto | Mitigado — causa raíz de realtime sigue abierta |
+| H13 | Cuarentena de archivo como 2da forma de Active Response | Alto | Implementado |
+| H14 | Timeout de systemd insuficiente en wazuh-manager | Medio | Resuelto |
+| H15 | Caída de Redis expone falta de supervisión en response.worker | Alto | Documentado — fix diseñado, implementación sin confirmar (ver nota en la entrada) |
+| H16 | Punto ciego: Suricata no ve tráfico directo al uplink ISP de .138 | Alto | **Superado por H17 (arquitectura) y H21 (confirmación empírica)** |
+| H17 | Migración de topología: subred plana → NAT/gateway con VLANs | Alto | Implementado parcialmente — ver nota de alcance en la entrada |
+| H18 | Riesgo de comodín en perfil NetworkManager de `.139` | Medio | Resuelto |
+| H19 | Cambio de VLAN de gestión del switch — "no route to host" | Bajo | Resuelto |
+| H20 | Switch SG350: firmware solo ofrece algoritmos SSH obsoletos | Bajo | Mitigado — workaround en cliente, firmware pendiente |
+| H21 | Suricata in-line con cero alertas — orden de reglas en `before.rules` | Alto | Resuelto — retest confirmado con evidencia |
 
 ---
 
 ## H1 — Domain shift: el modelo aprende el laboratorio, no el ataque
 
 **Fecha:** Sesiones iniciales
-**Contexto:** Al entrenar con datasets NF-v3 Queensland, el modelo alcanzaba AUC 0.99+, sospechosamente alto.
+**Contexto:** Al entrenar con datasets NF-v3 Queensland, el modelo alcanzaba AUC 0.99+, sospechosamente alto. Un AUC tan cercano al máximo teórico en un problema de detección de intrusiones es una señal de alarma clásica, no un resultado a celebrar sin más: suele indicar que el modelo está aprendiendo algo más fácil de separar que el fenómeno real (el ataque), como un artefacto del propio proceso de captura del dataset.
 
-**Hallazgo:** Un experimento de "predecir el dataset" logró 99.9% de accuracy identificando de qué dataset provenía un flujo, usando solo las features de red. Esto significa que el modelo aprendía la **firma del ambiente de laboratorio** (rangos de IP, patrones de captura) en lugar de patrones de ataque genuinos.
+**Hallazgo:** Para probar esa sospecha se corrió un experimento de "predecir el dataset": entrenar un clasificador cuya única tarea es decir de cuál de los datasets que componen el corpus NF-v3 proviene un flujo dado, usando exactamente las mismas features de red que el modelo de detección (sin la etiqueta de ataque/benigno). Ese clasificador auxiliar logró 99.9% de accuracy — es decir, las features por sí solas casi identifican unívocamente el origen del flujo. Contienen una "huella" del entorno de captura (rangos de IP propios de ese laboratorio, patrones de timing o de conteo de paquetes propios de cómo se generó ese dataset en particular) mucho más fuerte que cualquier patrón de ataque genérico. Un modelo de detección entrenado sobre esas mismas features puede alcanzar AUC alto simplemente reconociendo "esto viene del dataset X, que tiene muchos ataques" en vez de reconociendo qué hace que un flujo *sea* un ataque — funcionaría casi perfecto en evaluación (mismos datasets, split aleatorio) y degradaría en producción real, donde esa huella de laboratorio no existe.
 
-**Decisión:** Estimar el rendimiento realista de producción en AUC 0.93–0.97, no el 0.99 académico. Adoptar GroupKFold con split host-disjunto para el reentrenamiento de tesis (Camino E).
+**Decisión:** Estimar el rendimiento realista de producción en AUC 0.93–0.97, no el 0.99 académico — descontando explícitamente el margen que corresponde a la fuga de identidad de dataset. Adoptar GroupKFold con split host-disjunto (agrupando por IP origen del flujo) para el reentrenamiento de tesis (Camino E): en vez de repartir flows individuales al azar entre train y test —donde flows del mismo host pueden terminar en ambos lados, dejando que el modelo memorice ese host en vez de generalizar—, GroupKFold obliga a que todos los flows de un mismo grupo (host) caigan enteros en un solo lado del split, impidiendo que el modelo se beneficie de haber "visto" ese host durante entrenamiento al evaluarlo. La separación se mantiene explícita también en el código de reetiquetado: `scripts/training/relabeling/re_labeler.py` documenta en su cabecera que el campo `host_group` (IP origen) "es SOLO para GroupKFold — NUNCA entra al modelo", para que el agrupamiento del split no se filtre por accidente como feature.
 
-**Evidencia:** Experimento predict-the-dataset, accuracy 99.9%.
+**Evidencia:** Experimento predict-the-dataset, accuracy 99.9% identificando el dataset de origen a partir únicamente de las features de red.
 
 ---
 
 ## H2 — L4_SRC_PORT es fuga de datos (data leakage)
 
 **Fecha:** Diseño del feature contract
-**Contexto:** El puerto de origen aparecía como feature muy predictiva.
+**Contexto:** Durante la selección de features para LightGBM, el puerto de origen (L4_SRC_PORT) aparecía como una de las features más predictivas del modelo — candidata fuerte a entrar al Golden 4.
 
-**Hallazgo:** L4_SRC_PORT mostró 22.6% de ganancia en entrenamiento pero solo 2.8% de importancia por permutación — señal clásica de leakage. El modelo memorizaba puertos efímeros específicos del dataset, no un patrón generalizable.
+**Hallazgo:** Se compararon dos métricas de importancia de feature que miden cosas distintas: **gain** (cuánto reduce la impureza del árbol cada vez que LightGBM particiona usando esa feature, medido sobre el propio entrenamiento) vs. **permutation importance** (cuánto cae el rendimiento en un set de validación separado cuando se baraja al azar el valor de esa feature, rompiendo su relación con el target — mide si el modelo *depende* de ella para generalizar, no solo si la usó mucho para ajustar el training set). L4_SRC_PORT mostró 22.6% de gain pero solo 2.8% de importancia por permutación. Una brecha grande entre ambas es la señal clásica de leakage: el modelo la usa agresivamente para memorizar el training set (gain alto), pero esa memorización no aporta nada a la generalización real (permutation importance bajo). El mecanismo concreto: los puertos de origen son asignados por el sistema operativo del cliente de forma efímera y en gran medida arbitraria por conexión — no codifican ninguna propiedad del tráfico en sí, pero en un dataset de laboratorio con un número limitado de máquinas generando tráfico, ciertos rangos de puertos efímeros terminan correlacionados por casualidad con qué máquina (y por tanto qué clase) generó cada flujo. El modelo aprende esa correlación espuria del laboratorio, no un patrón de ataque generalizable — la misma familia de problema que H1, a nivel de una sola feature en vez de todo el dataset.
 
-**Decisión:** Excluir L4_SRC_PORT del Golden 4. Features finales: SERVER_TCP_FLAGS, OUT_PKTS, FLOW_DURATION_MILLISECONDS, L4_DST_PORT.
+**Decisión:** Excluir L4_SRC_PORT del Golden 4. Features finales: SERVER_TCP_FLAGS, OUT_PKTS, FLOW_DURATION_MILLISECONDS, L4_DST_PORT. El criterio (gain alto + permutation importance bajo → sospechar leakage antes de aceptar una feature) queda como método a replicar para cualquier feature candidata futura, no solo para este caso puntual — de ahí también la prohibición explícita en `CLAUDE.md` de reintroducir `L4_SRC_PORT` como señal.
 
-**Evidencia:** Gain 22.6% vs permutation importance 2.8%.
+**Evidencia:** Gain 22.6% vs permutation importance 2.8% para L4_SRC_PORT.
 
 ---
 
 ## H3 — Etiquetado por reputación de IP vs comportamiento del flujo
 
 **Fecha:** 2026-06-13
-**Contexto:** El etiquetador v1 solo consultaba AbuseIPDB para IPs con alerta de Suricata. Resultado: 4 ataques de 505k flows (0.001%).
+**Contexto:** El corpus de entrenamiento necesita una etiqueta (ataque/benigno) por flujo, y no existe ground truth manual disponible a esa escala — el etiquetado se deriva de fuentes automáticas. La primera versión del etiquetador (v1) solo consultaba AbuseIPDB (score de reputación de IP) para las IPs que YA tenían una alerta de Suricata asociada, es decir, dependía enteramente de que la detección por firmas hubiera marcado el flujo primero. Resultado: 4 ataques de 505k flows (0.001%) — tasa de positivos casi nula, insuficiente para entrenar cualquier clasificador supervisado.
 
-**Hallazgo:** Al consultar AbuseIPDB para TODAS las IPs externas priorizadas por volumen (v2), la tasa de ataques subió a 11% del corpus. La IP 37.77.150.67 (score 100, 3441 reportes) generó 53.348 flows de escaneo en un día.
+**Hallazgo:** El problema no era la escasez de ataques reales en el tráfico, sino que el etiquetador v1 heredaba exactamente el punto ciego de Suricata: solo consideraba "posible ataque" lo que una firma ya conocida detectaba, ignorando cualquier IP con mala reputación externa cuyo tráfico no había disparado ninguna regla. Al reescribir el etiquetador (v2, `scripts/training/etiquetador/etiquetador_diario.py`, con el log de arranque explícito "Etiquetador diario v2 — AbuseIPDB para todas las IPs externas") para consultar AbuseIPDB de TODAS las IPs externas priorizadas por volumen de flows —no solo las que Suricata ya había marcado—, la tasa de ataques etiquetados subió a 11% del corpus, casi tres órdenes de magnitud más. La IP 37.77.150.67 (score 100 en AbuseIPDB, 3441 reportes) por sí sola generó 53.348 flows de escaneo en un día, sin haber sido flageada jamás por una firma de Suricata. El etiquetado final quedó como esquema híbrido, visible en el propio código: categorías Suricata de alta confianza (`ATTACK_CATS` — Web Application Attack, privilege gain, network trojan, DoS, C2 — y `NOISE_CATS` para ruido benigno confirmado como escaneos genéricos) combinadas con un umbral de reputación externa (AbuseIPDB score ≥40) aplicado a cualquier IP externa, tenga o no alerta de Suricata asociada.
 
-**Decisión:** Etiquetado híbrido — categoría Suricata (alta confianza) + AbuseIPDB score ≥40 para todas las IPs externas. Documentar que el 97.5% de ataques se etiquetan por reputación de IP, no por comportamiento del flujo.
+**Decisión:** Etiquetado híbrido — categoría Suricata (alta confianza) + AbuseIPDB score ≥40 para todas las IPs externas. Documentar que el 97.5% de ataques se etiquetan por reputación de IP, no por comportamiento del flujo. Este hallazgo anticipa la misma idea que después se formaliza en `CLAUDE.md` sobre por qué Suricata y LightGBM son "detectores complementarios" (AUC 0.38 entre ellos, esperado): si el etiquetado de entrenamiento solo confiara en las firmas de Suricata, el modelo entrenado heredaría exactamente sus puntos ciegos en vez de aprender a cubrirlos.
 
-**Evidencia:** v1: 0.001% ataques → v2: 11.04% ataques. Corpus 512k flows.
+**Evidencia:** v1: 0.001% ataques → v2: 11.04% ataques. Corpus 512k flows. IP 37.77.150.67: score 100, 3441 reportes AbuseIPDB, 53.348 flows de escaneo en un día.
 
 **Limitación reconocida:** El etiquetado por IP no enseña al modelo el *comportamiento* del ataque, solo la reputación del origen. Mitigado con honeypot (H5).
 
@@ -61,12 +77,19 @@
 
 ## H4 — Isolation Forest no detecta escaneos de puertos
 
+> **Nota (auditoría 2026-08-25):** H6, el mismo día, refina este hallazgo — no lo reemplaza.
+> La conclusión central de H4 se mantiene (Isolation Forest general no es viable como
+> detector primario de escaneos, que son el 97% del corpus de ataques). Lo que cambia en H6
+> es el alcance: segmentado a flows con respuesta del servidor, el mismo detector mejora
+> sustancialmente (ver tabla comparativa en H6). Léanse como una sola línea de investigación
+> continua, no como hallazgos en conflicto.
+
 **Fecha:** 2026-06-15
-**Contexto:** Se evaluó Isolation Forest como detector de anomalías no supervisado, entrenado solo con tráfico benigno (484k flows).
+**Contexto:** Se evaluó Isolation Forest como detector de anomalías no supervisado, entrenado solo con tráfico benigno (484k flows) — a diferencia de LightGBM, no recibe ninguna etiqueta de ataque/benigno durante el entrenamiento: aprende únicamente la forma de la distribución "normal" y marca como anómalo lo que se aleja de ella. El parámetro `contamination` fija de antemano qué proporción del tráfico se espera que sea anómala, y con eso calibra el umbral de score que separa "normal" de "anómalo" — subirlo captura más casos (recall) a costa de marcar más tráfico benigno como anómalo (más falsos positivos).
 
-**Hallazgo:** Mejor configuración (contamination 0.25) detecta solo 20.9% de ataques con 24.9% de falsos positivos. El motivo: el 97% de los ataques son escaneos (OUT_PKTS=0, DURATION≈0), estadísticamente indistinguibles del tráfico benigno trivial (conexiones fallidas, health checks).
+**Hallazgo:** Se barrió `contamination` entre 0.05 y 0.25; incluso la mejor configuración (0.25) detecta solo 20.9% de ataques con 24.9% de falsos positivos. La causa de fondo: el 97% de los ataques del corpus son escaneos de puertos, y un escaneo típico (OUT_PKTS=0, DURATION≈0 — el cliente manda el SYN y no llega a completar ni un intercambio) es, sobre las features Golden 4, estadísticamente indistinguible del tráfico benigno trivial (una conexión fallida, un health check, un cliente que se rinde rápido). Isolation Forest no tiene forma de aprender la diferencia entre "falla porque es benigno y el servicio no respondió" y "falla porque es un escaneo" si ambos casos ocupan la misma región del espacio de features — necesitaría una señal de comportamiento (frecuencia, dispersión de puertos destino en el tiempo) que las features Golden 4, evaluadas flow a flow, no capturan por sí solas.
 
-**Decisión:** El Isolation Forest NO es viable como detector primario en este dominio. Confirma la arquitectura: LightGBM supervisado calibrado es el clasificador principal; Isolation Forest queda como complemento para anomalías extremas (exfiltración, C2 de duración inusual).
+**Decisión:** El Isolation Forest NO es viable como detector primario en este dominio. Confirma la arquitectura: LightGBM supervisado calibrado es el clasificador principal — sí tiene la etiqueta para aprender que ese patrón trivial es, en este contexto, mayoritariamente malicioso, algo que un detector no supervisado no puede inferir solo de la forma de la distribución; Isolation Forest queda como complemento para anomalías extremas (exfiltración, C2 de duración inusual) donde el patrón sí se aleja de lo normal en forma medible.
 
 **Evidencia:**
 
@@ -85,13 +108,13 @@
 ## H5 — Honeypot Cowrie como fuente de telemetría de ataque real
 
 **Fecha:** 2026-06-15
-**Contexto:** El corpus carecía de ataques con sesión completada (OUT_PKTS>0, DURATION>1000ms). Los escaneos dominaban.
+**Contexto:** El corpus, dominado por escaneos (H4: 97% de los ataques), carecía casi por completo de ataques con sesión completada (OUT_PKTS>0, DURATION>1000ms) — el patrón de un atacante que efectivamente logra conectarse y operar, no solo tocar el puerto y desaparecer. Sin ejemplos reales de ese patrón, ni LightGBM ni el Isolation Forest segmentado (H6, diseñado específicamente para detectar anomalías en flows-con-respuesta) tenían de dónde aprenderlo.
 
-**Hallazgo:** Cowrie desplegado en puerto 22 (SSH real movido a 2222) capturó 5 atacantes reales en los primeros 3 minutos, con sesiones de login exitoso y duraciones de 6.9–12.8 segundos. Credenciales reales probadas: Support/maintenance, Test/letmein.
+**Hallazgo:** Se desplegó Cowrie (honeypot de emulación SSH) en el puerto 22 — liberado moviendo el SSH real de administración al puerto 2222, el mismo puerto que después queda como estándar de acceso a los servidores del proyecto. En los primeros 3 minutos capturó 5 atacantes reales con sesiones de login exitoso (Cowrie simula aceptar credenciales de fuerza bruta) y duraciones de 6.9–12.8 segundos — casi tres órdenes de magnitud más que un escaneo típico (DURATION≈0). Credenciales reales probadas por los atacantes: Support/maintenance, Test/letmein — patrones de fuerza bruta genéricos, no dirigidos específicamente al proyecto.
 
-**Decisión:** Cowrie como fuente permanente de brute force SSH real. Aislamiento verificado: usuario cowrie sin acceso al sistema SOC. Genera el patrón de "ataque completado" que los escaneos no aportan.
+**Decisión:** Cowrie como fuente permanente de brute force SSH real. Aislamiento verificado por diseño, no solo por configuración de red: el servicio systemd (`infra/systemd/cowrie.service`) corre bajo un usuario dedicado sin privilegios (`User=cowrie`), con `WorkingDirectory=/home/cowrie/cowrie` contenido a su propio árbol de directorios — Cowrie emula un sistema de archivos falso ante el atacante, sin dar acceso real al sistema operativo subyacente en ningún momento de la sesión emulada. Genera el patrón de "ataque completado" que los escaneos no aportan, alimentando tanto el reentrenamiento de LightGBM como el corpus segmentado del Isolation Forest (H6).
 
-**Evidencia:** 5 sesiones en 3 min. Duraciones 6.9–12.8s. IPs con score 100 en AbuseIPDB.
+**Evidencia:** 5 sesiones en 3 min. Duraciones 6.9–12.8s. IPs con score 100 en AbuseIPDB. Configuración real del servicio en `infra/systemd/cowrie.service` (`User=cowrie`, `Restart=always`).
 
 **Seguridad:** Honeypot de emulación, sistema de archivos falso, sin acceso al OS real.
 
@@ -292,6 +315,13 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ## H15 — Caída de Redis expone falta de supervisión de proceso en response.worker
 
+> **Nota (auditoría 2026-08-25):** la Decisión de este hallazgo es un diseño
+> (`response-worker.service` con `Requires=`/`Restart=on-failure`), no una confirmación de
+> implementación. No aparece en `docs/BACKLOG_INFRA.md` ni en la sección Pendientes de este
+> documento como ítem abierto, así que su estado real (¿se creó el unit file? ¿sigue
+> corriendo como proceso manual sin supervisión?) queda ambiguo para un lector nuevo.
+> Confirmar y actualizar esta nota con el estado real antes de la defensa.
+
 **Fecha:** 2026-08-11
 
 **Contexto:** `redis-server.service` (`.140`) dejó de estar disponible entre las 06:49 y las 22:34 (~15.5h). `motor-soc` (FastAPI, Fast Path) degradó con gracia como estaba diseñado — decisiones provisionales continuaron sin bloquear por IO externo. `response.worker`, en cambio, corría en ese momento como proceso sin supervisión de systemd (lanzado manualmente, sin unit propio), sin `Requires=redis-server.service` ni política de `Restart=`.
@@ -311,6 +341,14 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 ---
 
 ## H16 — Punto ciego estructural: Suricata no ve tráfico directo al uplink ISP de .138
+
+> **Superado — auditoría 2026-08-25:** este punto ciego fue resuelto arquitectónicamente
+> por la migración a NAT/VLAN documentada en H17 (`.139` pasa de sensor pasivo a punto de
+> paso in-line), y la confirmación empírica pendiente que H17 dejó abierta ("repetir la
+> prueba de H16") se cerró en H21 (mismo día, causa distinta encontrada en el camino: orden
+> de reglas de firewall). Se conserva el hallazgo original íntegro por su valor metodológico
+> — documenta un punto ciego real y por qué "mismo subnet IP" no implica "misma visibilidad
+> de captura", lección que sigue aplicando a cualquier sensor pasivo futuro.
 
 **Fecha:** 2026-08-13
 
@@ -334,9 +372,179 @@ El tráfico de prueba, dirigido directamente a la IP pública `200.54.12.138`, e
 
 **Lección de diseño:** estar en el mismo subnet IP no implica estar en el mismo dominio de visibilidad de captura de paquetes en una red conmutada. Cualquier arquitectura de monitoreo pasivo (Suricata, tcpdump, o similar) en un solo host necesita puerto espejo explícito hacia cada segmento físico que se quiera observar — la topología IP por sí sola no lo garantiza. Vale como advertencia general para cualquier despliegue futuro de sensores de red en este proyecto, no solo para `.138`.
 
+## H17 — Migración de topología: de subred plana a NAT/gateway con VLANs, cerrando el punto ciego de H16
+
+> **Nota de alcance (auditoría 2026-08-25):** el Hallazgo describe el diseño completo de
+> switch/VLANs para los cuatro servidores, lo que puede leerse como que los cuatro ya
+> operaban sobre la nueva topología al cerrar esta entrada. En la práctica, a la fecha de
+> esta auditoría solo `.139` (gateway) y `.140` (motor, `10.10.10.3`) están efectivamente
+> migrados y verificados; `.138`, `.141` y `.142` siguen con su acceso/IP pública vieja,
+> pendientes de migración física (`.141`/`.142` ni siquiera están cableados al switch aún).
+> Estado vivo de cada host en la tabla de Infraestructura de `CLAUDE.md`. Este hallazgo no
+> se corrige — se aclara para que un lector nuevo no asuma una migración total ya cerrada.
+
+**Fecha:** 2026-08-19
+
+**Contexto:** H16 documentó que Suricata en `.139` operaba como sensor pasivo dependiente de que el tráfico atravesara físicamente esa interfaz, sin puerto espejo hacia el uplink ISP directo de `.138`, lo que dejaba fuera de visibilidad cualquier tráfico dirigido directo a la IP pública de un servidor protegido. Para cerrar ese punto ciego estructural se rediseñó la topología completa de red del proyecto, pasando de una subred plana única (`200.54.12.136/29` compartida entre todos los hosts) a una topología NAT/gateway con VLANs, donde `.139` deja de ser un sensor pasivo y pasa a ser el punto de paso físico obligatorio (in-line) de todo el tráfico entre el router ISP y los cuatro servidores del proyecto.
+
+**Hallazgo:** La nueva topología quedó así: Router ISP 892FSP (`.137`) hacia `.139` (interfaz `eno1` con la IP pública `200.54.12.139/29` hacia el ISP, interfaz `eno2` como trunk hacia el switch, actuando como NAT gateway y sensor Suricata in-line) hacia el switch Cisco SG350 hacia los cuatro servidores en VLANs separadas. En el switch se crearon tres VLANs: VLAN 10 (producción del motor, puerto gi2 hacia `.140`, subred `10.10.10.0/24`), VLAN 20 (terceros, puerto gi3 hacia `.141` y gi4 hacia `.142`, subred `10.20.20.0/24`) y VLAN 30 (web genérica, puerto gi1 hacia `.138`, subred `10.30.30.0/24`), con el puerto gi6 como trunk hacia `.139` permitiendo las tres VLANs. La sesión SPAN que existía antes (monitor session 1, gi1-5 como source, gi6 como destination) se eliminó por quedar obsoleta: ya no hace falta espejar tráfico para que Suricata lo vea, porque ahora pasa físicamente por `.139`. En `.139` se crearon subinterfaces VLAN sobre `eno2` vía NetworkManager (`eno2.10` en `10.10.10.1/24`, `eno2.20` en `10.20.20.1/24`, `eno2.30` en `10.30.30.1/24`), se activó `ip_forward`, y se agregó NAT vía MASQUERADE en `/etc/ufw/before.rules` para que las tres subredes salgan a Internet por `eno1`. Las reglas UFW que antes apuntaban a la subred pública vieja `200.54.12.136/29` (API de Wazuh 55000, Node Exporter 9100, xRDP 3389, agentes Wazuh 1514/1515) se migraron a las tres VLANs nuevas, con un criterio de separación explícito: los puertos de monitoreo (1514, 1515, 9100) quedaron abiertos a las tres VLANs, mientras que los de administración (55000, 3389) quedaron restringidos únicamente a VLAN 10.
+
+Se verificó el estado real de `.139` por SSH antes de cerrar este hallazgo. `ip -4 addr show` confirma `eno1` con `200.54.12.139/29` y las tres subinterfaces `eno2.10`, `eno2.20`, `eno2.30` con las IPs `.1` de cada VLAN; `ip route show` confirma las tres rutas `10.10.10.0/24`, `10.20.20.0/24` y `10.30.30.0/24` cada una vía su subinterfaz; `cat /proc/sys/net/ipv4/ip_forward` devuelve `1`; `nmcli connection show` confirma los tres perfiles `vlan10`/`vlan20`/`vlan30` con `vlan.parent: eno2` e `id` 10/20/30 respectivamente; `ip link show eno2` confirma la interfaz física up sin IP propia, consistente con su rol de trunk. `iptables -L ufw-user-input -n -v` confirma exactamente el criterio de separación descrito: reglas para 1514/1515/9100 (TCP y UDP) repetidas para `10.10.10.0/24`, `10.20.20.0/24` y `10.30.30.0/24`, y reglas para 55000/3389 presentes únicamente para `10.10.10.0/24`. La regla NAT/MASQUERADE en `/etc/ufw/before.rules` y la tabla `nat` de iptables no se pudieron leer en esta sesión porque el `sudo` restringido de auditoría solo permite `iptables -L*` (sin `-t nat`) y no incluye lectura de `/etc/ufw/before.rules`; se toma como evidencia indirecta suficiente que `ip_forward=1` está activo y que las tres VLANs tienen salida a Internet operativa según lo reportado por el usuario.
+
+**Decisión:** Adoptar la topología NAT/gateway con VLANs como arquitectura de red estable del proyecto, reemplazando la subred plana original. `.139` pasa de sensor pasivo a punto de paso in-line, lo que resuelve de raíz el punto ciego documentado en H16 para tráfico dirigido directo a la IP pública de cualquier servidor detrás del gateway: ahora todo ese tráfico atraviesa `.139` por diseño, no por coincidencia de que el atacante relaye a través de él. Queda pendiente repetir en una sesión futura la prueba de H16 (payload SQLi/traversal contra un servidor VLAN) para confirmar empíricamente que las alertas de Suricata ahora sí se generan.
+
+**Evidencia:** Salida real de `ip -4 addr show`, `ip route show`, `ip_forward`, `nmcli connection show` e `iptables -L ufw-user-input -n -v` capturada por SSH en `.139` el 2026-08-19, resumida en el hallazgo anterior.
+
+---
+
+## H18 — Riesgo de coincidencia por comodín en perfil NetworkManager de `.139`, corregido antes de causar incidente
+
+**Fecha:** 2026-08-19
+
+**Contexto:** Durante la migración de topología (H17), se revisaron los perfiles de NetworkManager en `.139` que gestionan la interfaz con la IP pública del proyecto, para asegurar que la nueva interfaz de trunk `eno2` no terminara heredando por error configuración destinada a la interfaz pública `eno1`.
+
+**Hallazgo:** El perfil `netplan-zz-all-en` tenía configurado `match.interface-name=en*` (comodín), en vez de fijar la interfaz por nombre exacto. Bajo ese comodín, el perfil podía potencialmente coincidir también con `eno2` (la interfaz de trunk hacia el switch) y no solo con `eno1`, con el riesgo de que NetworkManager aplicara la IP pública `200.54.12.139/29` sobre la interfaz de trunk en vez de sobre la interfaz hacia el ISP. El riesgo se detectó por revisión de configuración antes de que se manifestara como incidente real.
+
+**Decisión:** Se corrigió el perfil fijando `connection.interface-name=eno1` explícito y quitando el `match.interface-name` comodín. Verificado por SSH en `.139` con `nmcli connection show netplan-zz-all-en`: `connection.interface-name` es `eno1` y `match.interface-name` quedó vacío (`--`). Existe además un segundo perfil, `netplan-eno1`, con `connection.interface-name=eno1` también pero sin activar (no aparece como dispositivo conectado en `nmcli connection show`); no se tocó por no representar riesgo mientras permanezca inactivo, queda como candidato a limpieza en una sesión futura.
+
+**Evidencia:** `nmcli connection show netplan-zz-all-en | grep -E 'match|interface-name'` en `.139`, 2026-08-19, confirma `connection.interface-name: eno1` y `match.interface-name: --`.
+
+---
+
+## H19 — Cambio de VLAN de gestión del switch SG350 genera "no route to host" transitorio por dominios de capa 2 distintos
+
+**Fecha:** 2026-08-19
+
+**Contexto:** Como parte de la migración de topología (H17), se movió la IP de gestión del switch SG350 de VLAN 1 (`10.10.10.1`, sin etiquetar) a VLAN 10 (`10.10.10.254`, junto al resto del equipo de producción del motor), para que la administración del switch quedara dentro del mismo segmento que el equipo de tesis en vez de en la VLAN nativa por defecto.
+
+**Hallazgo:** Al completar el cambio se produjo brevemente un error "no route to host" al intentar administrar el switch. La causa no fue un error de direccionamiento sino de segmentación: el gateway en `.139` (`eno2.10`, `10.10.10.1/24`) y la gestión del switch en su ubicación anterior (VLAN 1, no etiquetada) vivían en dominios de capa 2 distintos aunque compartieran el mismo rango numérico `10.10.10.0/24` — coincidencia de direccionamiento IP que no implica pertenecer al mismo segmento conmutado, el mismo tipo de confusión ya documentado en H16 para el caso de captura de paquetes.
+
+**Decisión:** La gestión del switch queda definitivamente en VLAN 10, junto al equipo de tesis, resolviendo el error una vez que ambos extremos comparten el mismo dominio de capa 2. Se deja como advertencia general del proyecto: compartir rango numérico no equivale a compartir segmento de red, ya sea para gestión, para captura de paquetes (H16) o para cualquier otro propósito de conectividad de capa 2.
+
+**Evidencia:** Reportado por el usuario durante la migración; no verificable retroactivamente por SSH al ser un estado transitorio de administración del switch (fuera del alcance de acceso SSH de esta sesión, limitado a los tres servidores Linux del proyecto).
+
+---
+
+## H20 — Switch SG350 con firmware v2.4.0.94 solo ofrece algoritmos SSH obsoletos
+
+**Fecha:** 2026-08-19
+
+**Contexto:** Al intentar administrar el switch SG350 por SSH tras la migración de topología (H17), la conexión falló con clientes OpenSSH modernos.
+
+**Hallazgo:** El firmware v2.4.0.94 del switch solo ofrece algoritmos de intercambio de llaves y de host key ya deprecados por defecto en OpenSSH moderno: `diffie-hellman-group1-sha1` y `diffie-hellman-group14-sha1` como `KexAlgorithms`, y `ssh-rsa`/`ssh-dss` como `HostKeyAlgorithms`. Un cliente OpenSSH sin esos algoritmos habilitados explícitamente rechaza la negociación antes de llegar a pedir credenciales.
+
+**Decisión:** Workaround aplicado en el cliente, forzando los algoritmos legacy en la invocación de SSH con `-oKexAlgorithms=+diffie-hellman-group14-sha1` y `-oHostKeyAlgorithms=+ssh-rsa` (u equivalentes según el cliente). Queda pendiente evaluar la actualización de firmware del switch para dejar de depender de algoritmos obsoletos en el canal de gestión.
+
+**Evidencia:** Reportado por el usuario durante la migración; no verificable retroactivamente por SSH al ser un estado del propio switch (fuera del alcance de acceso SSH de esta sesión, limitado a los tres servidores Linux del proyecto).
+
+---
+
+## H21 — Suricata in-line con cero alertas: la cola NFQUEUE recibía tráfico pero el firewall solo dejaba pasar el primer paquete de cada conexión
+
+**Fecha:** 2026-08-25
+
+**Contexto:** Como parte del pendiente dejado por H17 (repetir la prueba de H16 sobre la
+nueva topología NAT/VLAN, para confirmar empíricamente que Suricata genera alertas para
+tráfico dirigido a un servidor detrás del gateway), se pasó a Suricata en `.139` a modo
+in-line real vía NFQUEUE — interceptando activamente el tráfico en la ruta de netfilter, no
+solo capturándolo pasivamente por AF-PACKET como antes de H17. Se repitió tráfico de prueba
+equivalente al de H16 contra un host detrás del gateway. Confirmado que el tráfico
+efectivamente atravesaba la cola NFQUEUE (contadores de la regla incrementando), pero
+`eve.json` seguía sin registrar ninguna alerta — ni las esperadas, ni ningún evento en
+absoluto para ese tráfico.
+
+**Hallazgo:** Se descartaron en orden: reglas de Suricata mal cargadas, permisos de lectura
+sobre el ruleset, y el modo de captura configurado en `suricata.yaml`. La causa raíz estaba
+en `/etc/ufw/before.rules`: la regla de fast-path para tráfico ya establecido (`ct state
+RELATED,ESTABLISHED ACCEPT` / equivalente `-m state --state RELATED,ESTABLISHED -j ACCEPT`)
+aparecía **antes** que la regla que desvía tráfico a la cola NFQUEUE de Suricata. Netfilter
+evalúa las reglas en orden y aplica la primera que hace match: en cuanto el primer paquete
+(SYN) de una conexión nueva pasaba por NFQUEUE y Suricata lo dejaba seguir, conntrack
+marcaba esa conexión como ESTABLISHED — y todos los paquetes siguientes de esa misma
+conexión (el resto del handshake, el payload real, la respuesta del servidor) hacían match
+con la regla de fast-path *antes* de llegar a la regla NFQUEUE, sin pasar nunca por
+Suricata. Efecto práctico: Suricata solo veía el primer paquete de cada conexión — no
+alcanza para que la inmensa mayoría de los SIDs (que inspeccionan payload HTTP, múltiples
+paquetes del stream, o la respuesta) disparen ninguna alerta. No era un problema de reglas
+de Suricata ni de la cola NFQUEUE en sí — el tráfico nunca llegaba completo a Suricata.
+
+**Decisión:** Reordenar `/etc/ufw/before.rules` para que la desviación a NFQUEUE preceda a
+la regla de fast-path `RELATED,ESTABLISHED ACCEPT`, de modo que todo paquete de toda
+conexión pase por Suricata antes de que conntrack pueda aplicar el atajo. Suricata se dejó
+además como servicio systemd persistente vía
+`/etc/systemd/system/suricata.service.d/override.conf` (mismo patrón de drop-in ya usado en
+H14 para `wazuh-manager.service`, sin tocar el unit file empaquetado), para que el modo
+in-line sobreviva a un reinicio del host sin relanzarlo a mano.
+
+**Lección generalizable:** en cualquier firewall (iptables/nftables/ufw, en cualquier host
+presente o futuro del proyecto) que combine reglas de fast-path para tráfico establecido con
+una desviación a un motor IPS/NFQUEUE, las reglas de fast-path deben ir **siempre después**
+de la desviación al IPS — nunca antes. Puestas antes, el "atajo" de aceleración para tráfico
+ya establecido se convierte, sin que nadie lo decida explícitamente, en un bypass casi total
+del IPS: solo el primer paquete de cada conexión nueva llega a inspeccionarse.
+
+**Detalles secundarios encontrados en el camino (no son la causa raíz, pero se corrigieron
+en la misma sesión):**
+- `eve.json` y `stats.log` habían crecido a 16GB+ sin rotación configurada. Esto es
+  continuación del mismo problema ya documentado en `docs/BACKLOG_INFRA.md` (detectado
+  2026-08-12 con `eve.json` en 14.6GB) — no es un hallazgo nuevo, es el mismo riesgo sin
+  mitigar, ahora también en `stats.log` y con más volumen. `logrotate` para ambos archivos
+  sigue pendiente de configurar (ver ese documento para la propuesta ya escrita).
+- Permisos rotos entre `root` y el usuario `suricata` tras pruebas manuales del proceso
+  durante el diagnóstico (se había ejecutado/tocado archivos como `root` en el camino,
+  dejando algunos artefactos sin el owner correcto para que el servicio systemd, que corre
+  como `suricata`, los leyera/escribiera) — corregido antes de dejar el servicio persistente.
+
+**Evidencia:** Retest confirmado tras el reordenamiento de `before.rules` — Suricata volvió
+a generar alertas para tráfico que atraviesa el gateway hacia un host detrás de una VLAN,
+cerrando en firme el pendiente que H17 había dejado abierto:
+
+```
+08/25/2026-16:00:28.323021 [**] [1:2100498:7] GPL ATTACK_RESPONSE id
+check returned root [**] [Classification: Potentially Bad Traffic]
+[Priority: 2] {TCP} 217.160.0.187:80 -> 10.10.10.3:37796
+```
+
+Esta alerta (SID 2100498, `GPL ATTACK_RESPONSE id check returned root`) dispara sobre la
+*respuesta* de una conexión — no sobre el primer paquete (SYN) de la conexión, sino sobre
+contenido de payload en un paquete posterior del stream ya establecido. Es exactamente el
+tipo de alerta que la causa raíz de este hallazgo (fast-path `ESTABLISHED,RELATED` evaluado
+antes que la desviación a NFQUEUE) impedía ver: antes del fix, esta alerta específica no
+podría haber disparado nunca, porque todo paquete posterior al primero de la conexión
+saltaba a Suricata vía el atajo de conntrack. Que dispare confirma que el stream completo
+—no solo el SYN— vuelve a pasar por Suricata tras reordenar `before.rules`. Con esto se
+cierra también el pendiente original de H17 (repetir la prueba de H16 sobre la nueva
+topología NAT/VLAN).
+
+**Addendum — verificación independiente (SSH en `.139`, 2026-08-26):** confirmado
+directamente en la tabla `filter`, cadena `ufw-before-forward` (no `ufw-before-input` — el
+tráfico hacia hosts VLAN se reenvía, no se destina a `.139` mismo): posición 5 `NFQUEUE num
+0 bypass` (18.065 paquetes / 9,76MB acumulados desde el arranque), posición 6 `ctstate
+RELATED,ESTABLISHED ACCEPT` — el orden corregido descrito en la Decisión ya está aplicado y
+en producción. `eve.json` registra exactamente 2 alertas desde que Suricata arrancó en este
+modo (`ActiveEnterTimestamp` 2026-08-25 15:58:46), ambas SID 2100498, ambas contra
+`10.10.10.3` — la segunda es la citada arriba.
+
+Dos hallazgos adicionales de esta verificación, no solicitados pero registrados para no
+perderlos:
+- **Corrección de tamaño:** `eve.json` pesa hoy 83MB, no 16GB+ — bajó desde el diagnóstico
+  del día anterior, consistente con una rotación o truncado al aplicar `override.conf` y
+  reiniciar el servicio (mecanismo exacto no confirmado). `stats.log` sigue en 13GB — el
+  problema de logrotate de `docs/BACKLOG_INFRA.md` (2026-08-12) sigue sin resolver y ahora
+  pesa también sobre este archivo.
+- **NFQUEUE en modo `bypass`:** si Suricata deja de leer la cola (caída, reinicio lento), el
+  tráfico no se bloquea por defecto — sigue pasando sin inspección (fail-open, no
+  fail-closed). Puede ser una decisión de diseño razonable para no tumbar la red si Suricata
+  falla, pero es una limitación conocida que vale la pena dejar explícita para la sección de
+  autocrítica de la tesis. No se cambió nada de la configuración; queda como candidato a
+  hallazgo propio (H22) si se decide investigar o mitigar.
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)
 
 - **Inestabilidad de conexión periódica agente-manager:** patrón recurrente (~cada hora) de "Agent key already in use", "Response timeout", "Cannot send request to agent" entre .139 y .138. Causa no confirmada — candidatos: desincronización de reloj, proceso periódico en .138 reiniciando la conexión, configuración de keepalive. Pendiente investigar antes de noviembre, puede explicar fallos silenciosos de Active Response a futuro.
 - **20 reglas de threat intel inactivas** (IDs 99901-99920): referencian listas IOC (malicious-ioc/malware-hashes, malicious-ip, malicious-domains) que nunca se cargaron con contenido real. Las reglas existen pero no tienen efecto. Pendiente decidir si se completan con feeds reales o se eliminan del ruleset.
+- **Verificar directamente la regla NAT/MASQUERADE en `.139`:** el `sudo` restringido de auditoría documentado no permitía leer `/etc/ufw/before.rules` ni `iptables -t nat -L` (ver H17). El diagnóstico de H21 sí involucró leer y editar `before.rules` directamente — si eso se hizo con acceso ampliado o manual, actualizar acá y en el alcance del `sudo` de auditoría (`.claude/skills/soc-audit/SKILL.md`) para que quede consistente con lo que realmente es accesible hoy.
+- **Perfil `netplan-eno1` duplicado en `.139`:** perfil de NetworkManager inactivo con el mismo `interface-name=eno1` que `netplan-zz-all-en` (H18). No representa riesgo mientras siga sin autoconectar, pero es candidato a limpieza para evitar ambigüedad futura.
+- **Actualización de firmware del switch SG350** (H20): evaluar upgrade desde v2.4.0.94 para dejar de depender del workaround de algoritmos SSH legacy en el cliente.

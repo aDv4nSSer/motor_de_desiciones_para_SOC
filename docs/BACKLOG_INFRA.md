@@ -60,6 +60,20 @@ junto con otras inconsistencias que se encuentren en la misma limpieza.
 
 ## Falta puerto espejo (SPAN/mirror) hacia `eno2` de `.139` — punto ciego de Suricata
 
+> **OBSOLETO — cerrado 2026-08-25, ver H17 en `docs/BITACORA_TECNICA.md`.**
+> La propuesta de abajo (configurar un SPAN/mirror en el switch físico) no
+> se implementó — se resolvió por una vía distinta: la migración completa de
+> la red a una topología NAT/gateway con VLANs (H17), donde `.139` deja de
+> ser un sensor pasivo dependiente de un puerto espejo y pasa a ser el punto
+> de paso físico obligatorio (in-line) de todo el tráfico entre el router
+> ISP y los servidores del proyecto. Al ser in-line, Suricata ve por diseño
+> todo el tráfico que entra o sale de cualquier host detrás del gateway —
+> la necesidad misma de un SPAN queda eliminada, no solo pospuesta. El
+> retest empírico que confirma que el punto ciego ya no existe está en H21
+> (2026-08-25, mismo documento). Se conserva el resto de esta entrada sin
+> modificar por su valor de contexto histórico — documenta el diagnóstico
+> original y las alternativas consideradas en su momento.
+
 Detectado 2026-08-13 verificando end-to-end la Parte A de detección L7
 experimental. Detalle completo del mecanismo, evidencia y reproducción en
 `docs/BITACORA_TECNICA.md` → **H16**.
