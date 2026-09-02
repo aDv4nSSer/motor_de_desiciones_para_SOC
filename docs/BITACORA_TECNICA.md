@@ -8,32 +8,36 @@
 
 ## Índice de hallazgos clave
 
-| # | Tema | Impacto | Estado |
-|---|------|---------|--------|
-| H1 | Domain shift en datasets académicos | Alto | Documentado |
-| H2 | L4_SRC_PORT es data leakage | Alto | Resuelto |
-| H3 | Etiquetado por IP vs comportamiento | Alto | Resuelto |
-| H4 | Isolation Forest no detecta escaneos | Medio | Documentado — refinado por H6, no reemplazado |
-| H5 | Honeypot como fuente de telemetría real | Alto | Implementado |
-| H6 | Isolation Forest segmentado por presencia de respuesta | Medio | Implementado |
-| H7 | Desajuste de features IF entre entrenamiento e inferencia | Alto | Resuelto |
-| H8 | Colisión IP investigador/atacante en etiquetado por campaña | Alto | Resuelto |
-| H9 | Cowrie caído 3 días por PATH faltante en systemd | Medio | Resuelto |
-| H10 | Feature contract rechaza sesiones largas (Golden 4) | Medio | Documentado — limitación conocida, sin fix |
-| H11 | Payload incompatible en Wazuh Active Response on-demand | Alto | Resuelto |
-| H12 | FIM ampliado a WordPress + bug de detección realtime | Alto | Mitigado — causa raíz de realtime sigue abierta |
-| H13 | Cuarentena de archivo como 2da forma de Active Response | Alto | Implementado |
-| H14 | Timeout de systemd insuficiente en wazuh-manager | Medio | Resuelto |
-| H15 | Caída de Redis expone falta de supervisión en response.worker | Alto | Documentado — fix diseñado, implementación sin confirmar (ver nota en la entrada) |
-| H16 | Punto ciego: Suricata no ve tráfico directo al uplink ISP de .138 | Alto | **Superado por H17 (arquitectura) y H21 (confirmación empírica)** |
-| H17 | Migración de topología: subred plana → NAT/gateway con VLANs | Alto | Implementado parcialmente — ver nota de alcance en la entrada |
-| H18 | Riesgo de comodín en perfil NetworkManager de `.139` | Medio | Resuelto |
-| H19 | Cambio de VLAN de gestión del switch — "no route to host" | Bajo | Resuelto |
-| H20 | Switch SG350: firmware solo ofrece algoritmos SSH obsoletos | Bajo | Mitigado — workaround en cliente, firmware pendiente |
-| H21 | Suricata in-line con cero alertas — orden de reglas en `before.rules` | Alto | Resuelto — retest confirmado con evidencia |
+Categorías: **ML** (dataset/modelo/features) · **Resp** (respuesta activa/FIM/worker) · **Red** (red/VLAN/switch/firewall) · **Ops** (systemd/supervisión/servicios)
+
+| # | Categoría | Tema | Impacto | Estado |
+|---|-----------|------|---------|--------|
+| [H1](#h1) | ML | Domain shift en datasets académicos | Alto | Documentado |
+| [H2](#h2) | ML | L4_SRC_PORT es data leakage | Alto | Resuelto |
+| [H3](#h3) | ML | Etiquetado por IP vs comportamiento | Alto | Resuelto |
+| [H4](#h4) | ML | Isolation Forest no detecta escaneos | Medio | Documentado — refinado por H6, no reemplazado |
+| [H5](#h5) | ML | Honeypot como fuente de telemetría real | Alto | Implementado |
+| [H6](#h6) | ML | Isolation Forest segmentado por presencia de respuesta | Medio | Implementado |
+| [H7](#h7) | ML | Desajuste de features IF entre entrenamiento e inferencia | Alto | Resuelto |
+| [H8](#h8) | ML | Colisión IP investigador/atacante en etiquetado por campaña | Alto | Resuelto |
+| [H9](#h9) | Ops | Cowrie caído 3 días por PATH faltante en systemd | Medio | Resuelto |
+| [H10](#h10) | ML | Feature contract rechaza sesiones largas (Golden 4) | Medio | Documentado — limitación conocida, sin fix |
+| [H11](#h11) | Resp | Payload incompatible en Wazuh Active Response on-demand | Alto | Resuelto |
+| [H12](#h12) | Resp | FIM ampliado a WordPress + bug de detección realtime | Alto | Mitigado — causa raíz de realtime sigue abierta |
+| [H13](#h13) | Resp | Cuarentena de archivo como 2da forma de Active Response | Alto | Implementado |
+| [H14](#h14) | Ops | Timeout de systemd insuficiente en wazuh-manager | Medio | Resuelto |
+| [H15](#h15) | Ops | Caída de Redis expone falta de supervisión en response.worker | Alto | Documentado — fix diseñado, implementación sin confirmar (ver nota en la entrada) |
+| [H16](#h16) | Red | Punto ciego: Suricata no ve tráfico directo al uplink ISP de .138 | Alto | **Superado por H17 (arquitectura) y H21 (confirmación empírica)** |
+| [H17](#h17) | Red | Migración de topología: subred plana → NAT/gateway con VLANs | Alto | Implementado parcialmente — ver nota de alcance en la entrada |
+| [H18](#h18) | Red | Riesgo de comodín en perfil NetworkManager de `.139` | Medio | Resuelto |
+| [H19](#h19) | Red | Cambio de VLAN de gestión del switch — "no route to host" | Bajo | Resuelto |
+| [H20](#h20) | Red | Switch SG350: firmware solo ofrece algoritmos SSH obsoletos | Bajo | Mitigado — workaround en cliente, firmware pendiente |
+| [H21](#h21) | Red | Suricata in-line con cero alertas — orden de reglas en `before.rules` | Alto | Resuelto — retest confirmado con evidencia |
+| [H22](#h22) | Ops | Redis caído por bind a IP pública obsoleta — motor-soc casi 1 semana sin levantar | Alto | Resuelto — fix aplicado y verificado; brecha de monitoreo queda pendiente |
 
 ---
 
+<a id="h1"></a>
 ## H1 — Domain shift: el modelo aprende el laboratorio, no el ataque
 
 **Fecha:** Sesiones iniciales
@@ -47,6 +51,7 @@
 
 ---
 
+<a id="h2"></a>
 ## H2 — L4_SRC_PORT es fuga de datos (data leakage)
 
 **Fecha:** Diseño del feature contract
@@ -60,6 +65,7 @@
 
 ---
 
+<a id="h3"></a>
 ## H3 — Etiquetado por reputación de IP vs comportamiento del flujo
 
 **Fecha:** 2026-06-13
@@ -75,6 +81,7 @@
 
 ---
 
+<a id="h4"></a>
 ## H4 — Isolation Forest no detecta escaneos de puertos
 
 > **Nota (auditoría 2026-08-25):** H6, el mismo día, refina este hallazgo — no lo reemplaza.
@@ -105,6 +112,7 @@
 
 ---
 
+<a id="h5"></a>
 ## H5 — Honeypot Cowrie como fuente de telemetría de ataque real
 
 **Fecha:** 2026-06-15
@@ -137,6 +145,7 @@
 
 ---
 
+<a id="h6"></a>
 ## H6 — Isolation Forest mejora con features derivadas y segmentación por respuesta
 
 **Fecha:** 2026-06-15
@@ -163,6 +172,7 @@ La diferencia confirma que las anomalías de comportamiento (C2, exfiltración, 
 
 ---
 
+<a id="h7"></a>
 ## H7 — Desajuste de features entre entrenamiento e inferencia del Isolation Forest
 
 **Fecha:** 2026-06-15
@@ -184,6 +194,7 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 
 **Lección de diseño:** Cualquier transformación aplicada en entrenamiento (escalado, features derivadas, clipping) DEBE guardarse y aplicarse idénticamente en inferencia. Un scaler desalineado degrada silenciosamente el modelo sin lanzar errores.
 
+<a id="h8"></a>
 ## H8 — Colisión entre IP del investigador e IP atacante en etiquetado por campaña
 
 **Fecha:** 2026-06-15
@@ -199,6 +210,7 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 
 ---
 
+<a id="h9"></a>
 ## H9 — Cowrie caído 3 días por PATH faltante en servicio systemd
 
 **Fecha:** 2026-06-18
@@ -214,6 +226,7 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 
 ---
 
+<a id="h10"></a>
 ## H10 — Feature contract rechaza sesiones largas: limitación del Golden 4
 
 **Fecha:** 2026-06-21
@@ -244,6 +257,7 @@ El modelo recibía datos en un formato incompatible con su entrenamiento, produc
 
 ---
 
+<a id="h11"></a>
 ## H11 — API de Wazuh: payload incompatible en Active Response on-demand
 
 **Fecha:** 2026-07-04
@@ -264,6 +278,7 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ---
 
+<a id="h12"></a>
 ## H12 — FIM ampliado a WordPress + bugs de sintaxis restrict y limitación de tiempo real
 
 **Fecha:** 2026-07-05
@@ -279,6 +294,7 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ---
 
+<a id="h13"></a>
 ## H13 — Segunda forma de respuesta activa: cuarentena de archivo para compromiso interno
 
 **Fecha:** 2026-07-05 / 2026-07-06
@@ -298,6 +314,7 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ---
 
+<a id="h14"></a>
 ## H14 — Timeout de systemd insuficiente en wazuh-manager.service
 
 **Fecha:** 2026-07-05
@@ -313,6 +330,7 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ---
 
+<a id="h15"></a>
 ## H15 — Caída de Redis expone falta de supervisión de proceso en response.worker
 
 > **Nota (auditoría 2026-08-25):** la Decisión de este hallazgo es un diseño
@@ -340,6 +358,7 @@ Validado primero con curl manual aislado antes de reiniciar el worker, para desc
 
 ---
 
+<a id="h16"></a>
 ## H16 — Punto ciego estructural: Suricata no ve tráfico directo al uplink ISP de .138
 
 > **Superado — auditoría 2026-08-25:** este punto ciego fue resuelto arquitectónicamente
@@ -372,6 +391,7 @@ El tráfico de prueba, dirigido directamente a la IP pública `200.54.12.138`, e
 
 **Lección de diseño:** estar en el mismo subnet IP no implica estar en el mismo dominio de visibilidad de captura de paquetes en una red conmutada. Cualquier arquitectura de monitoreo pasivo (Suricata, tcpdump, o similar) en un solo host necesita puerto espejo explícito hacia cada segmento físico que se quiera observar — la topología IP por sí sola no lo garantiza. Vale como advertencia general para cualquier despliegue futuro de sensores de red en este proyecto, no solo para `.138`.
 
+<a id="h17"></a>
 ## H17 — Migración de topología: de subred plana a NAT/gateway con VLANs, cerrando el punto ciego de H16
 
 > **Nota de alcance (auditoría 2026-08-25):** el Hallazgo describe el diseño completo de
@@ -397,6 +417,7 @@ Se verificó el estado real de `.139` por SSH antes de cerrar este hallazgo. `ip
 
 ---
 
+<a id="h18"></a>
 ## H18 — Riesgo de coincidencia por comodín en perfil NetworkManager de `.139`, corregido antes de causar incidente
 
 **Fecha:** 2026-08-19
@@ -411,6 +432,7 @@ Se verificó el estado real de `.139` por SSH antes de cerrar este hallazgo. `ip
 
 ---
 
+<a id="h19"></a>
 ## H19 — Cambio de VLAN de gestión del switch SG350 genera "no route to host" transitorio por dominios de capa 2 distintos
 
 **Fecha:** 2026-08-19
@@ -425,6 +447,7 @@ Se verificó el estado real de `.139` por SSH antes de cerrar este hallazgo. `ip
 
 ---
 
+<a id="h20"></a>
 ## H20 — Switch SG350 con firmware v2.4.0.94 solo ofrece algoritmos SSH obsoletos
 
 **Fecha:** 2026-08-19
@@ -439,6 +462,7 @@ Se verificó el estado real de `.139` por SSH antes de cerrar este hallazgo. `ip
 
 ---
 
+<a id="h21"></a>
 ## H21 — Suricata in-line con cero alertas: la cola NFQUEUE recibía tráfico pero el firewall solo dejaba pasar el primer paquete de cada conexión
 
 **Fecha:** 2026-08-25
@@ -537,7 +561,56 @@ perderlos:
   fail-closed). Puede ser una decisión de diseño razonable para no tumbar la red si Suricata
   falla, pero es una limitación conocida que vale la pena dejar explícita para la sección de
   autocrítica de la tesis. No se cambió nada de la configuración; queda como candidato a
-  hallazgo propio (H22) si se decide investigar o mitigar.
+  hallazgo propio futuro (numeración pendiente — H22 ya se usó para el incidente de Redis
+  del 2026-09-02) si se decide investigar o mitigar.
+
+---
+
+<a id="h22"></a>
+## H22 — Redis caído por bind a IP pública obsoleta tras la migración a VLAN — `motor-soc.service` casi 1 semana sin levantar por "Dependency failed"
+
+**Fecha:** 2026-09-02 (la caída real empezó el 2026-08-26, con un episodio previo el 2026-08-11)
+
+**Contexto:** Verificación de rutina de conectividad SSH a `.139` y `.140`, seguida de una limpieza de sesiones de `systemd-logind` acumuladas en `.140` (8 sesiones huérfanas de la cuenta de operación, la mayoría con proceso líder ya muerto). Antes de cerrar una de ellas (`session-1706.scope`) se encontró que tenía dentro un proceso `opensearch_indexer.py` con PID vivo desde 2026-07-04 — señal de que no era una sesión vacía, lo que llevó a investigar en vez de cerrarla directamente.
+
+**Hallazgo:** Encadenamiento de tres problemas en `.140`, todos con la misma causa raíz:
+
+1. **`redis-server.service` fallaba en cada arranque** con `bind: Cannot assign requested address` sobre `200.54.12.140:6379`. `/etc/redis/soc-motor.conf` (incluido al final de `redis.conf` vía `include`, por lo que sobreescribe el `bind 127.0.0.1 -::1` por defecto) tenía `bind 127.0.0.1 200.54.12.140` — la IP pública que `.140` tenía **antes** de migrar a NAT/VLAN (H17). Desde que `.140` vive solo en `10.10.10.3` (VLAN 10), esa IP ya no existe en ninguna interfaz del host, y como la dirección no lleva el prefijo `-` (que le indicaría a Redis "intentá, pero no fallés si no está disponible"), Redis abortaba el arranque completo en vez de omitir solo esa dirección. El log de systemd muestra el mismo fallo repitiéndose en cada intento de reinicio del host: 2026-08-11 06:49 (coincide con el evento de `unattended-upgrades` ya descrito en H15), 2026-08-26 06:32, y 2026-08-30 04:00 — cada uno agotando 5 reintentos antes de "Start request repeated too quickly".
+2. **`motor-soc.service`** (el motor FastAPI real, Fast Path) declara `Requires=`/`After=redis-server.service`. Cuando Redis falló el 2026-08-26 06:32, systemd marcó el arranque de `motor-soc` como "Dependency failed" — un tipo de fallo que **no** activa la política `Restart=` del propio servicio, porque el servicio nunca llega a arrancar: no se reintenta solo, queda muerto hasta un trigger externo (reboot u orden manual). Resultado: el motor de decisiones real estuvo inactivo desde 2026-08-26 06:32 hasta 2026-09-02 15:50 — casi 6 días y 9 horas — sin ningún reintento automático y sin ninguna alerta, mientras Redis seguía fallando en cada ventana de reinicio del host (el episodio del 2026-08-30 04:00 confirma que el problema persistía, no que fue un evento aislado).
+3. **`opensearch-indexer.service`** (indexador del hash-chain de `soc-decisions`) tiene el mismo `Requires=redis-server`, pero con `Restart=always`/`RestartSec=10`, así que quedó crasheando en loop indefinido en vez de morir como `motor-soc`. La única razón por la que algo seguía indexando durante la caída fue un proceso manual huérfano (`opensearch_indexer.py`, PID vivo desde 2026-07-04) corriendo dentro de una sesión SSH que se cortó ese mismo día por "Connection reset by peer" y nunca se cerró — exactamente el mismo patrón de "proceso sin supervisión de systemd" que H15 documentó para `response.worker`, esta vez en el indexador. Al restaurar el servicio systemd sano quedaron los dos corriendo un momento; se confirmó por el log del proceso nuevo que usa un *consumer group* de Redis Streams (`INFO Consumer group... existe`) antes de matar el huérfano, para no asumir que la duplicación era inofensiva sin evidencia.
+
+**Causa raíz:** `/etc/redis/soc-motor.conf` nunca se actualizó al migrar `.140` de IP pública directa a VLAN privada (H17, cerrado 2026-08-25/26) — el mismo día en que, según el log de systemd, Redis empezó a fallar en cada arranque (2026-08-26 06:32). La migración de red cambió la superficie de direcciones del host, pero no se revisaron los `bind` de servicios que antes también escuchaban en la IP pública.
+
+**Decisión:**
+- `soc-motor.conf` corregido a `bind 127.0.0.1` (se quita la IP pública obsoleta). Redis solo lo usan servicios del mismo host (motor, indexador) — nadie externo necesita hablarle directo, así que además de arreglar el arranque esto reduce la superficie de exposición respecto a la config anterior.
+- Reinicio en orden: `redis-server` → `motor-soc.service` (verificado con `/health`: `{"status":"ok","model_version":"golden4_v7_1","model_real":true,"iforest_real":true}`) → confirmado que `opensearch-indexer.service` reconectó solo.
+- Matado el proceso indexador huérfano (PID vivo desde 2026-07-04) una vez confirmado que el de systemd ya procesaba sano.
+- Limpiadas las 8 sesiones huérfanas de `systemd-logind` en `.140` — varias no se liberaban con `loginctl terminate-session` (bug conocido de logind cuando el scope queda vacío); hubo que pararlas por su unidad `systemd` directamente (`systemctl stop session-N.scope`, `systemctl stop user@<uid>.service` para el manager de escritorio residual).
+- **Pendiente, no resuelto en esta sesión:** no existe monitoreo de `motor-soc.service` ni de `redis-server.service` en `.140`. El único heartbeat activo (`vigilante/heartbeat_check.py`) vigila `motor-watcher.service` en `.139` (el lazo FIM), no el motor de decisiones — y ese mismo heartbeat depende de una conexión a Redis sin `try/except` alrededor (`redis.Redis(...).get(...)` directo), así que durante esta misma caída de Redis tampoco habría podido avisar de nada. Es la misma clase de punto ciego que H15 señaló para `response.worker`, ahora confirmada también en el propio motor y en su mecanismo de alerta — candidato fuerte para `docs/BACKLOG_INFRA.md`.
+
+**Evidencia:**
+```
+# journalctl -u redis-server (extracto)
+Aug 26 06:32:04 iaubo systemd[1]: redis-server.service: Failed with result 'exit-code'.
+Aug 30 04:00:49 iaubo systemd[1]: redis-server.service: Start request repeated too quickly.
+
+# log de arranque de Redis
+Warning: Could not create server TCP listening socket 200.54.12.140:6379: bind: Cannot assign requested address
+Failed listening on port 6379 (tcp), aborting.
+
+# motor-soc.service
+Aug 26 06:32:04 iaubo systemd[1]: Dependency failed for motor-soc.service — Motor de Decisiones SOC.
+Aug 30 04:00:47 iaubo systemd[1]: Dependency failed for motor-soc.service — Motor de Decisiones SOC.
+Sep 02 15:50:29 iaubo systemd[1]: Started motor-soc.service — Motor de Decisiones SOC — Tesis UBO.
+Sep 02 15:51:48 iaubo uvicorn[661929]: 127.0.0.1:46960 - "GET /health HTTP/1.1" 200 OK
+
+# /etc/redis/soc-motor.conf, antes / después
+- bind 127.0.0.1 200.54.12.140
++ bind 127.0.0.1
+```
+Indexador huérfano: PID 2256436, arranque `Jul04` confirmado por `ps -ef`, viviendo dentro de `session-1706.scope` (`loginctl session-status 1706`), asociado a una sesión SSH cortada ese mismo día por "Connection reset by peer".
+
+**Impacto en la tesis:** ventana real de motor de decisiones inactivo ≈6 días 9h (2026-08-26 06:32 → 2026-09-02 15:50). Cualquier análisis de disponibilidad o métricas de valor que cubra este período (sección 7 de `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, "disponibilidad operativa vía Prometheus/Zabbix") debe excluir o marcar explícitamente esta ventana — mismo criterio metodológico que H15 estableció para su propia caída.
 
 ---
 
@@ -547,4 +620,6 @@ perderlos:
 - **20 reglas de threat intel inactivas** (IDs 99901-99920): referencian listas IOC (malicious-ioc/malware-hashes, malicious-ip, malicious-domains) que nunca se cargaron con contenido real. Las reglas existen pero no tienen efecto. Pendiente decidir si se completan con feeds reales o se eliminan del ruleset.
 - **Verificar directamente la regla NAT/MASQUERADE en `.139`:** el `sudo` restringido de auditoría documentado no permitía leer `/etc/ufw/before.rules` ni `iptables -t nat -L` (ver H17). El diagnóstico de H21 sí involucró leer y editar `before.rules` directamente — si eso se hizo con acceso ampliado o manual, actualizar acá y en el alcance del `sudo` de auditoría (`.claude/skills/soc-audit/SKILL.md`) para que quede consistente con lo que realmente es accesible hoy.
 - **Perfil `netplan-eno1` duplicado en `.139`:** perfil de NetworkManager inactivo con el mismo `interface-name=eno1` que `netplan-zz-all-en` (H18). No representa riesgo mientras siga sin autoconectar, pero es candidato a limpieza para evitar ambigüedad futura.
+- **Sin monitoreo de `motor-soc.service`/`redis-server.service` en `.140`** (H22): el heartbeat existente solo cubre `motor-watcher.service` en `.139` y además depende de Redis sin manejo de fallo — sería ciego a una repetición exacta de H22. Diseñar un check independiente de Redis (o con fallback que no dependa de él) que cubra el motor y el propio Redis, no solo el vigilante FIM.
+- **Cuantificar el hueco real en `soc-decisions`/OpenSearch durante la ventana de H22** (2026-08-26 a 2026-09-02): no se verificó cuántas decisiones reales faltaron indexar en esos ~6 días (el motor estaba muerto, no solo el indexador) — útil para el capítulo de resultados si se necesita justificar o excluir ese rango de cualquier métrica de disponibilidad.
 - **Actualización de firmware del switch SG350** (H20): evaluar upgrade desde v2.4.0.94 para dejar de depender del workaround de algoritmos SSH legacy en el cliente.
