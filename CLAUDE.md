@@ -2,21 +2,28 @@
 
 Tesis UBO: "Motor de decisión basado en riesgo para SOAR en SOC: integración de Machine
 Learning calibrado con orquestación de respuesta automatizada."
-Semillero: julio 2026 (~90%) | Defensa: noviembre 2026 | Branch activo: develop
+Semillero: septiembre 2026 (~95%) | Cierre documento: 16 oct 2026 | Defensa: 30 oct 2026 | Branch activo: develop
 
 <!-- Roles: Antonio = infra/integración/backend | Joaquín = ML | Asesor: Prof. Miguel Castillo -->
 <!-- Reglas extendidas: .claude/rules/model-contract.md | security.md | observability.md -->
 
 ---
 
-## Contexto reciente (semana del 18–25 ago 2026)
+## Contexto reciente (actualizado 1 sep 2026)
 
 La red del laboratorio migró de subred plana a NAT/VLANs con `.139` como
 bastion/gateway obligatorio, y se corrigió un bug de firewall que dejaba a
-Suricata casi ciego pese a estar activo. No afecta al modelo, a los features
-ni al pipeline de entrenamiento — es infraestructura de red pura, a cargo de
-Antonio. Detalle completo en `docs/BITACORA_TECNICA.md` (H16–H21); estado
-operativo resumido en la sección Infraestructura más abajo.
+Suricata casi ciego pese a estar activo. `.138` ya migró hoy (1-sep) a VLAN 30
+(`10.30.30.2`, SSH puerto 22 vía bastion). `.141`/`.142` siguen pendientes.
+Detalle completo en `docs/BITACORA_TECNICA.md` (H16–H21).
+
+Además, el profesor guía pidió reforzar R-SOAR como sistema de gestión que
+apoye cumplimiento normativo (Ley 21.663/ANCI), no solo como motor técnico.
+El 1-sep quedaron cerradas con Antonio las decisiones de ampliación de R1/R2,
+control de acceso y dashboards por rol. Documento completo, con todas las
+decisiones cerradas: `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md` — leer
+antes de tocar R1/R2, el dashboard, o cualquier tema de autenticación/roles.
+Resumen en la sección "Ampliación de respuesta SOAR" más abajo.
 
 ---
 
@@ -37,6 +44,12 @@ Infraestructura de este documento — eso lo maneja Antonio. Si algo de esa
 parte te bloquea (por ejemplo, acceso a `.140` para correr un
 reentrenamiento), avisale a él directamente en vez de intentar resolverlo
 por tu cuenta.
+
+**Sobre el Isolation Forest de comportamiento de host** (exfiltración, ediciones de
+archivo ilógicas, privilegios extraños): quedó confirmado como trabajo futuro, fuera de
+alcance de este ciclo — no hay dataset realista para validarlo y no se quiere arriesgar
+el modelo de red ya calibrado. Si no estás de acuerdo o quieres retomarlo, avisale a
+Antonio para ajustar el documento antes de tocar nada.
 
 ---
 
@@ -146,6 +159,31 @@ Todos los índices: `number_of_replicas: 0`, `index.codec: best_compression`. IS
 
 ---
 
+## Ampliación de respuesta SOAR (set 2026)
+
+Decisión del profesor guía: R-SOAR debe funcionar también como apoyo a la gestión de
+seguridad de la información (SGSI) y al cumplimiento ante la ANCI (Ley 21.663), no solo
+como motor técnico. Se cerraron con Antonio, el 1-sep, las decisiones de ampliación de
+R1/R2, control de acceso y dashboards. Documento completo:
+`docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`. Resumen:
+
+- **R1:** se suma OTX/AlienVault, CrowdSec (corroboración comunitaria) y contexto de
+  hallazgos nativos de Wazuh (FIM, privilegios, rootcheck). Isolation Forest de
+  comportamiento de host queda como trabajo futuro (ver PROHIBICIONES).
+- **R2:** repertorio de acciones graduado (log, alertar+crear caso, bloqueo de IP,
+  rate-limiting, cuarentena de host vía switch SG350), no solo bloquear/no bloquear.
+  Acciones de alto impacto (cuarentena) requieren aprobación humana de Operador N2 o CISO.
+- **Roles:** Operador N1/N2 y CISO/Gerencia, mínimo privilegio, JWT + tabla de usuarios,
+  cada acceso y cada acción restringida por rol se registra en el hash-chain de auditoría.
+- **Dashboards:** Operativo (alertas, casos vía Iris, aprobación de acciones) y
+  Gerencial/CISO (cumplimiento Ley 21.663, métricas de valor, historial/auditoría). Ambos
+  leen la misma capa de datos, Grafana se mantiene aparte como consola NOC/SOC.
+- **Iris Web** es dependencia core desde semana 1-2, no un módulo opcional.
+
+Ver checklist completo de pendientes de implementación en la sección 9 del documento.
+
+---
+
 ## Estándares de Calidad Empresarial
 
 **Contratos de API:**
@@ -172,18 +210,19 @@ Todos los índices: `number_of_replicas: 0`, `index.codec: best_compression`. IS
 |---|---|---|---|
 | Gen 10 (`.139`) | 200.54.12.139 (SSH puerto 2222) | Bastion/NAT gateway in-line, Suricata, Wazuh Manager, honeypot Cowrie | Migrado — trunk VLAN vía `eno2` |
 | Lenovo (`.140`) | 10.10.10.3 (VLAN 10) | Motor FastAPI + Redis + OpenSearch (Docker) | Migrado — SSH puerto 2222 |
-| Gen 9 A (`.138`) | 200.54.12.138 (pública, aún directa) | Web: nginx + WordPress + MariaDB (fuente de tráfico real) | Pendiente (requiere acceso físico) |
-| `.141` (Eliecer, IA) | 10.20.20.2 (VLAN 20, aún no operativo) | Servidor de terceros | Pendiente |
-| `.142` (Agustín, emprendedores) | 10.20.20.3 (VLAN 20, aún no operativo) | Servidor de terceros | Pendiente, falta cablear al switch |
+| Gen 9 A (`.138`) | 10.30.30.2 (VLAN 30) | Web: nginx + WordPress + MariaDB (fuente de tráfico real) | Migrado 1-sep — SSH puerto 22 vía bastion |
+| `.141` (Eliecer, IA) | 10.20.20.2 (VLAN 20, aún no operativo) | Servidor de terceros — dentro del perímetro R-SOAR una vez migrado | Pendiente, cableado |
+| `.142` (Agustín, emprendedores) | 10.20.20.3 (VLAN 20, aún no operativo) | Servidor de terceros — **fuera del perímetro R-SOAR por decisión**, mantiene IP pública `200.54.12.142` | Pendiente, falta cablear al switch |
+| Switch SG350 (`switch56ed45`) | 10.10.10.254 (VLAN 10, gestión) | Switch gestionado, trunk hacia `.139` (gi6), acceso VLAN por puerto (gi1→.138, gi2→.140, gi3→.141, gi4→.142) | Operativo — se agregará VLAN de cuarentena dedicada (pendiente) |
 
-> **Nota de migración (ago 2026):** la topología pasó de subred plana `200.54.12.136/29`
-> compartida por todos los hosts a NAT/gateway con VLANs sobre `.139` (in-line, ya no
-> sensor pasivo con SPAN). `.139` mantiene IP pública directa (bastion/jump host
-> obligatorio); `.140` ya vive solo en VLAN 10 (`10.10.10.0/24`) sin IP pública propia.
-> `.138`, `.141`, `.142` siguen con su acceso viejo hasta que se migren físicamente.
+> **Nota de migración (actualizada 1 sep 2026):** la topología pasó de subred plana
+> `200.54.12.136/29` compartida por todos los hosts a NAT/gateway con VLANs sobre `.139`
+> (in-line, ya no sensor pasivo con SPAN). `.139` mantiene IP pública directa (bastion/jump
+> host obligatorio); `.140` y `.138` ya viven solo en su VLAN privada (10.10.10.0/24 y
+> 10.30.30.0/24 respectivamente) sin IP pública propia. `.141`/`.142` siguen con su acceso
+> viejo hasta que se migren físicamente; `.142` queda fuera del perímetro de R-SOAR por
+> decisión de alcance, no solo por estado de migración.
 > Detalle completo, verificación por SSH y hallazgos (H17–H20) en `docs/BITACORA_TECNICA.md`.
-> Reemplaza la nota de jul 2026 sobre migración de Motor/Redis a `.140`, que sigue vigente
-> a nivel de servicio pero ya no a nivel de red (ese host ya no tiene IP pública).
 
 **Acceso SSH — bastion obligatorio para todo host detrás de VLAN:**
 
@@ -191,14 +230,21 @@ Todos los índices: `number_of_replicas: 0`, `index.codec: best_compression`. IS
 # Directo al bastion (.139) — sigue con IP pública
 ssh -i ~/.ssh/tesis_ubo_aiayala -p 2222 aiayala@200.54.12.139
 
-# A cualquier host en VLAN (ejemplo .140 en VLAN 10) — jump host via .139
-# OJO: especificar -p 2222 tanto para el jump como para el destino final,
-# el SSH interno de cada host migrado corre en 2222, no en el 22 estándar.
+# A .140 (VLAN 10) — jump host via .139, puerto interno 2222
 ssh -i ~/.ssh/tesis_ubo_aiayala -p 2222 -J aiayala@200.54.12.139:2222 aiayala@10.10.10.3
+
+# A .138 (VLAN 30, migrado 1-sep) — jump host via .139, puerto interno 22 (estándar,
+# distinto al de .140 — no asumir, verificar siempre con `ss -tlnp | grep ssh`)
+ssh -i ~/.ssh/tesis_ubo_aiayala -p 22 -J aiayala@200.54.12.139:2222 aiayala@10.30.30.2
 ```
 
-`.138`, `.141`, `.142` (no migrados aún) se siguen alcanzando por su IP pública/ruta vieja
-directa — no aplican el flujo de jump host hasta que se migren.
+**El puerto SSH interno NO es uniforme entre servidores** — confirmar siempre con
+`ss -tlnp | grep ssh` desde la consola física antes de asumirlo.
+
+`.141`/`.142` (no migrados aún) se siguen alcanzando por su IP pública/ruta vieja directa
+— no aplican el flujo de jump host hasta que se migren. `.142` además queda fuera del
+perímetro protegido de R-SOAR por decisión de alcance (ver
+`docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 1).
 
 Servicios nuevos en Docker, red interna Docker. Solo dashboard expuesto externamente
 (nginx reverse proxy en `.139` → `proxy_pass` a la IP privada de cada host, ej.
@@ -236,6 +282,8 @@ Cambio de arquitectura → actualizar `ROADMAP.md` en el mismo commit.
 10. **No proponer MISP ni LLMs como trabajo activo** — fuera de alcance de hardware y plazo.
 11. **No proponer réplicas en OpenSearch** — single node, `replicas: 0`.
 12. **No tocar la red TI universitaria (25 PCs)** — fuera de alcance absoluto.
+13. **No entrenar Isolation Forest de comportamiento de host en este ciclo** — no hay dataset de comportamientos anómalos de host realista todavía; queda como trabajo futuro (ver `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 2). No modificar el Isolation Forest de red ya validado para intentarlo.
+14. **No implementar Shuffle SOAR** — duplicaría R1/R2 del motor propio (escucha Redis Stream, consulta TI, pide inferencia, ejecuta bloqueo: es lo que ya hace `decision-engine`). Documentado como trabajo futuro/productización post-tesis.
 
 ## graphify
 
