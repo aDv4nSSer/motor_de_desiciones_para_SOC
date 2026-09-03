@@ -34,6 +34,7 @@ Categorías: **ML** (dataset/modelo/features) · **Resp** (respuesta activa/FIM/
 | [H20](#h20) | Red | Switch SG350: firmware solo ofrece algoritmos SSH obsoletos | Bajo | Mitigado — workaround en cliente, firmware pendiente |
 | [H21](#h21) | Red | Suricata in-line con cero alertas — orden de reglas en `before.rules` | Alto | Resuelto — retest confirmado con evidencia |
 | [H22](#h22) | Ops | Redis caído por bind a IP pública obsoleta — motor-soc casi 1 semana sin levantar | Alto | Resuelto — fix aplicado y verificado; brecha de monitoreo queda pendiente |
+| [H23](#h23) | Resp | OTX/AlienVault como segunda fuente de R1 (ampliación SOAR, punto 1) | Medio | Implementado — API key real ya cargada en `.140`, pendiente deploy del código |
 
 ---
 
@@ -611,6 +612,22 @@ Sep 02 15:51:48 iaubo uvicorn[661929]: 127.0.0.1:46960 - "GET /health HTTP/1.1" 
 Indexador huérfano: PID 2256436, arranque `Jul04` confirmado por `ps -ef`, viviendo dentro de `session-1706.scope` (`loginctl session-status 1706`), asociado a una sesión SSH cortada ese mismo día por "Connection reset by peer".
 
 **Impacto en la tesis:** ventana real de motor de decisiones inactivo ≈6 días 9h (2026-08-26 06:32 → 2026-09-02 15:50). Cualquier análisis de disponibilidad o métricas de valor que cubra este período (sección 7 de `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, "disponibilidad operativa vía Prometheus/Zabbix") debe excluir o marcar explícitamente esta ventana — mismo criterio metodológico que H15 estableció para su propia caída.
+
+---
+
+<a id="h23"></a>
+## H23 — OTX/AlienVault como segunda fuente de R1 (ampliación SOAR, punto 1)
+
+**Fecha:** 2026-09-03
+**Contexto:** La ampliación SOAR (`docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 1) decidió que R1 sume OTX/AlienVault como corroboración comunitaria además de AbuseIPDB, ya integrado. Se implementó `_otx_lookup()` en `motor/response/enrichment.py`, calcando exactamente el patrón ya validado de `_abuseipdb_lookup()`: cache Redis primero (prefijo `soc:enrich:otx:`), cache miss dispara `GET /api/v1/indicators/IPv4/{ip}/general` con header `X-OTX-API-KEY`, se extrae `pulse_info.count` (cantidad de pulses/reportes comunitarios que mencionan el indicador) y se cachea con TTL 6h.
+
+**Hallazgo:** Mismo principio de degradación elegante que AbuseIPDB — sin `otx_api_key` configurada o ante cualquier fallo HTTP/de red, la función nunca lanza excepción: marca `otx_available = False`, agrega una nota en `EnrichmentResult.notes` y R1 continúa con el resto del enriquecimiento (reverse DNS + AbuseIPDB) sin bloquear el pipeline. `enrich()` ahora llama a ambos lookups (`_abuseipdb_lookup` y `_otx_lookup`) y fusiona los campos `otx_pulse_count`/`otx_available` en el mismo `EnrichmentResult` que ya se persistía.
+
+**Decisión:** `ABUSEIPDB_API_KEY=` y `OTX_API_KEY=` agregadas a `.env.example` (la de AbuseIPDB faltaba pese a que el código ya la usaba desde antes). La key real de OTX se configura directamente en el `.env` de producción de `.140` — no se toca en este cambio ni se commitea.
+
+**Evidencia:** 5 tests unitarios nuevos en `tests/unit/test_otx_enrichment.py` (cache hit, cache miss con llamada a API + escritura de cache, sin API key, timeout de conexión, HTTP 429) — 5/5 pasan. Suite completa del repo: 24/24 pasan tras el cambio (`pytest tests/ -v`).
+
+**Pendiente:** validar en `.140` con la key real de OTX que la cuota/rate limit del proveedor es compatible con el volumen real de tráfico (OTX no impone un límite tan estricto como AbuseIPDB, pero no se ha medido en producción). MISP queda diferido según PROHIBICIONES de `CLAUDE.md`.
 
 ---
 
