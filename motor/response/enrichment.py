@@ -26,6 +26,7 @@ from response.schemas import EnrichmentResult
 log = logging.getLogger("response.r1")
 
 ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
+OTX_URL = "https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/general"
 
 
 def _reverse_dns(ip: str) -> Optional[str]:
@@ -108,11 +109,73 @@ def _abuseipdb_lookup(
     return result
 
 
+def _otx_lookup(
+    ip: str, settings: ResponseSettings, rdb: redis.Redis
+) -> EnrichmentResult:
+    """
+    Consulta OTX/AlienVault con cache. Devuelve EnrichmentResult parcial.
+    Nunca lanza excepción hacia arriba — degradación elegante.
+    """
+    result = EnrichmentResult(src_ip=ip)
+
+    # Sin API key configurada -> degradación elegante
+    if not settings.otx_api_key:
+        result.otx_available = False
+        result.notes.append("otx_api_key no configurada")
+        return result
+
+    cache_key = f"{settings.enrich_cache_prefix}otx:{ip}"
+
+    # 1) Cache hit
+    try:
+        cached = rdb.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            result.otx_pulse_count = data.get("pulse_count")
+            result.cached = True
+            return result
+    except (redis.RedisError, json.JSONDecodeError) as e:
+        log.warning(f"cache read fallida (otx) para {ip}: {e}")
+
+    # 2) Cache miss -> consulta API
+    try:
+        resp = httpx.get(
+            OTX_URL.format(ip=ip),
+            headers={"X-OTX-API-KEY": settings.otx_api_key},
+            timeout=settings.otx_timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        result.otx_pulse_count = payload.get("pulse_info", {}).get("count")
+
+        # cachear
+        try:
+            rdb.setex(
+                cache_key,
+                settings.otx_cache_ttl,
+                json.dumps({"pulse_count": result.otx_pulse_count}),
+            )
+        except redis.RedisError as e:
+            log.warning(f"cache write fallida (otx) para {ip}: {e}")
+
+    except httpx.HTTPStatusError as e:
+        result.otx_available = False
+        code = e.response.status_code
+        result.notes.append(f"otx HTTP {code}")
+    except (httpx.HTTPError, ValueError) as e:
+        result.otx_available = False
+        result.notes.append(f"otx error: {type(e).__name__}")
+        log.warning(f"OTX no disponible para {ip}: {e}")
+
+    return result
+
+
 def enrich(
     src_ip: Optional[str], settings: ResponseSettings, rdb: redis.Redis
 ) -> EnrichmentResult:
     """
-    Punto de entrada de R1. Enriquece una IP de origen con DNS + reputación.
+    Punto de entrada de R1. Enriquece una IP de origen con DNS + reputación
+    (AbuseIPDB + OTX/AlienVault).
     Siempre devuelve un EnrichmentResult, nunca lanza excepción.
     """
     if not src_ip:
@@ -121,5 +184,10 @@ def enrich(
         return r
 
     result = _abuseipdb_lookup(src_ip, settings, rdb)
+    otx_result = _otx_lookup(src_ip, settings, rdb)
+    result.otx_pulse_count = otx_result.otx_pulse_count
+    result.otx_available = otx_result.otx_available
+    result.notes.extend(otx_result.notes)
+    result.cached = result.cached or otx_result.cached
     result.reverse_dns = _reverse_dns(src_ip)
     return result

@@ -51,6 +51,8 @@ class EnrichmentResult(BaseModel):
     abuseipdb_total_reports: Optional[int] = None
     abuseipdb_country: Optional[str] = None
     abuseipdb_available: bool = True             # False si la API falló / no configurada
+    otx_pulse_count: Optional[int] = None        # reportes de amenaza comunitarios (OTX pulses)
+    otx_available: bool = True                   # False si la API falló / no configurada
     cached: bool = False
     notes: list[str] = Field(default_factory=list)
 

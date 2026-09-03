@@ -107,7 +107,7 @@ Iris Web debe estar listo e integrado desde el inicio (semana 1-2), sin módulo 
 
 ## 9. Pendientes de implementación
 
-1. Cerrar integración OTX/AlienVault.
+1. ~~Cerrar integración OTX/AlienVault.~~ **Hecho (2026-09-03)** — `_otx_lookup()` en `motor/response/enrichment.py`, ver [H23](BITACORA_TECNICA.md#h23). La API key real ya está cargada en el `.env` de `.140`, pendiente solo el deploy del código.
 2. Instalar CrowdSec (agente + bouncer) en `.139`.
 3. Consulta del motor a eventos recientes de Wazuh (FIM, privilegios, rootcheck) por host.
 4. Clasificar firmas de `threshold.conf` (drop vs. alert).

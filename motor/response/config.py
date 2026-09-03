@@ -62,6 +62,11 @@ class ResponseSettings(BaseSettings):
     abuseipdb_cache_ttl: int = 21600     # 6h — respeta límite 900 req/día
     abuseipdb_timeout: float = 4.0
 
+    # ── R1: OTX/AlienVault ───────────────────────────────────────────────
+    otx_api_key: str = ""
+    otx_cache_ttl: int = 21600           # 6h — mismo criterio que AbuseIPDB
+    otx_timeout: float = 4.0
+
     # ── R2: enforcer Wazuh API ─────────────────────────────────────────
     enforcer_backend: str = "dry_run"    # dry_run | wazuh_api
     wazuh_api_url: str = "https://200.54.12.139:55000"
