@@ -42,6 +42,7 @@ Categorías: **ML** (dataset/modelo/features) · **Resp** (respuesta activa/FIM/
 | [H28](#h28) | Resp | Corroboración multi-fuente de R1 (AbuseIPDB+OTX) no influía en tier/`accion_recomendada` — solo quedaba en `soc:response:audit` sin efecto en R2; además, R1 en producción enriquece IPs privadas post-migración VLAN (`10.10.10.3`/`10.30.30.2`), lo que rompía OTX (HTTP 400) y explica por qué la corroboración real nunca se validó bajo carga | Alto | Resuelto y validado en producción: gate real en `worker.py` (2+ fuentes → automático, <2 → `BLOCK_PENDING_APPROVAL` N1) + guard de IP privada en `enrichment.py`, desplegado a `.140` y confirmado con evento real (`worker.log`). 25 tests nuevos, 44/44 pasan. Circuit-breaker evaluado y descartado con evidencia. Efecto colateral medido: guard también drenó un backlog real de 99.594 mensajes. Cuota de OTX bajo tráfico externo real sigue sin validar (bloqueado por el hallazgo de IP privada, fuera de alcance de red/Suricata) |
 | [H29](#h29) | Resp | `r2_min_tier=2` (default desde jul-2026 + override idéntico hardcodeado en el `.env` real de `.140`, ambos previos a la especificación de sep-2026) permitía que eventos T2 llegaran al gate de bloqueo automático de R2, contra la sección 4 de la especificación (bloqueo automático exclusivo de T3) | Alto | Auditado con 3 fuentes independientes (`soc:response:audit`, `worker.log` sin capar, `active-responses.log` real de Wazuh en `.138`): **cero bloqueos reales de T2 ocurrieron** — no por diseño correcto, sino porque no hubo tráfico con corroboración≥2 desde el gate de H28 ni active-response alguno desde el apagón del 18-ago (H25). Corregido en código y en el `.env` real (que tenía el valor pisado, no detectado hasta el deploy). Desplegado tras resolver una saturación colateral de `motor-soc` (reboot completo) y validado con evento T2 real: confirmado que el evento ya ni siquiera llega a evaluarse para bloqueo (`block` ausente), no solo `BLOCK_PENDING_APPROVAL` |
 | [H30](#h30) | Ops | `motor-soc.service` (Fast Path) se saturó dos veces durante la validación de H29 — proceso único sin `--workers`, IO síncrono (Redis sin timeout en `response/queue.py`) y CPU-bound (`model.predict()`) ejecutados directamente dentro de `async def decide()` | Alto | Mecanismo identificado con evidencia directa (journal: 2 `SIGKILL` por timeout de parada, no OOM; código confirma el anti-patrón). **Disparador inicial del 3-sep no determinado** — declarado explícitamente como causa raíz no confirmada, no cerrado como resuelto por el reboot |
+| [H31](#h31) | ML | `motor/model.py` real en `.140` usa nombres de columna `Column_0..3` y unwrap de modelo empaquetado en dict — no coincide con `model-contract.md` ni con el `model.py` versionado en el repo | Alto | Documentado como contraste textual puro, sin interpretar bug vs. diseño intencional (le corresponde a Joaquín). No se modifica ni se reconcilia — queda explícitamente excluido de la conversión a git checkout de H26 hasta su revisión |
 
 ---
 
@@ -944,6 +945,59 @@ Esta combinación — trabajo síncrono bloqueante (CPU y Redis, uno de ellos si
 **Decisión:** no se aplica ningún cambio de código en esta sesión — no fue pedido y modificar el Fast Path en producción sin plan de rollback claro no es una decisión para tomar unilateralmente. Queda documentado como pendiente concreto, con mecanismo identificado, para decidir con Antonio si se aborda antes de CrowdSec o se prioriza después.
 
 **Evidencia:** journal completo de `motor-soc.service` (extracto arriba), lectura de `motor/main.py`, `motor/redis_client.py`, `motor/response/queue.py`, `infra/systemd/motor-soc.service` (sin drift confirmado contra el real), `nproc`/`free -h` de `.140`.
+
+---
+
+<a id="h31"></a>
+## H31 — `motor/model.py` real en producción usa una lógica de features distinta a la documentada en `model-contract.md` y no versionada en el repo
+
+**Fecha:** 2026-09-05
+
+**Severidad:** Alto (la más alta usada en esta bitácora) — no es un hallazgo de infraestructura, es una posible discrepancia entre el código que generó las métricas de la tesis (AUC 0.97, precisión/recall documentados en `model-contract.md`) y lo que está versionado en `develop`.
+
+**Contexto:** al auditar archivos de `motor/` en `.140` para la reconciliación de H26 (PASO 2), se comparó por hash cada archivo tracked contra su equivalente real en producción. `motor/model.py` no coincide — a diferencia de `dashboard.py` (drift menor, ver abajo) y de `redis_client.py` (ver H32), esta diferencia toca directamente la lógica de inferencia del modelo Golden 4 v7.1.
+
+**Hallazgo — contraste textual, sin interpretar intención ni corrección:**
+
+`.claude/rules/model-contract.md`, sección "Features activos (4 únicos — Golden 4)", documenta:
+```
+SERVER_TCP_FLAGS          Flags TCP del servidor (SYN, ACK, RST, FIN, etc.)
+OUT_PKTS                  Paquetes salientes del cliente al servidor en el flujo
+FLOW_DURATION_MILLISECONDS Duración total del flujo en milisegundos
+L4_DST_PORT               Puerto destino TCP/UDP (0–65535)
+```
+y especifica: "El orden y los nombres deben coincidir exactamente con `feature_schema_v5_latest.json`."
+
+El `_features_lgbm()` real en `~/tesis/motor/model.py` (`.140`), que es el código que efectivamente ejecuta cada predicción en producción, construye en cambio un `pandas.DataFrame` con columnas nombradas `Column_0`, `Column_1`, `Column_2`, `Column_3`:
+```python
+def _features_lgbm(self, f: dict):
+    """4 Golden features — el modelo usa Column_0..3 como nombres internos."""
+    import pandas as pd
+    return pd.DataFrame([{
+        "Column_0": float(f.get("SERVER_TCP_FLAGS", 0)),
+        "Column_1": float(f.get("OUT_PKTS", 0)),
+        "Column_2": float(f.get("FLOW_DURATION_MILLISECONDS", 0)),
+        "Column_3": float(f.get("L4_DST_PORT", 0)),
+    }])
+```
+El repo (`motor/model.py`, tracked en `develop`) en cambio construye un `numpy.ndarray` posicional sin nombres de columna:
+```python
+def _features_lgbm(self, f: dict) -> np.ndarray:
+    """4 Golden features en orden para LightGBM."""
+    return np.array([[
+        f.get("SERVER_TCP_FLAGS", 0),
+        f.get("OUT_PKTS", 0),
+        f.get("FLOW_DURATION_MILLISECONDS", 0),
+        f.get("L4_DST_PORT", 0),
+    ]], dtype=np.float32)
+```
+Adicionalmente, la carga del modelo difiere: producción hace `pkg = joblib.load(MODEL_FILE)` y, si `pkg` es un `dict`, extrae `pkg['model']` con un log `"LightGBM extraído del paquete v{pkg.get('version','?')}"`; el repo asume que `joblib.load(MODEL_FILE)` devuelve directamente el estimador, sin manejar el caso de paquete-dict. Si el `model.py` del repo se desplegara tal cual a producción hoy, la carga del modelo probablemente fallaría o se comportaría de forma distinta a la actual.
+
+**Lo que esto significa, sin especular sobre cuál versión es la correcta:** el código que hoy corre en producción y generó las métricas ya validadas y citadas en `model-contract.md` (AUC 0.97, Brier 0.058, etc.) **no está en ningún commit de este repositorio**. No se sabe, desde el análisis de esta sesión, si `Column_0..3` es el naming interno con el que Joaquín entrenó el modelo (en cuyo caso el repo está simplemente desactualizado y sin riesgo funcional) o si hay una inconsistencia real entre cómo se entrenó y cómo se sirve el modelo (en cuyo caso las métricas podrían no ser reproducibles con el código versionado, o peor, el mapeo de columnas podría no ser el que se cree). Esa interpretación le corresponde a Joaquín, no fue asumida acá.
+
+**Decisión:** no se modifica `motor/model.py` del repo ni se trae la versión de producción al repo en esta sesión, ni siquiera como referencia temporal — se deja explícitamente fuera de cualquier reconciliación hasta que Joaquín confirme cuál versión (o ninguna de las dos) es la correcta. La conversión a checkout real de git en `.140` (H26) debe excluir explícitamente este archivo de la sincronización automática (`git update-index --skip-worktree`) para que un futuro `git pull` no sobreescriba la versión real de producción con la versión del repo, que hoy se sabe desactualizada.
+
+**Evidencia:** diff completo `motor/model.py` (repo) vs. `~/tesis/motor/model.py` (`.140`, descargado por scp para diff local, no editado); hashes SHA-256 distintos confirmados; `.claude/rules/model-contract.md` citado arriba.
 
 ---
 
