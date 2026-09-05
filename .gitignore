@@ -9,6 +9,12 @@
 *.pkl
 *.joblib
 models/
+# H26: en .140, motor/models es un symlink hacia motor-runtime/models (no un
+# directorio real) -- "models/" con barra no matchea un symlink en git, hay
+# que ignorarlo explícito o vuelve a aparecer como untracked en git status.
+motor/models
+motor/logs
+motor/config
 
 # --- Estado interno de Vector (checkpoints, buffers) ---
 **/.vector-data/
