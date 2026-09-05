@@ -5,6 +5,12 @@ Streams: soc:flows (Fast Path) y soc:decisions (decisiones finales)
 import redis, json, logging, os
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
+# Mismo patrón que opensearch_indexer.py/dashboard.py desde H27: REDIS_PASSWORD
+# vive en .env (WorkingDirectory), no en el unit file de systemd.
+load_dotenv()
+
 log = logging.getLogger("motor.redis")
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "200.54.12.140")
