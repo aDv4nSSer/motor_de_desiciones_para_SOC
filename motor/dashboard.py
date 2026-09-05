@@ -17,8 +17,11 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import redis
+from dotenv import load_dotenv
 
 from response.config import get_settings
+
+load_dotenv()
 
 log = logging.getLogger("motor.dashboard")
 

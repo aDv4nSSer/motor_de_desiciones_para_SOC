@@ -52,6 +52,9 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import tldextract
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +68,7 @@ STATE_FILE = os.environ.get(
     "SHADOW_STATE_FILE", "/home/aiayala/tesis/vigilante/logs/shadow_detect_state.json"
 )
 
-OS_HOST = os.environ.get("OS_HOST", "https://200.54.12.140:9201")
+OS_HOST = os.environ.get("OS_HOST", "https://10.10.10.3:9201")
 OS_USER = os.environ.get("OS_USER", "admin")
 OS_PASS = os.environ.get("OS_PASS", "")
 OS_INDEX = "soc-experimental-detections"

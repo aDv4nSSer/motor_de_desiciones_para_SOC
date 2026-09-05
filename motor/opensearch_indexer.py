@@ -15,6 +15,10 @@ Si alguien modifica un documento, la cadena se rompe y es detectable.
 import redis, hashlib, json, os, time, logging, urllib.request, urllib.parse, ssl
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [opensearch_indexer] %(levelname)s %(message)s"

@@ -8,6 +8,7 @@ scikit-learn>=1.4.0
 redis>=4.6.0
 requests>=2.31.0
 lightgbm>=4.0.0
+python-dotenv>=1.0.0  # opensearch_indexer.py, dashboard.py, shadow_detect.py -- load_dotenv()
 
 # Vigilante (corre en .139, mismo requirements por consistencia)
 # redis y requests ya cubiertos arriba
