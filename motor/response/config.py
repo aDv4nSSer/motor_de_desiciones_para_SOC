@@ -41,7 +41,9 @@ class ResponseSettings(BaseSettings):
 
     # ── Umbrales de disparo ────────────────────────────────────────────
     r1_min_tier: int = 1   # R1 (enrich) dispara desde T1
-    r2_min_tier: int = 2   # R2 (block)  dispara desde T2
+    r2_min_tier: int = 3   # R2 (block)  dispara solo desde T3 (sección 4 de la
+                           # especificación: bloqueo automático es exclusivo de T3;
+                           # T2 solo alerta y crea caso — ver H29 en BITACORA_TECNICA.md)
 
     # ── Cola Redis ─────────────────────────────────────────────────────
     redis_host: str = "localhost"

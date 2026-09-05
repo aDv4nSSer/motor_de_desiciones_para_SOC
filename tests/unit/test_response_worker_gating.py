@@ -163,3 +163,67 @@ class TestBelowR2ThresholdNeverReachesGate:
 
         respond_block.assert_not_called()
         assert record.block is None
+
+
+class TestR2MinTierDefaultMatchesSpec:
+    """
+    Continuación de H28 (H29): la sección 4 de la especificación solo
+    contempla bloqueo automático en T3 — T2 (red u host) siempre alerta y
+    crea caso, nunca bloquea, sin importar la corroboración. r2_min_tier=2
+    (heredado de julio, previo a la especificación de septiembre) permitía
+    que T2 llegara al gate de R2 igual. Este test fija el default correcto
+    para que una regresión futura no lo vuelva a bajar sin darse cuenta.
+    """
+
+    def test_default_r2_min_tier_is_three_not_two(self) -> None:
+        assert ResponseSettings().r2_min_tier == 3
+
+    def test_tier_two_never_reaches_r2_gate_even_with_strong_corroboration(
+        self, mocker
+    ) -> None:
+        """Bajo el default real (sin overrides), un T2 con 2+ fuentes
+        corroborando NO debe intentar bloquear — la tabla de la especificación
+        no contempla bloqueo automático en T2 bajo ninguna circunstancia."""
+        settings = ResponseSettings(response_mode="dry_run")
+        rdb = mocker.MagicMock()
+        enforcer = mocker.MagicMock(name="dry_run")
+
+        mocker.patch(
+            "response.worker.enrich",
+            return_value=EnrichmentResult(
+                src_ip="203.0.113.5", corroboration_count=2,
+                corroborating_sources=["abuseipdb", "otx"],
+            ),
+        )
+        respond_block = mocker.patch("response.worker.respond_block")
+
+        record = process_task(_task(tier=2), settings, rdb, enforcer)
+
+        respond_block.assert_not_called()
+        assert record.block is None
+
+    def test_tier_three_still_autoblocks_with_strong_corroboration_under_defaults(
+        self, mocker
+    ) -> None:
+        """Confirma que subir r2_min_tier a 3 no rompió el camino automático
+        real de T3 con corroboración suficiente."""
+        settings = ResponseSettings(response_mode="dry_run")
+        rdb = mocker.MagicMock()
+        enforcer = mocker.MagicMock(name="dry_run")
+
+        mocker.patch(
+            "response.worker.enrich",
+            return_value=EnrichmentResult(
+                src_ip="203.0.113.5", corroboration_count=2,
+                corroborating_sources=["abuseipdb", "otx"],
+            ),
+        )
+        respond_block = mocker.patch(
+            "response.worker.respond_block",
+            return_value=mocker.MagicMock(action=ActionType.BLOCK, enforced=False),
+        )
+
+        record = process_task(_task(tier=3), settings, rdb, enforcer)
+
+        respond_block.assert_called_once()
+        assert record.block.action == ActionType.BLOCK
