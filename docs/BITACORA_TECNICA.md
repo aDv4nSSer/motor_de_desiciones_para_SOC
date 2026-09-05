@@ -43,6 +43,7 @@ Categorías: **ML** (dataset/modelo/features) · **Resp** (respuesta activa/FIM/
 | [H29](#h29) | Resp | `r2_min_tier=2` (default desde jul-2026 + override idéntico hardcodeado en el `.env` real de `.140`, ambos previos a la especificación de sep-2026) permitía que eventos T2 llegaran al gate de bloqueo automático de R2, contra la sección 4 de la especificación (bloqueo automático exclusivo de T3) | Alto | Auditado con 3 fuentes independientes (`soc:response:audit`, `worker.log` sin capar, `active-responses.log` real de Wazuh en `.138`): **cero bloqueos reales de T2 ocurrieron** — no por diseño correcto, sino porque no hubo tráfico con corroboración≥2 desde el gate de H28 ni active-response alguno desde el apagón del 18-ago (H25). Corregido en código y en el `.env` real (que tenía el valor pisado, no detectado hasta el deploy). Desplegado tras resolver una saturación colateral de `motor-soc` (reboot completo) y validado con evento T2 real: confirmado que el evento ya ni siquiera llega a evaluarse para bloqueo (`block` ausente), no solo `BLOCK_PENDING_APPROVAL` |
 | [H30](#h30) | Ops | `motor-soc.service` (Fast Path) se saturó dos veces durante la validación de H29 — proceso único sin `--workers`, IO síncrono (Redis sin timeout en `response/queue.py`) y CPU-bound (`model.predict()`) ejecutados directamente dentro de `async def decide()` | Alto | Mecanismo identificado con evidencia directa (journal: 2 `SIGKILL` por timeout de parada, no OOM; código confirma el anti-patrón). **Disparador inicial del 3-sep no determinado** — declarado explícitamente como causa raíz no confirmada, no cerrado como resuelto por el reboot |
 | [H31](#h31) | ML | `motor/model.py` real en `.140` usa nombres de columna `Column_0..3` y unwrap de modelo empaquetado en dict — no coincide con `model-contract.md` ni con el `model.py` versionado en el repo | Alto | Documentado como contraste textual puro, sin interpretar bug vs. diseño intencional (le corresponde a Joaquín). No se modifica ni se reconcilia — queda explícitamente excluido de la conversión a git checkout de H26 hasta su revisión |
+| [H32](#h32) | Ops | `redis_client.py` en producción tenía la password real de Redis hardcodeada como fallback (`"soc_ubo_2026"`) — `motor-soc.service` corría sin `REDIS_PASSWORD` en su entorno y dependía silenciosamente de ese hardcodeo para funcionar | Alto | Corregido: fail-fast si falta `REDIS_PASSWORD`, `load_dotenv()` agregado (mismo patrón de H27). Desplegado y validado con tráfico real. Password tratada como expuesta (apareció en esta sesión) — rotación pendiente, mismo criterio que H27 |
 
 ---
 
@@ -998,6 +999,33 @@ Adicionalmente, la carga del modelo difiere: producción hace `pkg = joblib.load
 **Decisión:** no se modifica `motor/model.py` del repo ni se trae la versión de producción al repo en esta sesión, ni siquiera como referencia temporal — se deja explícitamente fuera de cualquier reconciliación hasta que Joaquín confirme cuál versión (o ninguna de las dos) es la correcta. La conversión a checkout real de git en `.140` (H26) debe excluir explícitamente este archivo de la sincronización automática (`git update-index --skip-worktree`) para que un futuro `git pull` no sobreescriba la versión real de producción con la versión del repo, que hoy se sabe desactualizada.
 
 **Evidencia:** diff completo `motor/model.py` (repo) vs. `~/tesis/motor/model.py` (`.140`, descargado por scp para diff local, no editado); hashes SHA-256 distintos confirmados; `.claude/rules/model-contract.md` citado arriba.
+
+---
+
+<a id="h32"></a>
+## H32 — `redis_client.py` en producción tenía un password real hardcodeado como fallback, y `motor-soc.service` corría sin `REDIS_PASSWORD` en su entorno
+
+**Fecha:** 2026-09-05
+
+**Contexto:** al reconciliar `motor/redis_client.py` (repo) contra `.140` para H26, el hash no coincidía. El diff mostró `REDIS_PASS = os.environ.get("REDIS_PASSWORD", "soc_ubo_2026")` en producción — un default que parece una password real.
+
+**Hallazgo 1 — el hardcodeo NO era un valor de relleno, era la password real y activa:** `motor-soc.service` no tiene `EnvironmentFile=` ni `Environment=REDIS_PASSWORD=...` en su unit (confirmado leyendo `/proc/<pid>/environ` del proceso real, `REDIS_PASSWORD` ausente). Se probó en vivo, replicando exactamente el entorno de systemd (`REDIS_HOST=localhost`, sin `REDIS_PASSWORD`): con el código desplegado (`redis_client.py` sin arreglar todavía en ese momento), `get_redis()` conectaba exitosamente y un `XADD` de prueba a `soc:decisions` funcionaba usando el valor hardcodeado `"soc_ubo_2026"` — confirmando que ese string **es la password real y vigente de Redis en `.140` en este momento**, no un placeholder. Ya apareció en esta conversación de trabajo (necesario para diagnosticar el problema) — se trata como expuesta, mismo criterio que la password de OpenSearch en H27.
+
+**Hallazgo 2 — sin el hardcodeo, el Fast Path llevaba tiempo funcionando "por casualidad":** `soc:decisions`/`soc:flows` (los streams que alimenta `redis_client.py` desde el Fast Path) sí reciben datos reales de forma continua — pero solo porque el fallback hardcodeado coincide con la password real, no porque el mecanismo de configuración esté bien armado. Si esa password cambiara sin actualizar el código (exactamente lo que se hace en la sección de rotación más abajo), `motor-soc.service` habría quedado silenciosamente incapaz de publicar decisiones — `get_redis()` traga la excepción, loguea `"Redis no disponible"` y devuelve `None`; `publish_decision()`/`publish_flow()` devuelven `False` sin que `process_event()` revise el resultado. Es el mismo patrón de "nadie se entera hasta que alguien audita a mano" que ya se repitió en H22/H24/H25/H27.
+
+**Fix aplicado (commits en `develop`):**
+1. `REDIS_PASS = os.environ.get("REDIS_PASSWORD")` sin default, con `raise RuntimeError(...)` explícito si falta — un fallback adivinable es peor que fallar fuerte al arrancar.
+2. `load_dotenv()` agregado a `redis_client.py` (mismo patrón de H27 para `opensearch_indexer.py`/`dashboard.py`/`shadow_detect.py`) — sin esto, el fail-fast del punto 1 hubiera tumbado `motor-soc.service` al reiniciar, porque su unit de systemd nunca inyectó `REDIS_PASSWORD` por ningún otro medio.
+3. `dashboard.py` redesplegado a `.140` con el `load_dotenv()` que H27 había agregado al repo pero nunca llegó a producción en ese archivo puntual (drift menor, detectado en la misma reconciliación).
+4 tests nuevos (`tests/unit/test_redis_client_fail_fast.py`). 51/51 tests del repo pasan.
+
+**Validado en producción:** verificado en un entorno que replica exactamente el `Environment=` de systemd (sin depender de la restricción de `sudo` para journalctl) que `get_redis()` conecta y publica correctamente con la password real leída de `.env`, no del hardcodeo. `motor-soc.service` reiniciado (PID nuevo), `/health` responde en <5ms, `soc:decisions` confirmado recibiendo entradas nuevas en tiempo real después del reinicio (tráfico real, no solo prueba sintética).
+
+**Pendiente — rotación de `REDIS_PASSWORD`:** decidido tratarla como en H27 (rotación real, no solo el fix de código) una vez confirmado que el mecanismo de configuración post-fix es sano — igual criterio que H27: primero que los servicios ya saneados sigan sanos, después rotar. No completada todavía en esta sesión; continúa como sección propia más abajo o en una entrada posterior según cuándo se ejecute.
+
+**Hallazgo relacionado, no corregido (fuera del alcance pedido):** `REDIS_HOST` en el mismo archivo tiene el mismo patrón de riesgo (`os.environ.get("REDIS_HOST", "200.54.12.140")` — la IP pública obsoleta que ya causó el apagón de 17 días de H25). Hoy no causa daño porque `motor-soc.service` sí define `Environment=REDIS_HOST=localhost` explícitamente, pero es el mismo tipo de mina de H25 esperando a que alguien quite esa línea del unit sin darse cuenta. No se tocó — se pidió corregir específicamente el patrón de `REDIS_PASSWORD`, no `REDIS_HOST`.
+
+**Evidencia:** diff `redis_client.py` repo vs. producción (hash distinto confirmado); prueba en vivo de conexión con y sin el hardcodeo, replicando el entorno real de systemd; confirmación de ausencia de `REDIS_PASSWORD` en `/proc/<pid>/environ`; lectura de entradas frescas reales en `soc:decisions` post-fix.
 
 ---
 
