@@ -6,7 +6,7 @@
 # Uso: vector --config configs/vector.production.toml
 # ============================================================
 
-data_dir = "/home/aiayala/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta/.vector-data"
+data_dir = "/home/aiayala/tesis/motor_decisiones_soc/pipeline-ingesta/.vector-data"
 
 # ------------------------------------------------------------
 # SOURCE: archivo eve.json de Suricata
@@ -101,6 +101,8 @@ duration_ms_raw = if start_ts != null && end_ts != null {
 .FLOW_DURATION_MILLISECONDS = if duration_ms_raw > 120534 { 120534 } else if duration_ms_raw < 0 { 0 } else { duration_ms_raw }
 
 . = {
+    "IPV4_SRC_ADDR":              .src_ip,
+    "IPV4_DST_ADDR":              .dest_ip,
     "PROTOCOL":                   .PROTOCOL,
     "L4_SRC_PORT":                .L4_SRC_PORT,
     "L4_DST_PORT":                .L4_DST_PORT,
@@ -121,7 +123,7 @@ duration_ms_raw = if start_ts != null && end_ts != null {
 [sinks.jsonl_output]
 type = "file"
 inputs = ["parse_eve"]
-path = "/home/aiayala/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta/outputs/flows_%Y-%m-%d_%H.jsonl"
+path = "/home/aiayala/tesis/motor_decisiones_soc/pipeline-ingesta/outputs/flows_%Y-%m-%d_%H.jsonl"
 encoding.codec = "json"
 
 # ------------------------------------------------------------
@@ -131,3 +133,65 @@ encoding.codec = "json"
 type = "console"
 inputs = ["parse_eve"]
 encoding.codec = "json"
+# ------------------------------------------------------------
+# SINK 3: Motor de Decisiones SOC (FastAPI en .140)
+# Fast Path: cada flow enviado para clasificación ML
+# ------------------------------------------------------------
+[sinks.motor_soc]
+type = "http"
+inputs = ["parse_eve"]
+uri = "http://10.10.10.3:8000/decide"
+method = "post"
+encoding.codec = "json"
+request.timeout_secs = 2
+request.retry_attempts = 2
+
+# ------------------------------------------------------------
+# TRANSFORM: alertas de Suricata (para correlacion con decisiones
+# del motor). Ruta paralela e independiente de parse_eve -- no
+# afecta el Fast Path hacia el motor.
+# ------------------------------------------------------------
+[transforms.parse_eve_alerts]
+type = "remap"
+inputs = ["suricata_eve"]
+source = '''
+. = parse_json!(.message)
+
+if .event_type != "alert" {
+    abort
+}
+
+ts = parse_timestamp!(string!(.timestamp), "%+")
+
+. = {
+    "timestamp":     ts,
+    "flow_id":       .flow_id,
+    "src_ip":        .src_ip,
+    "src_port":      .src_port,
+    "dest_ip":       .dest_ip,
+    "dest_port":     .dest_port,
+    "proto":         .proto,
+    "signature":     .alert.signature,
+    "signature_id":  .alert.signature_id,
+    "category":      .alert.category,
+    "severity":      .alert.severity,
+    "action":        .alert.action
+}
+'''
+
+# ------------------------------------------------------------
+# SINK: alertas de Suricata -> OpenSearch (.140)
+# Para correlacionar ataques detectados por firma contra las
+# decisiones que tomo el motor sobre el mismo trafico.
+# ------------------------------------------------------------
+[sinks.suricata_alerts_os]
+type = "elasticsearch"
+inputs = ["parse_eve_alerts"]
+endpoints = ["https://10.10.10.3:9201"]
+mode = "bulk"
+api_version = "v7"
+bulk.index = "suricata-alerts-%Y.%m.%d"
+auth.strategy = "basic"
+auth.user = "admin"
+auth.password = "${OS_PASS}"
+tls.verify_certificate = false
