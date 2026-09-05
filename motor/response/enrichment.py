@@ -12,6 +12,7 @@ no disponible. R1 nunca debe romper el pipeline de respuesta.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import socket
@@ -37,6 +38,22 @@ def _reverse_dns(ip: str) -> Optional[str]:
         return None
 
 
+def _is_public_ip(ip: str) -> bool:
+    """
+    True solo si `ip` es una dirección enrutable públicamente. Una IP
+    privada/loopback/link-local nunca puede tener reputación real en TI
+    externa — consultarla desperdicia cuota y, en el caso de OTX, el
+    endpoint la rechaza con HTTP 400 (ver hallazgo de continuación de H23:
+    tras la migración a NAT/VLANs, `src_ip` en el Fast Path puede llegar
+    como IP interna, ej. `10.10.10.3`/`10.30.30.2`).
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
+
+
 def _abuseipdb_lookup(
     ip: str, settings: ResponseSettings, rdb: redis.Redis
 ) -> EnrichmentResult:
@@ -45,6 +62,11 @@ def _abuseipdb_lookup(
     Nunca lanza excepción hacia arriba — degradación elegante.
     """
     result = EnrichmentResult(src_ip=ip)
+
+    if not _is_public_ip(ip):
+        result.abuseipdb_available = False
+        result.notes.append("abuseipdb: IP no pública, TI externa no aplica")
+        return result
 
     # Sin API key configurada -> degradación elegante
     if not settings.abuseipdb_api_key:
@@ -118,6 +140,11 @@ def _otx_lookup(
     """
     result = EnrichmentResult(src_ip=ip)
 
+    if not _is_public_ip(ip):
+        result.otx_available = False
+        result.notes.append("otx: IP no pública, TI externa no aplica")
+        return result
+
     # Sin API key configurada -> degradación elegante
     if not settings.otx_api_key:
         result.otx_available = False
@@ -170,12 +197,47 @@ def _otx_lookup(
     return result
 
 
+def count_corroborating_sources(
+    result: EnrichmentResult, settings: ResponseSettings
+) -> tuple[int, list[str]]:
+    """
+    Cuenta cuántas fuentes de R1 corroboran, de forma independiente, que la
+    IP es maliciosa — es el insumo real que R2 usa para decidir entre
+    bloqueo automático y aprobación humana (ver worker.py y sección 4 de
+    `especificacion_tecnica_final_r-soar.md`).
+
+    Criterio por fuente (umbrales en ResponseSettings, no hardcodeados):
+      - AbuseIPDB: abuseConfidenceScore >= abuseipdb_malicious_threshold.
+      - OTX: pulse_count >= otx_min_pulse_count (un pulse ya es un reporte
+        comunitario curado por analistas, no autogenerado — distinto del
+        conteo de reportes de AbuseIPDB, que sí necesita umbral numérico
+        para filtrar ruido).
+
+    Una fuente NO disponible (sin API key, timeout, error HTTP, cuota
+    agotada) no cuenta ni a favor ni en contra — mismo criterio de
+    degradación elegante que el resto de R1. Ausencia de dato no es
+    evidencia de nada.
+    """
+    sources: list[str] = []
+
+    if result.abuseipdb_available and result.abuseipdb_score is not None:
+        if result.abuseipdb_score >= settings.abuseipdb_malicious_threshold:
+            sources.append("abuseipdb")
+
+    if result.otx_available and result.otx_pulse_count is not None:
+        if result.otx_pulse_count >= settings.otx_min_pulse_count:
+            sources.append("otx")
+
+    return len(sources), sources
+
+
 def enrich(
     src_ip: Optional[str], settings: ResponseSettings, rdb: redis.Redis
 ) -> EnrichmentResult:
     """
     Punto de entrada de R1. Enriquece una IP de origen con DNS + reputación
-    (AbuseIPDB + OTX/AlienVault).
+    (AbuseIPDB + OTX/AlienVault) y calcula la corroboración multi-fuente que
+    consume R2 (ver `count_corroborating_sources`).
     Siempre devuelve un EnrichmentResult, nunca lanza excepción.
     """
     if not src_ip:
@@ -190,4 +252,8 @@ def enrich(
     result.notes.extend(otx_result.notes)
     result.cached = result.cached or otx_result.cached
     result.reverse_dns = _reverse_dns(src_ip)
+
+    count, names = count_corroborating_sources(result, settings)
+    result.corroboration_count = count
+    result.corroborating_sources = names
     return result

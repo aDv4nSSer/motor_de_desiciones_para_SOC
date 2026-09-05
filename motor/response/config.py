@@ -67,6 +67,16 @@ class ResponseSettings(BaseSettings):
     otx_cache_ttl: int = 21600           # 6h — mismo criterio que AbuseIPDB
     otx_timeout: float = 4.0
 
+    # ── R1: corroboración multi-fuente (gate real de R2, ver enrichment.py) ─
+    # Umbral de "hallazgo malicioso corroborado" por fuente. Una fuente no
+    # disponible (timeout/sin key/cuota) no cuenta ni a favor ni en contra.
+    abuseipdb_malicious_threshold: int = 50   # abuseConfidenceScore 0-100
+    otx_min_pulse_count: int = 1              # >=1 pulse ya es reporte comunitario curado
+    # 2+ fuentes corroborando -> bloqueo automático (tabla sección 4 de la
+    # especificación). Con menos, R2 no ejecuta: queda como pendiente de
+    # aprobación humana (Operador N1+).
+    min_corroborating_sources_for_autoblock: int = 2
+
     # ── R2: enforcer Wazuh API ─────────────────────────────────────────
     enforcer_backend: str = "dry_run"    # dry_run | wazuh_api
     wazuh_api_url: str = "https://200.54.12.139:55000"

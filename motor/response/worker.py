@@ -24,7 +24,7 @@ import redis
 from response.config import get_settings
 from response.enforcer import build_enforcer, respond_block
 from response.enrichment import enrich
-from response.schemas import ResponseRecord, ResponseTask
+from response.schemas import ActionType, BlockResult, ResponseRecord, ResponseTask
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,11 +65,34 @@ def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
 
     # ── R2: acción activa (bloqueo) ─────────────────────────────────────
     if task.tier >= settings.r2_min_tier:
-        record.block = respond_block(task.src_ip, settings, rdb, enforcer, task.trace_id)
+        corroboration_count = record.enrichment.corroboration_count if record.enrichment else 0
+
+        if corroboration_count >= settings.min_corroborating_sources_for_autoblock:
+            record.block = respond_block(task.src_ip, settings, rdb, enforcer, task.trace_id)
+        else:
+            # Score/tier alto pero sin corroboración multi-fuente suficiente:
+            # no se ejecuta bloqueo automático (evita el falso positivo tipo
+            # Bing/msnbot). Queda pendiente de aprobación humana en vez de
+            # llegar al enforcer — R2 (enforcer.py) no se toca ni se invoca.
+            record.block = BlockResult(
+                src_ip=task.src_ip,
+                action=ActionType.BLOCK_PENDING_APPROVAL,
+                enforced=False,
+                enforcer="none",
+                reason=(
+                    f"corroboración insuficiente ({corroboration_count}/"
+                    f"{settings.min_corroborating_sources_for_autoblock} fuentes) "
+                    "— requiere aprobación humana antes de bloquear"
+                ),
+                requires_approval=True,
+                approval_level="N1",
+            )
+
         b = record.block
         log.info(
             f"[{task.trace_id[:8]}] R2 ip={task.src_ip} action={b.action.value} "
-            f"enforced={b.enforced} reason='{b.reason}' via={b.enforcer}"
+            f"enforced={b.enforced} reason='{b.reason}' via={b.enforcer} "
+            f"corroboration={corroboration_count}"
         )
 
     _audit(record, rdb)
