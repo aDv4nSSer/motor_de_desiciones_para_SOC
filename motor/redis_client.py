@@ -6,6 +6,8 @@ import redis, json, logging, os
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 # Mismo patrón que opensearch_indexer.py/dashboard.py desde H27: REDIS_PASSWORD
 # vive en .env (WorkingDirectory), no en el unit file de systemd.
@@ -36,6 +38,15 @@ def get_redis():
                 decode_responses=True,
                 socket_timeout=1.0,
                 socket_connect_timeout=1.0,
+                # Continuación de H30: redis-py 8.x trae un Retry por defecto
+                # con hasta 10 reintentos sobre TimeoutError/ConnectionError,
+                # incluso con retry_on_timeout=False (validado con CLIENT
+                # PAUSE contra un Redis de prueba: sin esto, 1 intento
+                # "fallido" tardaba ~5s en vez de los ~1s configurados).
+                # NoBackoff()+0 fuerza un único intento real. retry_on_timeout
+                # está deprecado en redis-py 8.x (TimeoutError ya se incluye
+                # por defecto en el Retry) — pasar retry= explícito alcanza.
+                retry=Retry(NoBackoff(), 0),
             )
             _client.ping()
             log.info(f"Redis conectado: {REDIS_HOST}:{REDIS_PORT}")

@@ -3,7 +3,7 @@ main.py — Motor de Decisiones SOC v2
 FastAPI: recibe flows de Vector (single o batch), clasifica con ML, publica a Redis.
 Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
-import uuid, logging, time
+import asyncio, uuid, logging, time
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
@@ -125,7 +125,19 @@ async def decide(request: Request):
     # Vector puede enviar un objeto único o un array de objetos (batch)
     events = body if isinstance(body, list) else [body]
 
-    results = [process_event(ev, str(uuid.uuid4()), classtype) for ev in events]
+    # Continuación de H30: process_event() es síncrono (inferencia CPU-bound +
+    # publish a Redis) — llamarlo inline bloquea el único event loop de
+    # uvicorn para TODAS las requests concurrentes. run_in_executor lo corre
+    # en el threadpool default de asyncio, liberando el loop para seguir
+    # aceptando conexiones mientras corre. Seguro para concurrencia: el
+    # modelo (LightGBM/IsolationForest) es de solo-lectura durante inferencia
+    # y los clientes Redis usan connection pool (ambos ya son thread-safe sin
+    # cambios adicionales).
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, process_event, ev, str(uuid.uuid4()), classtype)
+        for ev in events
+    ])
 
     # Si Vector envió un solo evento, retornar un objeto; si batch, retornar lista
     return results[0] if len(results) == 1 else results

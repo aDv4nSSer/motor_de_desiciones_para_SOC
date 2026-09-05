@@ -49,6 +49,11 @@ class ResponseSettings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_password: str = ""
+    # Continuación de H30: enqueue_response_task() se llama de forma síncrona
+    # desde el Fast Path (main.py) en cada request — sin timeout, un Redis
+    # lento bloquea el único event loop de uvicorn indefinidamente.
+    redis_socket_timeout: float = 1.0
+    redis_socket_connect_timeout: float = 1.0
     response_stream: str = "soc:response:tasks"
     response_group: str = "response-workers"
     response_consumer: str = "worker-1"

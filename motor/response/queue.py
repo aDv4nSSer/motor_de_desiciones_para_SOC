@@ -12,6 +12,8 @@ import logging
 import time
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from response.config import get_settings
 from response.schemas import ResponseTask
@@ -22,7 +24,14 @@ log = logging.getLogger("response.queue")
 _settings = get_settings()
 _rdb = redis.Redis(
     host=_settings.redis_host, port=_settings.redis_port,
-    password=_settings.redis_password, decode_responses=True
+    password=_settings.redis_password, decode_responses=True,
+    socket_timeout=_settings.redis_socket_timeout,
+    socket_connect_timeout=_settings.redis_socket_connect_timeout,
+    # Continuación de H30: el Retry default de redis-py 8.x reintenta hasta
+    # 10 veces sobre timeout pese a retry_on_timeout (deprecado en 8.x,
+    # TimeoutError ya se incluye por defecto) — validado con CLIENT PAUSE,
+    # sin esto socket_timeout no acota el peor caso real.
+    retry=Retry(NoBackoff(), 0),
 )
 
 
