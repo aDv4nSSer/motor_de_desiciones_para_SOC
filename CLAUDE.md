@@ -39,6 +39,11 @@ modelo — verificar siempre ahí antes de tocar el feature set o los
 thresholds) y los hallazgos H1–H10 de `docs/BITACORA_TECNICA.md` (domain
 shift, data leakage, etiquetado, límites del Isolation Forest).
 
+**Ventana sin datos reales del Fast Path (18-ago a 04-sep):** cualquier
+métrica de latencia, tasa de detección o AUC en producción que calcules
+sobre `soc-decisions` debe excluir ese rango completo — ver H25 en
+`docs/BITACORA_TECNICA.md` para el detalle.
+
 **No necesitás tocar** red, VLANs, Suricata, bastion host ni la sección
 Infraestructura de este documento — eso lo maneja Antonio. Si algo de esa
 parte te bloquea (por ejemplo, acceso a `.140` para correr un

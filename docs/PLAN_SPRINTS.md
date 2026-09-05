@@ -64,7 +64,7 @@
 |---|---|---|---|
 | Suricata en modo in-line con NFQUEUE en el 139 | Antonio | Tráfico real bloqueado por firma, verificado con prueba controlada | ⚠️ **Parcial** — causa raíz del "cero alertas" encontrada y corregida (H21: orden de reglas en `/etc/ufw/before.rules`, el fast-path `RELATED,ESTABLISHED ACCEPT` estaba antes que la desviación a NFQUEUE). Falta la prueba controlada que confirme **bloqueo** real por firma — el DoD pide bloqueo, no solo visibilidad. |
 | Revisar cuáles firmas de `threshold.conf` pasan a drop vs quedan en alert | Antonio | Documento/lista con la decisión de cada firma | ❌ **Pendiente** — sin decidir. |
-| Repetir prueba de H16 sobre la nueva topología (confirmar que Suricata genera alertas) | Antonio | Log de Suricata mostrando detección real post-migración | ❌ **Pendiente** — H21 dejó esto explícitamente abierto en su sección de Evidencia: falta repetir el payload de prueba de H16 y confirmar la alerta en `eve.json`. |
+| Repetir prueba de H16 sobre la nueva topología (confirmar que Suricata genera alertas) | Antonio | Log de Suricata mostrando detección real post-migración | ✅ **Completado** — H21 registra el retest confirmado el mismo 25-ago (SID 2100498 disparando sobre tráfico posterior al primer paquete de la conexión, tras reordenar `before.rules`), cerrando el pendiente que la propia entrada había dejado abierto. |
 | Subir tesis de referencia (años anteriores) al chat de tesis | Antonio | Archivos cargados, estructura identificada | *(sin información desde la bitácora técnica — confirmar directamente)* |
 | Armar índice completo de capítulos (formato UBO) | Antonio + Claude (chat tesis) | Índice aprobado, compartido con Joaquín | *(sin información desde la bitácora técnica — confirmar directamente)* |
 | Reentrenamiento LightGBM — Camino E (4 features genuinas + GroupKFold host-disjunto) | Joaquín | Script corrido, métricas nuevas guardadas en `models/` | *(sin información desde la bitácora técnica — confirmar con Joaquín)* |
@@ -76,6 +76,14 @@
 > notara. Diagnosticado y resuelto el mismo día (ver `docs/BITACORA_TECNICA.md` H22), sin
 > necesidad de extender el sprint. Queda pendiente un hueco real: no hay monitoreo de
 > `motor-soc`/`redis-server`, así que se agrega explícitamente al Sprint 2 abajo.
+>
+> **Corrección (04-sep, ver H24/H25):** el diagnóstico de H22 cubría solo `motor-soc`/Redis.
+> Investigación posterior encontró que `response-worker.service` (R1/R2) quedó caído por la
+> misma causa pero nunca se reinició al resolver H22 (H24), y que la causa raíz real del gap
+> de ingesta era un sink de Vector en `.139` apuntando a la IP pública obsoleta de `.140`
+> (H25) — el hueco real sin ningún evento procesado es 2026-08-18 a 2026-09-04, ≈17 días, no
+> los ≈6 días de este incidente. La tarea de monitoreo del Sprint 2 (abajo) debe cubrir
+> también `response-worker` y los sinks de Vector, no solo `motor-soc`/`redis-server`.
 
 ---
 
@@ -95,7 +103,7 @@
 | **[SOAR R1] Cerrar integración OTX/AlienVault** en `threat-intel-svc` (mismo patrón adapter/circuit-breaker que AbuseIPDB) | Antonio + Claude Code | Indicador consultado responde `NormalizedTI` con `sources: [abuseipdb, otx]`, verificado con un IOC real |
 | **[SOAR R1] Instalar CrowdSec** (agente + bouncer) en `.139` | Antonio | `cscli metrics` muestra decisiones activas; una IP de mala reputación comunitaria se bloquea antes de llegar a Suricata |
 | **[SOAR — infra core] Desplegar Iris Web** e integración mínima (crear caso desde `vigilante/cases.py` o directo desde el motor) | Antonio + Claude Code | Un caso de prueba visible en Iris, referenciando el `trace_id`/hash de `soc-decisions` (sin duplicar el registro) |
-| **[H22] Monitoreo de `motor-soc.service`/`redis-server.service`** en `.140`, independiente de Redis (a diferencia del heartbeat actual) | Antonio + Claude Code | Alerta por correo si `motor-soc` o `redis-server` caen — probado apagándolos a propósito |
+| **[H22/H24/H25] Monitoreo de `motor-soc.service`/`redis-server.service`/`response-worker.service`/sinks de Vector** en `.140`/`.139`, independiente de Redis (a diferencia del heartbeat actual) | Antonio + Claude Code | Alerta por correo si `motor-soc`, `redis-server`, `response-worker` caen o si un sink de Vector deja de entregar — probado apagándolos/desconectándolos a propósito |
 | Documentar métricas nuevas del reentrenamiento (precisión/recall/AUC comparado con v7.1) | Joaquín | Tabla comparativa lista para insertar en tesis |
 | Redactar sección de Marco Teórico — SOAR, SOC tradicional, ML en ciberseguridad | Joaquín | Borrador de 3-5 páginas con citas APA |
 | Revisar/editar Capítulo 1 (feedback de Antonio sobre el borrador) | Antonio | Capítulo 1 cerrado, listo para Miguel |
@@ -146,7 +154,7 @@ que el R2 graduado (Sprint 4) los necesite de verdad.
 
 | Tarea | Dueño | DoD |
 |---|---|---|
-| Extraer métricas operativas de la nueva arquitectura (latencia, autonomía, tasa de detección este-oeste) | Antonio | Dataset/tabla con al menos 1 semana de datos reales post-migración — **contar desde el 02-sep** (fix de H22), no desde antes, para no mezclar la ventana de caída con datos "normales" |
+| Extraer métricas operativas de la nueva arquitectura (latencia, autonomía, tasa de detección este-oeste) | Antonio | Dataset/tabla con al menos 1 semana de datos reales post-migración — **contar desde el 04-sep** (fix de H25), no desde el 02-sep como se asumía cuando se escribió esta fila: H24/H25 confirmaron que el Fast Path no recibió ningún evento real entre el 18-ago y el 04-sep (Vector con el sink apuntando a la IP pública obsoleta de `.140`, no solo la caída de Redis de H22) — excluir ese rango completo, no solo la ventana de 6 días que cubría H22 |
 | **[SOAR R2] Implementar `accion_recomendada`** en la salida del motor (tabla tier × origen × corroboración de la sección 4 de `ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`), con nivel de operador requerido | Antonio + Claude Code | Para cada fila de esa tabla, un evento de prueba produce la acción y el nivel de aprobación esperado |
 | Auditoría liviana de "viabilidad como producto": qué falta para multi-tenant, qué existe hoy | Antonio | Documento de 1-2 páginas, honesto, sin exagerar |
 | Redactar Capítulo 4 — Resultados y Discusión (primera mitad, con datos de red/motor) | Antonio | Borrador con al menos 3 secciones de resultados |
