@@ -9,7 +9,12 @@ log = logging.getLogger("motor.redis")
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "200.54.12.140")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASS = os.environ.get("REDIS_PASSWORD", "")
+REDIS_PASS = os.environ.get("REDIS_PASSWORD")
+if not REDIS_PASS:
+    raise RuntimeError(
+        "REDIS_PASSWORD no está configurada en el entorno — sin default a "
+        "propósito, un fallback adivinable es peor que fallar al arrancar."
+    )
 MAXLEN     = 10000
 
 _client = None
