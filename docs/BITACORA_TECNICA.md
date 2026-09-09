@@ -1226,6 +1226,268 @@ Ninguna opción es aplicada. **PASO 2 y 3 (validar el fix, re-medir el rate limi
 
 ---
 
+## H34 (cierre) — Opción A aplicada en INPUT y OUTPUT, validada con tráfico real de punta a punta
+
+**Fecha:** 2026-09-08
+
+**Decisión (Antonio):** aplicar la Opción A del H34 original — agregar la misma desviación NFQUEUE de `ufw-before-forward` también a `ufw-before-input` y `ufw-before-output`, con `.139` siendo el único punto de entrada SSH a toda la red privada, por lo que cada paso se diseñó para ser reversible sin necesitar acceso físico.
+
+**Red de seguridad usada en ambos pasos:** backup completo (`iptables-save`, `ip6tables-save`, `ufw status verbose`, `before.rules`/`before6.rules`) antes de tocar nada; comando de rollback probado con `iptables-restore --test` (sin aplicar) antes de aplicar el cambio real; revert automático a 5 minutos corriendo como proceso propio del usuario (sin sudo para programarlo/cancelarlo, solo el revert final usa los comandos ya autorizados) — así el mecanismo de cancelación no depende de que la sesión SSH siga viva. Acceso de escritura acotado con una entrada de `sudoers.d` NOPASSWD limitada a los comandos exactos necesarios (`iptables-save`/`-restore`, `iptables -S`, `ufw reload`, `cp` de dos rutas `/tmp` fijas hacia `before.rules`/`before6.rules`) — se verificó en el camino que el scoping funciona: un `cp --no-clobber` con flags distintos a los autorizados pidió password y no ejecutó nada.
+
+**PASO INPUT:**
+
+Antes de tocar nada se confirmó que la regla NFQUEUE existente en `ufw-before-forward` ya tenía `--queue-bypass` (fail-open si Suricata cae) — no hizo falta agregarlo ahí, solo replicarlo en las reglas nuevas.
+
+Se encontró que `ufw-before-input` no tiene ningún ACCEPT propio para SSH — el `ufw allow` real vive en `ufw-user-input`, que se evalúa después de `ufw-before-input` sin importar dónde se inserte la regla nueva dentro de esa cadena. Se agregó explícitamente:
+```
+-A ufw-before-input -p tcp --dport 2222 -j ACCEPT
+```
+justo después del ACCEPT de `RELATED,ESTABLISHED`, antes de cualquier otra cosa — así el SSH de administración (puerto 2222) queda incondicionalmente fuera del camino de Suricata/NFQUEUE, sin depender de `--queue-bypass` ni del estado de Suricata. El puerto 22 (honeypot Cowrie, `REDIRECT --to-port 2223` vía NAT) no tiene esa protección a propósito — es tráfico que sí debe llegar a Suricata. El catch-all se agregó al final de la cadena, después de `-j ufw-not-local`:
+```
+-A ufw-before-input -j NFQUEUE --queue-num 0 --queue-bypass
+```
+
+Antes de aplicar se verificaron dos condiciones pedidas explícitamente:
+1. **¿Existe un `ufw limit` en 2222/tcp que dependa del orden?** No — `ufw status verbose` muestra `2222/tcp ALLOW IN Anywhere`, sin `LIMIT`. Sin conflicto de ordering.
+2. **¿Wazuh monitorea fuerza bruta SSH contra 2222 por fuera de Suricata?** Sí, confirmado con evidencia en vivo, no solo config: sshd loguea a `journald` (`SYSLOG_IDENTIFIER=sshd`), Wazuh lo ingiere vía su `localfile` de `journald` y dispara reglas estándar independientes de Suricata — regla 5715 ("authentication success") disparó en vivo con una conexión de prueba propia, regla 5710 ("Attempt to login using a non-existent user") con decenas de disparos históricos reales, 515 alertas `sshd` totales en `alerts.log`. Dato honesto adicional: el bloque `<active-response>` de `ossec.conf` está deshabilitado — Wazuh detecta y alerta fuerza bruta SSH pero no la bloquea automáticamente hoy; esto ya era así antes de este cambio, no se modificó.
+
+Aplicado (`cp` + `ufw reload`), verificado con una sesión SSH nueva e independiente (sin cerrar la anterior) — acceso estable. `iptables -S ufw-before-input` en vivo confirmó el orden exacto: loopback → established/related → **ACCEPT 2222** → INVALID drop → icmp → dhcp → `ufw-not-local` → mDNS/UPnP → **NFQUEUE catch-all** → `ufw-user-input`.
+
+**Validación con tráfico real (no de prueba interna):** conexión SSH real contra el puerto 22 desde una IP pública externa (`186.189.105.151`), capturada por Cowrie (login falso aceptado, comando ejecutado) y — por primera vez — también por Suricata:
+```
+eve.json: src_ip=186.189.105.151 dest_ip=200.54.12.139 dest_port=2223 (post-NAT) event_type=flow tcp_flags=SYN
+```
+Antes de hoy esto era estructuralmente invisible para Suricata.
+
+**Nota honesta de proceso:** el revert automático se canceló sin haber abierto primero la sesión SSH de verificación en el orden acordado — funcionó igual porque el cambio estaba bien, pero fue el procedimiento saltado, no una garantía. Se corrigió explícitamente para el paso de OUTPUT (ver abajo).
+
+**PASO OUTPUT:**
+
+Inventario de tráfico saliente legítimo de `.139` antes de tocar nada: reverse proxy nginx (`proxy-soc:8080` y los tres `server_name` de `reverse-proxy-443`), DNS (`systemd-resolved` → `200.50.96.90`/`200.54.144.224` vía `eno1`), NTP (`ntp.ubuntu.com`), apt/`apt-daily`/`apt-daily-upgrade`, `certbot.timer` (renovación Let's Encrypt), `fwupd-refresh`, `update-notifier-download`, cron propio de `etiquetador_diario.py` (llamada a la API de AbuseIPDB — se detectó de paso que la crontab tiene la API key en texto plano en la línea del cron, no en variable de entorno vía `.env`; queda anotado como pendiente de higiene, no se tocó, fuera de alcance de H34), `shadow-detect.timer`/`motor-watcher-heartbeat.timer` (mayormente loopback/local). Ninguno tan crítico como el SSH del INPUT — todo el tráfico de respuesta de estas conexiones ya está cubierto por el ACCEPT de `RELATED,ESTABLISHED`, que se evalúa antes del catch-all nuevo. Se confirmó explícitamente (no se asumió) que no hay ninguna otra regla en `ufw-before-output` después de esa línea: solo 4 referencias a esa cadena en todo el archivo (comentario, declaración, loopback, established/related).
+
+**Hallazgo no buscado, corregido antes de validar:** el `proxy_pass` de nginx hacia `.138` (`proxy-soc:8080` y el `server_name web-soc-ubo.duckdns.org` de `reverse-proxy-443`) seguía usando la IP pública vieja `200.54.12.138` (mismo patrón ya anotado sin resolver en el H34 original, punto 4, y relacionado con H25/H26) — muerta desde la migración VLAN del 1-sep. Confirmado con curl directo desde `.139`: `200.54.12.138:80` → timeout (`HTTP 000`, ~3s); `10.30.30.2:80` (VLAN correcta) → `HTTP 200`, 34ms. Corregido (`sed` puntual, `nginx -t` antes de `reload`) antes de seguir, porque sin esto la validación de punta a punta del OUTPUT hubiera fallado por un bug ajeno a H34, no por el cambio de NFQUEUE.
+
+Backup nuevo tomado específicamente para este paso (el de INPUT ya no reflejaba el estado actual del sistema) y validado con `iptables-restore --test`. Regla aplicada, en la única ubicación posible dada la cadena:
+```
+-A ufw-before-output -j NFQUEUE --queue-num 0 --queue-bypass
+```
+justo después de `RELATED,ESTABLISHED -j ACCEPT`.
+
+**Orden de validación seguido esta vez sin saltar ningún paso:**
+1. Prueba HTTP real inmediatamente después de aplicar: `web-soc-ubo.duckdns.org` (443) y `200.54.12.139:8080` (proxy-soc) → `HTTP 200` en ambos.
+2. Revert automático de 5 minutos programado.
+3. Chequeo real cada 15s durante 2.5 minutos contra el proxy — **10/10 HTTP 200**, sin ninguna falla.
+4. Recién con la estabilidad confirmada, se canceló el revert — log: `REVERT CANCELADO (sentinel encontrado)`, sin proceso colgado.
+5. Validación en `eve.json`: **12 eventos** `flow` con `dest_ip=10.30.30.2 dest_port=80` — coinciden 1 a 1 en cantidad y timestamp con las 12 requests HTTP reales hechas durante la prueba (2 iniciales + 10 del chequeo de estabilidad). El primer evento de este tipo en todo `eve.json` es de las 15:11:23, justo después de aplicar el cambio — cero eventos de ese tipo existieron antes, en ningún momento (mismo resultado, "0 resultados", que el diagnóstico original de H34).
+
+`iptables -S ufw-before-output` en vivo confirmó el orden: loopback → established/related → **NFQUEUE catch-all** → `ufw-user-output`.
+
+**Cobertura estructural lograda — las tres cadenas del filtro:**
+```
+-A ufw-before-forward -j NFQUEUE --queue-num 0 --queue-bypass   (ya existía, H21)
+-A ufw-before-input   -j NFQUEUE --queue-num 0 --queue-bypass   (nuevo, hoy)
+-A ufw-before-output  -j NFQUEUE --queue-num 0 --queue-bypass   (nuevo, hoy)
+```
+Suricata ahora inspecciona el universo completo de tráfico que cruza `.139`: enrutado entre otros hosts (FORWARD), destinado a `.139` mismo (INPUT) y originado por `.139` mismo (OUTPUT). Cowrie y el reverse proxy fueron el **medio de verificación** de este fix, no su alcance — la cobertura es estructural (las tres cadenas de netfilter), así que se generaliza a cualquier servicio futuro en `.139` sin honeypot ni proxy de por medio.
+
+**Limitación honesta del cruce de evidencia (PASO 4 pedido):** el diagnóstico original de H34 cruzó 5 IPs frescas de atacantes reales tomadas directamente de `cowrie.json`. Esta sesión no pudo repetir ese cruce exacto — `cowrie.json` vive en `/home/cowrie`, sin permiso de lectura para `aiayala`, y `cowrie.service` no loguea a `journald`. En su lugar, la validación de INPUT usó una conexión externa real generada en el momento (`186.189.105.151`, misma naturaleza que un ataque real: IP pública genuina, camino natural puerto 22 → redirect → Cowrie), con el mismo resultado cualitativo (0 antes → capturado ahora). Para OUTPUT, en cambio, sí se logró una cuantificación más fuerte que la del H34 original (12/12 en vez de una muestra de 5) porque la fuente de tráfico (el propio proxy de `.139`) sí era accesible directamente. Si se quiere el cruce con IPs de Cowrie 100% frescas y no generadas por esta sesión, falta acceso de lectura a `/home/cowrie` — pendiente si Antonio lo considera necesario.
+
+**Aclaración importante para no sobrerrepresentar en la tesis:** cualquier "validación con evento real" hecha en esta sesión **antes** de este fix (incluida toda la validación de H21 y cualquier prueba previa mencionada en la bitácora) se hizo sobre tráfico *forwarded* o de prueba explícita — nunca sobre ataques externos entrando por su camino natural hacia `.139`/`.138`. Las únicas validaciones de esta sesión sobre tráfico verdaderamente externo entrando por su camino natural (puerto 22 público → Cowrie; proxy público → `.138`) son las de este cierre, después del fix.
+
+**Estado: CERRADO.** Las tres cadenas (FORWARD, INPUT, OUTPUT) desvían a Suricata vía NFQUEUE con `--queue-bypass`. SSH de administración protegido incondicionalmente. Reverse proxy hacia `.138` corregido y validado de punta a punta. Pendiente no bloqueante anotado arriba: lectura de `cowrie.json` para repetir el cruce de 5 IPs frescas si se quiere esa evidencia específica también.
+
+**Nota de cierre — acceso temporal removido (2026-09-08 15:43 -03):** el acceso ampliado usado esta noche (`/etc/sudoers.d/h34-temp`, NOPASSWD acotado a `iptables-save`/`-restore`, `ip6tables-save`/`-restore`, `iptables -S`/`ip6tables -S`, `ufw status verbose`/`ufw reload` y `cp` de dos rutas `/tmp` fijas hacia `before.rules`/`before6.rules`) fue removido con `sudo rm /etc/sudoers.d/h34-temp` una vez cerrado y validado el trabajo. Verificado explícitamente: el archivo ya no existe en `/etc/sudoers.d/`, `sudo -l` para `aiayala` ya no lista ese bloque, y el sudoers permanente de auditoría (`99-claude-audit`, junto con `99-claude-suricata-read`/`99-claude-suricata-rules`/`dga-check`/`shadow-detect`) queda intacto y sin cambios. No queda acceso ampliado de esta sesión con vida más allá de lo que ya existía antes de H34.
+
+---
+
+## H35 — Saturación de thread pool en `motor-soc` bajo carga real post-H34 (primera vez expuesto)
+
+**Fecha:** 2026-09-08
+
+**Hallazgo:** con Suricata inspeccionando las tres cadenas (H34), el volumen de tráfico real que llega al motor subió de ~0.267 IPs públicas distintas/hora (H23, casi todo ruido de pruebas) a **~682-898 IPs públicas distintas/hora reales** (ver H23 cierre y medición de esta misma noche). Bajo ese volumen, `motor-soc.service` empezó a saturarse: Vector descartó **15.489 eventos en 282 incidentes en 2h** (`error=Elapsed(())`, timeout de 2s agotado), con el proceso a **116.7% CPU** (sobre 1600% posible en el host, 16 cores) y latencias de Fast Path de **2000-2500ms** (presupuesto: <100ms). No es una regresión de código — es la primera vez que el sistema ve este volumen; antes de H34 casi no llegaba tráfico real.
+
+**Diagnóstico (PASO 0, antes de tocar nada):**
+- Host `.140`: 16 cores (Xeon Silver 4110 @ 2.10GHz, 8 físicos + HT).
+- `mpstat -P ALL 1 5` (dos muestras independientes, antes y después del experimento): **86.25-86.62% idle promedio, ningún core individual pasó de ~17%** en ningún muestreo — el 116.7% de CPU del proceso representa ~7% de la capacidad total del host. No hay CPU real agotada en ningún core — descarta RAMA B2 (throttling de firmas Suricata), confirma RAMA B1 (hay margen de hardware).
+- `ThreadPoolExecutor`: confirmado en código (`motor/main.py`, único call site `loop.run_in_executor(None, process_event, ...)`) — usa el default de asyncio, `min(32, cores+4)` = **20 threads**, no un valor fijado explícitamente.
+- Backlog real (`lag` de `soc:response:tasks`, no `XLEN` — ver más abajo): creciendo antes de cualquier intervención, ~+1.360/hora en una ventana de 73 min.
+
+**PASO A — freno de Redis evaluado, NO aplicado (colchón ya existente es suficiente):** la instrucción inicial era un `XTRIM ... MAXLEN ~ N` manual. Antes de aplicarlo se encontró en código (`motor/response/queue.py:65-68`) que `soc:response:tasks` **ya tiene `maxlen=200_000, approximate=True`** en el propio `xadd` del productor — explica por qué `XLEN` se mantenía clavado en ~200.017 pese a 2.9M+ entradas históricas. `INFO memory` de Redis: **135MB usados de 1GB `maxmemory`** (13%), policy `allkeys-lru` como red adicional. A la tasa de crecimiento real del backlog (~1.360/hora), el cap existente da **~139 horas (~5.8 días) de margen** antes de arriesgar entradas no procesadas. Un `XTRIM` manual a un valor más chico (~29k, la fórmula original) hubiera sido además **no durable** — el código sigue llamando `xadd(..., maxlen=200_000)` en cada tarea nueva, así que el stream volvería a crecer hacia 200k de todos modos sin tocar `queue.py` (fuera de alcance de esta noche). **Decisión: no se aplicó ningún trim manual — el colchón existente en código ya es adecuado**, documentado acá para que quede explícito en vez de asumido.
+
+**Experimento controlado — ¿GIL o falta de hardware? (sin cambiar arquitectura):** `py-spy` no estaba instalado, y aunque se hubiera instalado (`apt install` sí está en el `sudoers` acotado de `.140`), `py-spy dump` requiere adjuntarse a un proceso ajeno vía `ptrace` — bloqueado por `ptrace_scope=1` (Ubuntu, modo restringido) salvo con `sudo` interactivo, que no estaba disponible sin password. Se usó la alternativa: subir el `ThreadPoolExecutor` de 20 a 40 como experimento de medición (no como fix), con comentario explícito en el código citando H35, backup del `main.py` original antes de tocar nada, diff mostrado y confirmado antes de reiniciar `motor-soc.service` (con aviso previo).
+
+**Resultado del experimento (5 min, muestreo cada 45s):**
+```
+%CPU del proceso:  85.6 → 102 → 107 → 110 → 111 → 112 → 113
+```
+El `%CPU` se clava en ~110-113%, prácticamente el mismo orden de magnitud que el 116.7% medido ANTES del experimento con pool de 20 — duplicar los threads disponibles **no incrementó el uso de CPU proporcionalmente** (con paralelismo real aprovechable se esperaría acercarse a 200-400%+, dado que sobra backlog para procesar y sobran cores libres). **Esto confirma empíricamente que el cuello de botella es contención del GIL de Python, no falta de threads ni de hardware** — el `ThreadPoolExecutor` no da paralelismo real para el scoring CPU-bound (LightGBM + Isolation Forest) salvo que las rutinas en C liberen el GIL durante el cómputo pesado, y la evidencia dice que no lo hacen lo suficiente bajo esta carga.
+
+Dato honesto, no concluyente: el `lag` de `soc:response:tasks` bajó durante la misma ventana (7.372 → 6.181, -1.191 en 4:41 min), pero con el `%CPU` clavado, es más consistente con una caída del volumen de tráfico entrante en esa ventana puntual que con una mejora real de throughput atribuible al pool de 40 — no se le atribuye la mejora al experimento.
+
+**Revertido inmediatamente, tal como se acordó:** como el `%CPU` no subió claramente, se revirtió `main.py` al backup pre-experimento (diff vacío confirmado) y se reinició `motor-soc.service` — mismo estado que antes del experimento (pool de 20, sin cambios). Health check `200` post-revert.
+
+**Decisión — paliativo aplicado, fix estructural diferido a mañana:**
+1. Paliativo ya vigente desde antes de este hallazgo: timeout del sink `motor_soc` de Vector subido de 2s a 6s (ver el fix aplicado en esta misma sesión, antes de este experimento) — reduce pérdida de eventos en el punto de entrada, mueve el cuello de botella a la cola de Redis (que tiene colchón de sobra, ver PASO A).
+2. **Ningún cambio estructural esta noche** — ni `ThreadPoolExecutor` ampliado permanentemente, ni `ProcessPoolExecutor`, ni multi-worker de `uvicorn`, ni throttling de firmas Suricata. Antonio decidió explícitamente no forzar el cambio grande bajo presión nocturna.
+3. **Fix correcto para mañana, con evidencia de este experimento:** mover el scoring CPU-bound a procesos separados (`ProcessPoolExecutor` local, o mejor, un segundo nodo consumidor en `.141` una vez migrado y configurado) — un GIL compartido en un solo proceso no escala para este tipo de carga sin importar cuántos threads tenga. `.141` resuelve el mismo problema por otra vía (procesos en hosts separados en vez de en el mismo host), sin la complejidad de coordinar un `ProcessPoolExecutor` local (duplicación del modelo en memoria por proceso, coordinación de consumer group, riesgo de procesamiento duplicado) — evaluar ambas opciones con cabeza descansada, no bajo presión.
+
+**Evidencia:** `mpstat -P ALL 1 5` (dos corridas); grep de `ThreadPoolExecutor`/`run_in_executor` en `motor/main.py`; grep de `maxlen` en `motor/response/queue.py` y `redis_client.py`; `INFO memory` de Redis; diff exacto del experimento (`main.py`, backup `~/backup_main.py_pre-h35-experiment_20260908192744.py`); muestreo de `%CPU`/`lag` cada 45s durante el experimento; `journalctl -u vector-soar` mostrando la tasa de timeouts antes del paliativo.
+
+**Estado: MITIGADO (parcial) — PENDIENTE (fix estructural).** El paliativo de Vector reduce pérdida de eventos en el punto de entrada; el colchón de Redis existente (200k) da días de margen; la causa raíz (GIL, un solo proceso) queda confirmada con evidencia pero sin resolver — decisión de diseño para mañana, no de esta noche.
+
+---
+
+## H36 — Fix estructural de capacidad: `ThreadPoolExecutor` (GIL-bound) → `ProcessPoolExecutor`, con un bug real encontrado y resuelto en el camino
+
+**Fecha:** 2026-09-08
+
+**Nota de alcance:** esto NO incluye ningún cambio de versión de modelo — el modelo (`golden4_v7_1`), el contrato de features (Golden 4) y la lógica de decisión (`rules.yaml`, tiers) son exactamente los mismos que antes. El cambio es puramente de mecanismo de ejecución del scoring: de threads a procesos.
+
+**Decisión (Antonio):** reemplazar el `ThreadPoolExecutor` (confirmado GIL-bound en H35 con evidencia empírica — duplicar threads de 20 a 40 no subió el `%CPU` proporcionalmente) por un `ProcessPoolExecutor` para el paso de scoring (Isolation Forest + LightGBM), por fases con checkpoint antes de cada paso riesgoso.
+
+### FASE 0 — datos antes de diseñar
+
+- **Otros procesos en `.140`:** OpenSearch (docker) ~14% CPU / 2.15GB RAM, `response.worker` 0.4% CPU / 1.09GB RAM, `opensearch_indexer.py` 1.1% CPU / 46MB, `redis-server` 1.6% CPU / 148MB, nginx (16 workers) negligible. Total ≈ 17% de 1600% posible (16 cores) ≈ 2.7 cores equivalentes en uso — **~13 cores libres** de margen real.
+- **Memoria del modelo:** archivos en disco ~3.85MB combinados (LightGBM 1.85MB + IsolationForest 1.96MB + scaler). Proceso `motor-soc` completo (intérprete + FastAPI + numpy/lightgbm + ambos modelos) medido en **332MB RSS** — ese es el costo real por copia bajo `spawn` (sin copy-on-write).
+- **RAM:** 14GiB total, **7.5GiB "available"** (estimación real del kernel), swap prácticamente sin uso. Sin presión de memoria.
+- **`spawn`:** confirmado disponible (`forkserver`, `fork`, `spawn`), sin impedimento técnico. Detalle de diseño encontrado en `model.py`: `import __main__; __main__.CalibratedLightGBM = CalibratedLightGBM` a nivel de módulo — necesario para que `joblib.load()` deserialice el modelo (el `.pkl` fue serializado con la clase corriendo como `__main__` en el script de entrenamiento). Confirmado que esto se re-ejecuta correctamente en cada worker `spawn`eado en cuanto ese worker importa `model.py`.
+
+**Conclusión Fase 0:** margen de CPU y RAM de sobra para un pool de 8 workers (conservador, no arbitrario, basado en los ~13 cores libres medidos).
+
+### FASE 1 — diseño y código
+
+- `score_event(features, classtype) -> dict`: función **pura y picklable** — recibe solo datos simples (features ya validados, string), devuelve solo datos simples (tier/scores/decisión). Sin Redis, sin objetos de FastAPI. Corre en el pool de procesos.
+- `_score_pool = ProcessPoolExecutor(max_workers=8, mp_context=spawn, initializer=_init_score_worker)` — el `initializer` carga el modelo una vez por proceso worker (como global de ese proceso), igual que `get_model()` ya hacía una vez en el proceso principal.
+- `process_event()` mínimamente tocado: en vez de llamar `model.predict()` inline, hace `_score_pool.submit(score_event, features, classtype).result()` — sigue corriendo en el `ThreadPoolExecutor` de siempre (sin cambios ahí), el `.result()` bloqueante es seguro porque ya está en un thread, no en el event loop.
+- Calentamiento en `lifespan`: 8 tareas triviales al arrancar para forzar que los 8 procesos existan y tengan el modelo cargado antes del primer request real.
+
+### FASE 2 — validación de correctitud (encontró un bug real, no solo confirmó que todo andaba bien)
+
+**Comparación de scores — resultado limpio:** 30 muestras reales de `soc:flows` (features reales de tráfico genuino) + 3 casos sintéticos con override de classtype T3, comparadas campo por campo (tier/risk_score/ml_score/anomaly_score/decision/model_version) entre el mecanismo con threads y el nuevo con procesos: **0 discrepancias**. (Una falsa alarma inicial de 123 "discrepancias" resultó ser un artefacto de cómo se invocaba el script de prueba — descartada explícitamente, no se contó como hallazgo real.)
+
+**Bug real encontrado, root-caused y resuelto — no un artefacto de test:** al levantar una instancia real de `uvicorn main:app` (comando exacto de producción) en un directorio aislado para probar el despliegue completo, el calentamiento del pool se colgaba indefinidamente. Diagnóstico:
+1. Los 8 workers cargaban el modelo correctamente (confirmado en logs, ~1s cada uno) — el proceso padre nunca recibía la confirmación.
+2. Primer diagnóstico (guard contra `ProcessPoolExecutor` anidado vía `multiprocessing.parent_process() is None`) no resolvió el cuelgue.
+3. Causa real encontrada: `joblib`/scikit-learn crea su **propio pool interno ("loky")** al importar `model.py` — confirmado por los nombres de semáforos filtrados al apagar (`/loky-<pid>-...`). Cada uno de los 8 workers, al cargar el modelo, disparaba su propio pool anidado (40 procesos loky extra en total) — contención real entre pools anidados.
+4. El fix no era solo las env vars (`JOBLIB_MULTIPROCESSING=0`, `LOKY_MAX_CPU_COUNT=1`) — era el **orden de imports**: `main.py` tenía `from model import get_model` a nivel de módulo, y como cada worker hijo reimporta `main.py` completo para resolver la referencia picklable, sklearn/joblib ya estaban importados (backend ya decidido) antes de que cualquier env var pudiera aplicar. Solución: import de `model` **local** (diferido) dentro de `_init_score_worker`, `score_event`, `lifespan` y `/health`, fijando las env vars *antes* de ese import diferido.
+5. **Validación del fix:** arranque real de `uvicorn main:app` completo sin colgarse, 8 workers cargados, apagado limpio. Comparación de correctitud repetida tras el fix: **0 discrepancias** de nuevo (el fix no tocó lógica, solo orden de imports). Request real de punta a punta contra `/decide`: respuesta correcta con modelo real, 56ms.
+
+### FASE 3 — despliegue (con un segundo bug encontrado y corregido antes de dejarlo andando)
+
+**Primer intento de despliegue — regresión encontrada, revertida de inmediato:** al reiniciar `motor-soc.service` con el fix, `/decide` funcionaba perfecto (50-95ms reales, muy por debajo de los 2000-2500ms de H35), pero `/health` devolvía `500` — `NameError: name 'get_model' is not defined`. Causa: un 4to sitio (`/health`) que también llamaba `get_model()` y no se había actualizado al remover el import de nivel de módulo. Revertido al backup de inmediato (tal como se acordó ante cualquier señal inesperada), sin dejarlo "andando pero roto en un endpoint".
+
+**Fix completo y redespliegue:** corregidos los 4 sitios (`_init_score_worker`, `score_event`, `lifespan`, `/health`) con el import local. Validado en aislado (`/health` y `/decide` ambos correctos) antes de tocar producción de nuevo.
+
+**Despliegue final con 8 workers — monitoreo real (18 min, 5 muestras completas antes de que el loop de monitoreo cortara antes de tiempo):**
+- CPU: repartido entre padre y 8 workers desde la primera muestra (ej. muestra 3: 6.0-6.8% cada uno de los 9 procesos) — nunca un proceso solo clavado en 110%+.
+- Vector timeouts: 0 en las 5 muestras.
+- Fast Path: 44-91ms consistente.
+- Memoria: estable, 8.3Gi/14Gi usados, 6.4Gi disponibles.
+- **Lag de `soc:response:tasks`:** 914 → 962 → 1009 → 1052 → 1100 — mucho menor que antes (venía de >10.000 creciendo) pero **seguía subiendo**, más lento (~46/min vs ~224-1360/min antes) pero sin estabilizarse.
+
+### Ajuste — 8 → 10 workers
+
+Con el lag todavía subiendo (aunque mucho más lento) con 8 workers, y margen de memoria confirmado (6.3GB disponibles, costo incremental de 2 workers más ≈ 664MB — muy lejos del límite), se subió `_PROCESS_POOL_WORKERS` de 8 a 10. Mismo procedimiento: backup, diff mostrado, reinicio avisado, monitoreo.
+
+**Resultado — 18 minutos completos, 18 muestras:**
+- **Lag: 8, 0, 0, 15, 7, 58, 8, 41, 0, 3, 0, 8, 28, 0, 15, 0, 31, 0** — oscila entre 0 y 58 (0 en 7 de las 18 muestras), **sin tendencia sostenida de crecimiento**. Esto resuelve la pregunta abierta de si el cuello de botella era otra cosa (I/O de Redis, etc.) — no lo era: con más capacidad de cómputo paralelo, el lag deja de crecer. Era cuestión de cores dedicados al scoring, tal como se diagnosticó.
+- CPU: arranca alto tras el reinicio (~17-23% por proceso, catch-up del backlog) y baja a ~3.3-4.0% por proceso hacia el final de la ventana — repartido en los 10 procesos todo el tiempo.
+- Vector timeouts: **0 en las 18 muestras.**
+- Fast Path: 40-60ms típico, picos ocasionales a 84-97ms (dentro o cerca del presupuesto de <100ms) — nunca cerca de los 2000-2500ms de H35.
+- Memoria: estable, 8.5-8.6Gi/14Gi usados, 6.1Gi disponibles en las 18 muestras, sin crecimiento ni señales de swap.
+
+**Evidencia:** diffs completos de cada despliegue (`main.py` antes/después, con los 3 backups timestamped de la noche: pre-h36-deploy, pre-h36-deploy2, pre-h36-10workers); script de comparación de correctitud (30 muestras reales + 3 override, 0 discrepancias, dos corridas); logs de `journalctl -u motor-soc` mostrando el `NameError` de la regresión y su fix; 23 muestras de monitoreo en vivo (5 con 8 workers + 18 con 10 workers) con CPU/lag/memoria/latencia/timeouts.
+
+**Estado: RESUELTO.** El lag se estabiliza (oscila, no crece) con 10 workers — confirma que la causa raíz era capacidad de cómputo paralelo para el scoring, no I/O de Redis ni otro cuello de botella. Configuración final: `ProcessPoolExecutor(max_workers=10, mp_context=spawn)`, con el fix de orden de imports (env vars de joblib antes del import diferido de `model.py`) documentado en el propio código. Sin cambios de modelo, features, ni lógica de decisión — puramente mecanismo de paralelismo. `.141` (cuando esté migrado y configurado) queda como capacidad adicional a evaluar a futuro si el volumen de tráfico real sigue creciendo, no como pendiente urgente.
+
+---
+
+## H37 — Integración de CrowdSec como fuente de corroboración (Fase 1: agente instalado y validado; Fases 2-4 pendientes)
+
+**Fecha:** 2026-09-08
+
+**Restricción de diseño no negociable (Antonio):** CrowdSec no bloquea nada por su cuenta — ningún bouncer de enforcement (iptables/nftables). Solo aporta detección local como señal de corroboración adicional, igual que OTX/AbuseIPDB. El único punto de bloqueo real del sistema sigue siendo R2 (Wazuh Active Response).
+
+### FASE 0 — diagnóstico en `.139` antes de instalar
+
+- **Cores/CPU/RAM:** 8 cores (Xeon Bronze 3106, sin hyperthreading), **98.55% idle promedio** (`mpstat`, 5 muestras) — margen amplio para sumar un proceso más al gateway inline. RAM: 15GiB total, 11GiB "available", swap con 1.2GiB de 4GiB en uso (no crítico, anotado).
+- **Sin residuos previos:** confirmado, sin `cscli`/`crowdsec`, sin `/etc/crowdsec`, sin usuario `crowdsec`.
+- **`eve.json`:** 2.85GB, ~58.000 líneas/hora. Distribución real (muestra de 5.000 líneas): DNS 52.4%, flow 42.5%, TLS 3.8%, **alert solo 0.48%** — confirma la recomendación oficial de no darle el feed crudo completo.
+
+### FASE 1 — instalación del agente (sin bouncer de enforcement)
+
+**Instalación:** script oficial de packagecloud.io revisado línea por línea antes de ejecutar (418 líneas, solo configura repo APT + GPG, no instala nada por sí solo, requiere root — corrido por Antonio). Paquete `crowdsec` 1.8.1 instalado vía el `apt install` ya acotado en sudoers de auditoría.
+
+**Dos problemas reales encontrados y corregidos en el camino, ninguno asumido:**
+
+1. **Conflicto de puerto:** la LAPI de CrowdSec por defecto usa `127.0.0.1:8080`, que ya lo ocupa el nginx `proxy-soc` de H34. El servicio ni siquiera arrancó ("port 8080 is already used"). Corregido: `listen_uri` movido a `127.0.0.1:8081` en `config.yaml` y en `local_api_credentials.yaml` — sigue en localhost, nunca expuesto.
+2. **Auto-detección de más:** el postinst de Debian corrió su auto-setup y habilitó colecciones para apache2, auditd, linux, nginx, sshd y pgsql además de suricata — ninguno de esos servicios era lo pedido. Podado explícitamente a **solo `crowdsecurity/suricata`** (confirmado con `cscli collections inspect` que suricata no depende de ninguno de los removidos), incluyendo los archivos huérfanos en `acquis.d/`.
+
+**Bug real de configuración, encontrado y resuelto con evidencia, no a la primera:**
+
+- Intento 1: acquisition apuntando a `eve.json` con un campo `filter: "JsonExtract(evt.Line.Raw, 'event_type') == 'alert'"` para reducir volumen — **CrowdSec 1.8.1 no soporta ese campo para datasource tipo `file`** (`crowdsec init: ... unknown field "filter"`, confirmado en `/var/log/crowdsec.log`). Servicio no arrancaba.
+- Intento 2: se probó apuntar a `fast.log` en su lugar (ya es solo-alertas por diseño, sin necesitar filtro) — pero el label de acquisition (`suricata-evelogs`, heredado del intento anterior) no correspondía al parser real de `fast.log`. 0% de líneas parseadas pese a 8 alertas reales confirmadas en la misma ventana.
+- **Causa raíz real**, encontrada leyendo el parser instalado (`/etc/crowdsec/parsers/s01-parse/suricata-logs.yaml`, que define dos parsers en un mismo archivo): `crowdsecurity/suricata-evelogs` **ya filtra por `event_type=="alert"` internamente** vía `JsonExtract` — el filtro que se buscaba ya existe, en el parser, no en la adquisición. Solo hacía falta volver a `eve.json` con el label correcto (`type: suricata-evelogs`), sin ningún filtro adicional.
+- Con eso corregido, **seguía en 0% parseado** pese al label correcto. Causa raíz #2: el filtro del parser depende de `evt.Parsed.program`, que se deriva de una etapa base compartida (`crowdsecurity/syslog-logs`, stage `s00-raw`) — removida como efecto colateral (no declarado como dependencia explícita de `suricata` por `cscli`) al podar la colección `linux` en el paso anterior. Reinstalada (`cscli parsers install crowdsecurity/syslog-logs`) — **resolvió el problema**: primera línea parseada y en bucket de escenario confirmada de inmediato.
+
+**Validación final con tráfico real:**
+- 30 de 5.360 líneas parseadas ≈ **0.56%** — coincide casi exacto con el 0.48% medido en Fase 0 (confirma que el pipeline procesa exactamente lo que debería, ni más ni menos).
+- 22 de esas 30 llegaron al bucket del escenario `crowdsecurity/suricata-alerts`, con contenido real verificado (ej. `91.92.42.27`/reputación CINS, mismas IPs que ya corroboraba AbuseIPDB/OTX en H34).
+- **Ninguna alerta agregada disparó todavía** (`cscli alerts list`: "No active alerts"). Se intentó forzar con 15 conexiones reales repetidas desde una IP propia contra el honeypot — no generaron ninguna firma de Suricata, porque las reglas activas esta noche son basadas en listas de reputación (CINS/DShield/Spamhaus), no en comportamiento de conexión repetida; no hay forma honesta de fabricar una IP de mala reputación para forzar el disparo. **No es un fallo del pipeline** — el escenario es un leaky-bucket que necesita varios hits de la misma IP en una ventana de tiempo, y el tráfico real de esta noche es mayormente IPs distintas de un solo hit cada una.
+
+**Evidencia:** script de instalación revisado línea por línea; `cscli collections inspect crowdsecurity/suricata` (dependencias reales); `journalctl`/`/var/log/crowdsec.log` con el error exacto de "unknown field filter"; contenido completo de `/etc/crowdsec/parsers/s01-parse/suricata-logs.yaml` (los dos parsers, sus `filter:` exactos); métricas de `cscli metrics` en 4 puntos de la investigación (0/479, 0/1420, 1/1020, 30/5360) mostrando la progresión real hasta la corrección final; `tail /var/log/suricata/fast.log` confirmando que las conexiones de prueba propias no generaron firmas.
+
+**Estado: Fase 1 validada con evidencia real (parseo confirmado, ratio esperado). Fases 2 (bouncer de solo lectura), 3 (integración a la corroboración multi-fuente) y 4 (validación final + doc de cierre) quedan PENDIENTES**, no aplicadas hoy. Pendiente no bloqueante: confirmar orgánicamente (próximas horas/días) que un atacante repetido dispara una alerta agregada real de CrowdSec — no se fuerza con tráfico sintético para no ensuciar la evidencia de la tesis.
+
+### FASE 2 (mismo día) — bouncer de solo lectura, adapter creado y probado de forma aislada
+
+**Registro del bouncer:** `cscli bouncers add r-soar-reader` — API key generada y guardada únicamente en `~/tesis/motor-runtime/.env` de `.140` (`CROWDSEC_API_KEY`, `CROWDSEC_LAPI_URL`), nunca en código ni en el repo — mismo patrón que `OTX_API_KEY`/`ABUSEIPDB_API_KEY`.
+
+**Hallazgo de diseño encontrado antes de escribir el adapter, no asumido:** la LAPI de CrowdSec estaba bindeada a `127.0.0.1:8081` (solo local a `.139`) — el motor que la va a consultar corre en `.140`, en otro host. Decisión tomada con Antonio: bindear específicamente a la interfaz de VLAN10 que `.139` ya tiene (`10.10.10.1:8081`, misma VLAN que `.140`), en vez de `0.0.0.0` — evita exponer la LAPI en la IP pública de `.139` o en las VLANs 20/30, que no la necesitan. `local_api_credentials.yaml` (referencia interna del propio agente/`cscli`) actualizado al mismo host:puerto. Conectividad real confirmada desde `.140` (`curl` → `HTTP 404` en la raíz, ruta inexistente pero servidor responde).
+
+**Adapter creado:** `motor/response/crowdsec_adapter.py`, mismo patrón que `enrichment.py` (degradación elegante — nunca lanza excepción, retorna lista vacía si la LAPI no está configurada/disponible). `fetch_decisions_stream(settings, startup)` consulta `GET /v1/decisions/stream` con header `X-Api-Key`, parsea cada decisión a `CrowdSecDecision` (`ip`, `scenario`, `duration`, `decision_type`, `origin` — nuevo modelo en `schemas.py`). Config nueva en `response/config.py` (`crowdsec_lapi_url`, `crowdsec_api_key`, `crowdsec_timeout`), mismo patrón pydantic que el resto. **No integrado a `enrich()`/`count_corroborating_sources()` todavía** — eso es Fase 3, explícitamente diferida.
+
+**Test de solo-lectura — evidencia automatizada, no una promesa:** `motor/response/tests/test_crowdsec_adapter_readonly.py` (primer test formal del código de `motor/`, no existía carpeta `tests/` antes). Dos capas de verificación:
+1. Análisis de texto sobre el código real (comentarios/docstrings excluidos vía `tokenize`, para no auto-fallar por la propia explicación en prosa de qué NO hace el módulo) buscando `iptables`, `nftables`, `nft`, `ufw`, `firewall-cmd`, `subprocess.`, `os.system`, `os.popen`.
+2. Análisis AST: falla si el módulo importa `subprocess`/`os`, o si llama a cualquier función nombrada `system`/`popen`/`exec*`; además confirma que ninguna función pública tiene un nombre sugestivo de bloqueo (`block`/`ban`/`enforce`/`drop`/`firewall`).
+
+**Validado que el test realmente detecta violaciones, no solo pasa en verde por defecto:** se inyectó temporalmente `import subprocess` + una llamada a `iptables` en una copia del adapter — el test falló correctamente señalando el import prohibido. Archivo original restaurado y test vuelto a correr limpio.
+
+**Prueba aislada contra la LAPI real:** script standalone (no integrado al motor) llamando `fetch_decisions_stream(settings, startup=True)` — confirmado con la respuesta HTTP real, no solo el resultado ya envuelto por el adapter:
+```
+curl -H "X-Api-Key: ..." http://10.10.10.1:8081/v1/decisions/stream?startup=true
+→ HTTP 200, {"new": [], "deleted": []}
+```
+0 decisiones es un resultado real (coincide con lo ya sabido en Fase 1: ningún escenario de CrowdSec disparó todavía esta noche), no una falla enmascarada — se confirmó explícitamente con `curl` directo antes de confiar en el resultado del adapter.
+
+**Evidencia:** salida completa de `cscli bouncers add`; diff de `config.yaml`/`local_api_credentials.yaml` (puerto y host); `curl` de conectividad `.140`→`.139`; los 4 archivos nuevos/modificados (`schemas.py`, `config.py`, `crowdsec_adapter.py`, `test_crowdsec_adapter_readonly.py`); corrida del test en verde y en rojo (con la violación inyectada); respuesta HTTP cruda de `/v1/decisions/stream`.
+
+**Estado: Fase 2 CERRADA — adapter funcionando de forma standalone, probado, confirmado de solo lectura con evidencia automatizada.** Fase 3 (integración a la corroboración multi-fuente, con la decisión pendiente de qué peso darle a CrowdSec frente a OTX/AbuseIPDB) y Fase 4 (validación final + doc de cierre) siguen pendientes, no aplicadas hoy.
+
+### FASE 3 (mismo día) — CrowdSec integrado como señal REGISTRADA, deliberadamente NO gatillante
+
+**Decisión de diseño (Antonio):** con 0 alertas agregadas de CrowdSec en toda la ventana de validación de Fase 1, no hay evidencia todavía de cuánta señal nueva aporta en este entorno — integrarlo de lleno al gate de corroboración ahora sería darle peso a ciegas. Se integra como **observación auditable**: visible en cada registro de `soc-decisions`, sin participar en `count_corroborating_sources()` ni en la acción que ejecuta R2.
+
+**Cambios (todos aditivos, sin tocar lógica de decisión existente):**
+- `schemas.py`: `EnrichmentResult` suma `crowdsec_observado: bool`, `crowdsec_scenario`, `crowdsec_duration` — con comentario explícito en el propio código marcando que están deliberadamente fuera de `corroborating_sources`/`corroboration_count`.
+- `config.py`: `crowdsec_cache_ttl: int = 300` (5 min, no 6h como AbuseIPDB/OTX — las decisiones de CrowdSec son mucho más dinámicas que una reputación agregada).
+- `enrichment.py`: nueva `_crowdsec_lookup()` — cachea la lista completa de decisiones activas en Redis (mismo criterio de cache que AbuseIPDB/OTX, aplicado a una lista en vez de a un valor por IP, ya que el endpoint de Fase 2 es de stream completo, no de lookup puntual), llamada dentro de `enrich()` **después** de `count_corroborating_sources()` en la lectura del código, para que quede explícito que no lo alimenta. Degradación elegante idéntica al resto de R1.
+- **`count_corroborating_sources()` no se tocó — cero líneas modificadas en esa función.**
+
+**Test de no-regresión (punto 3, obligatorio) — validado en ambos sentidos:** `response/tests/test_crowdsec_observational_no_regression.py`. Construye un evento con una decisión de CrowdSec activa simulada para la IP, pero sin AbuseIPDB ni OTX (mockeados como no disponibles) — confirma `crowdsec_observado is True` (visibilidad) **y** `corroboration_count == 0` / `corroborating_sources == []` (sin regresión en el gate). Igual que con el test de Fase 2: se inyectó a propósito una regresión falsa (sumar `crowdsec_observado` a `count_corroborating_sources()`) y se confirmó que el test la detecta (`corroboration_count` pasó a dar 1) antes de restaurar el archivo original y volver a confirmar test en verde.
+
+**Validación con tráfico real — el campo se puebla correctamente, y ya sirve para el análisis que se pidió:**
+- Eventos de IP privada (`10.10.10.3` — DNS/tráfico interno del propio `.140`): `crowdsec_observado: false`, sin notas de error, exactamente lo esperado.
+- Eventos de IP pública real corroborados por AbuseIPDB+OTX: ej. `91.92.42.135` (tier 3, `corroboration_count: 2`, ya bloqueada por R2 — `"action": "block_skipped", "reason": "ya bloqueada — TTL extendido"`) con `crowdsec_observado: false` — es exactamente el dato que el punto 4 pedía poder consultar: una IP que el sistema *ya* bloqueó vía AbuseIPDB+OTX, sin que CrowdSec la haya observado (todavía) — el insumo real para decidir en 5-7 días si hay señal nueva o redundancia.
+
+**Recordatorio con fecha dejado por escrito** (no solo aquí): `docs/PLAN_SPRINTS.md`, fila de `accion_recomendada` en Sprint 4 — revisar entre el 13 y el 15 de septiembre cuántos eventos acumularon `crowdsec_observado: true` y cuántos de esos ya corroboraban por AbuseIPDB+OTX de todas formas, antes de decidir con datos reales si CrowdSec entra al gate de corroboración y con qué peso.
+
+**Evidencia:** diff de `schemas.py`/`config.py`/`enrichment.py`; corrida del test de no-regresión en verde y en rojo (con la regresión inyectada); registros reales de `soc:response:audit` mostrando `crowdsec_observado` poblado tanto en tráfico interno como en un caso real ya bloqueado por las otras dos fuentes; backups timestamped de los tres archivos modificados (`/tmp/backup_*.py_pre-h37fase3.py` en `.140`).
+
+**Estado: Fase 3 CERRADA.** CrowdSec queda integrado como señal observacional pura — auditable en `soc-decisions`, sin ningún efecto en `accion_recomendada`/`corroboration_count` hoy. Fase 4 (validación final de estabilidad de `.139` + documento de cierre consolidado) sigue pendiente para otra sesión; funcionalmente, Fase 3 ya cubre la mayor parte de lo que Fase 4 pedía validar (tráfico real, campo poblado, sin efectos secundarios).
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - **`--workers 2` para `motor-soc.service`, evaluado pero no aplicado** (H30): el `run_in_executor` ya mitiga el bloqueo del event loop; un segundo worker de proceso completo daría paralelismo real adicional pero duplica el modelo en memoria por proceso — pendiente confirmar con Joaquín si el modelo tolera esa duplicación sin problema (RAM disponible en `.140` no parece ser el límite real, ver H30 original, pero no se asumió sin preguntar).
