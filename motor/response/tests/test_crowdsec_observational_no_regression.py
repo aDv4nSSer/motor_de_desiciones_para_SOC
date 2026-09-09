@@ -35,7 +35,7 @@ def test_crowdsec_signal_alone_does_not_trigger_autoblock():
         abuseipdb_api_key="",   # sin key -> abuseipdb_available=False
         otx_api_key="",         # sin key -> otx_available=False
         crowdsec_lapi_url="http://fake-lapi:8081",
-        crowdsec_api_key="fake-key",
+        crowdsec_api_key="fake-key",  # pragma: allowlist secret -- valor de prueba, no un secreto real
     )
     rdb = _FakeRedis()
     ip = "203.0.113.55"  # TEST-NET-3, RFC 5737 -- IP pública de documentación
