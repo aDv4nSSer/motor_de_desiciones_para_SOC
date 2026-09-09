@@ -4,12 +4,16 @@ FastAPI: recibe flows de Vector (single o batch), clasifica con ML, publica a Re
 Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
 import asyncio, uuid, logging, time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
 
 from schemas import FlowFeatures, DecisionResponse, RiskTier
-from model import get_model
+# H36: "from model import get_model" NO va a nivel de módulo a propósito —
+# ver _init_score_worker() más abajo para el porqué (contención de joblib/
+# sklearn con nuestro propio ProcessPoolExecutor, encontrada en FASE 2).
 from redis_client import publish_decision, publish_flow
 from response.queue import enqueue_response_task
 from dashboard import (
@@ -33,12 +37,97 @@ T3_CLASSTYPES = {
 TIER_NAMES = {0: "T0_BENIGNO", 1: "T1_BAJO", 2: "T2_MEDIO", 3: "T3_CRITICO"}
 DECISIONS  = {0: "ALLOW", 1: "LOG", 2: "ALERT", 3: "BLOCK"}
 
+# H36 (2026-09-08): ProcessPoolExecutor para el scoring CPU-bound, reemplaza
+# el ThreadPoolExecutor de H30 (confirmado GIL-bound en H35 — duplicar
+# threads no subía el %CPU proporcionalmente). contexto "spawn" a propósito:
+# evita heredar conexiones Redis/sockets/event loop del proceso padre vía
+# fork, que podrían quedar en estado corrupto o compartido entre procesos.
+# 8→10 workers (2026-09-08, mismo día): 8 workers desplegado y validado
+# (CPU repartido, Vector timeouts en 0, Fast Path 44-91ms vs 2000-2500ms
+# antes) — subido a 10 tras confirmar margen de memoria (6.3GB disponibles,
+# costo incremental ~664MB) porque el lag de soc:response:tasks, aunque
+# mucho más lento que antes, seguía subiendo en vez de estabilizarse.
+_PROCESS_POOL_WORKERS = 10
+
+def _init_score_worker():
+    """Corre UNA VEZ por proceso worker al arrancar — carga el modelo como
+    global de ESE proceso (spawn no comparte memoria con el padre).
+
+    FASE 2 (H36): encontrado con evidencia — al importar `model.py` (que
+    importa sklearn/joblib) desde CADA uno de los 8 workers, joblib crea su
+    propio pool interno ("loky", confirmado por los nombres de semáforos
+    filtrados al apagar: /loky-<pid>-... en vez de /mp-<pid>-...) DENTRO de
+    cada worker ya paralelo nuestro — pools anidados, con contención real
+    que en el caso completo (main.py real vía uvicorn, no este repro
+    aislado) colgaba el calentamiento del proceso padre indefinidamente.
+    Fix: fijar estas env vars ANTES de que sklearn/joblib se importen por
+    primera vez en este proceso — por eso el import de `model` es local
+    acá, no a nivel de módulo (si fuera top-level, el reimport de main.py
+    que cada hijo hace para resolver la referencia picklable ya habría
+    importado sklearn antes de llegar a esta función, demasiado tarde).
+    """
+    import os
+    os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+    os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+    from model import get_model
+    get_model()
+
+# Guard obligatorio bajo spawn: cada worker hijo, para resolver la
+# referencia picklable main.score_event, reimporta este mismo módulo — sin
+# este guard, ese reimport volvería a ejecutar esta línea DENTRO de cada
+# hijo, creando un ProcessPoolExecutor anidado por cada uno (encontrado en
+# FASE 2: colgaba el warmup del proceso padre indefinidamente, aunque los
+# workers cargaban el modelo bien — el problema era el pool anidado, no el
+# modelo). multiprocessing.parent_process() es None solo en el proceso
+# original que nunca fue spawneado por otro contexto de multiprocessing.
+_score_pool = None
+if multiprocessing.parent_process() is None:
+    _score_pool = ProcessPoolExecutor(
+        max_workers=_PROCESS_POOL_WORKERS,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_init_score_worker,
+    )
+
+
+def score_event(features: dict, classtype: str) -> dict:
+    """Función PURA y picklable: recibe SOLO datos simples (features ya
+    validados) y devuelve SOLO datos simples (score/tier/decisión). Sin
+    Redis, sin request, sin logging de publish — eso queda en
+    process_event(), en el proceso padre. Corre en _score_pool.
+    """
+    from model import get_model  # ver _init_score_worker() — import local a propósito
+    model = get_model()
+    classtype_override = classtype.lower() in T3_CLASSTYPES
+    scores = model.predict(features)
+    tier   = 3 if classtype_override else model.tier(scores["risk_score"])
+    return {
+        "tier":               tier,
+        "tier_name":          TIER_NAMES[tier],
+        "risk_score":         scores["risk_score"],
+        "anomaly_score":      scores["anomaly_score"],
+        "ml_score":           scores["ml_score"],
+        "decision":           DECISIONS[tier],
+        "classtype_override": classtype_override,
+        "model_version":      model.model_version,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Motor SOC iniciando...")
+    from model import get_model  # ver _init_score_worker() — import local a propósito
     model = get_model()
     log.info(f"Modelo cargado: {model.model_version}")
+    # H36: calentar el pool de procesos ahora, no en la primera request real
+    # — fuerza a spawnear los N workers y cargar el modelo en cada uno.
+    log.info(f"Calentando {_PROCESS_POOL_WORKERS} workers del ProcessPoolExecutor...")
+    warmup_futures = [_score_pool.submit(_init_score_worker) for _ in range(_PROCESS_POOL_WORKERS)]
+    for f in warmup_futures:
+        f.result()
+    log.info("ProcessPoolExecutor listo.")
     yield
+    log.info("Motor SOC deteniendo...")
+    _score_pool.shutdown(wait=True)
     log.info("Motor SOC detenido.")
 
 app = FastAPI(
@@ -51,7 +140,6 @@ app = FastAPI(
 def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
     """Procesa un evento y retorna la decisión."""
     t_start = time.perf_counter()
-    model   = get_model()
 
     try:
         flow     = FlowFeatures(**event_data)
@@ -60,20 +148,25 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
         log.error(f"Validación fallida: {e} | body: {str(event_data)[:200]}")
         return {"trace_id": trace_id, "error": str(e), "tier": 0, "decision": "ALLOW"}
 
-    classtype_override = classtype.lower() in T3_CLASSTYPES
-    scores = model.predict(features)
-    tier   = 3 if classtype_override else model.tier(scores["risk_score"])
+    # H36: el scoring CPU-bound corre en _score_pool (procesos, no threads).
+    # .result() bloquea el thread actual (del ThreadPoolExecutor de siempre)
+    # hasta que el worker responde — no bloquea el event loop de asyncio,
+    # porque process_event ya corre fuera de él (run_in_executor en decide()).
+    scored = _score_pool.submit(score_event, features, classtype).result()
+
+    tier                = scored["tier"]
+    classtype_override  = scored["classtype_override"]
 
     response = {
         "trace_id":           trace_id,
         "tier":               tier,
-        "tier_name":          TIER_NAMES[tier],
-        "risk_score":         scores["risk_score"],
-        "anomaly_score":      scores["anomaly_score"],
-        "ml_score":           scores["ml_score"],
-        "decision":           DECISIONS[tier],
+        "tier_name":          scored["tier_name"],
+        "risk_score":         scored["risk_score"],
+        "anomaly_score":      scored["anomaly_score"],
+        "ml_score":           scored["ml_score"],
+        "decision":           scored["decision"],
         "classtype_override": classtype_override,
-        "model_version":      model.model_version,
+        "model_version":      scored["model_version"],
         "features_used": {
             "SERVER_TCP_FLAGS":           features["SERVER_TCP_FLAGS"],
             "OUT_PKTS":                   features["OUT_PKTS"],
@@ -90,7 +183,7 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
     enqueue_response_task(
         trace_id=trace_id,
         tier=tier,
-        risk_score=scores["risk_score"],
+        risk_score=scored["risk_score"],
         src_ip=event_data.get("IPV4_SRC_ADDR") or event_data.get("src_ip"),
         dst_ip=event_data.get("IPV4_DST_ADDR") or event_data.get("dst_ip"),
         dst_port=features["L4_DST_PORT"],
@@ -102,7 +195,7 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
         log.warning(f"Fast Path lento: {elapsed_ms:.1f}ms [trace={trace_id}]")
 
     log.info(
-        f"[{trace_id[:8]}] tier={tier} score={scores['risk_score']:.3f} "
+        f"[{trace_id[:8]}] tier={tier} score={scored['risk_score']:.3f} "
         f"port={features['L4_DST_PORT']} elapsed={elapsed_ms:.1f}ms"
     )
     return response
@@ -145,6 +238,7 @@ async def decide(request: Request):
 # ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
+    from model import get_model  # ver _init_score_worker() — import local a propósito
     model = get_model()
     return {
         "status":        "ok",
