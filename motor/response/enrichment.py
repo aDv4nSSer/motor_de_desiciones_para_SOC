@@ -22,6 +22,7 @@ import httpx
 import redis
 
 from response.config import ResponseSettings
+from response.crowdsec_adapter import fetch_decisions_stream
 from response.schemas import EnrichmentResult
 
 log = logging.getLogger("response.r1")
@@ -197,6 +198,58 @@ def _otx_lookup(
     return result
 
 
+def _crowdsec_lookup(
+    ip: str, settings: ResponseSettings, rdb: redis.Redis
+) -> EnrichmentResult:
+    """
+    H37 Fase 3: consulta si `ip` tiene una decisión activa de CrowdSec.
+
+    SOLO OBSERVACIONAL — deliberadamente NO participa en
+    count_corroborating_sources() ni en la acción recomendada de R2. No hay
+    evidencia todavía de cuánta señal nueva aporta CrowdSec en este entorno
+    (0 alertas agregadas en la ventana de validación de Fase 1) — se
+    acumula visibilidad en soc-decisions para decidir con datos reales más
+    adelante (recordatorio en PLAN_SPRINTS.md), no se le da peso a ciegas.
+
+    Cachea la lista completa de decisiones activas en Redis (TTL corto,
+    `crowdsec_cache_ttl` — las decisiones cambian mucho más rápido que una
+    reputación agregada) en vez de pedir el stream completo en cada evento.
+    Nunca lanza excepción hacia arriba — degradación elegante, mismo
+    criterio que AbuseIPDB/OTX.
+    """
+    result = EnrichmentResult(src_ip=ip)
+
+    if not settings.crowdsec_lapi_url or not settings.crowdsec_api_key:
+        result.notes.append("crowdsec: lapi_url/api_key no configurada")
+        return result
+
+    cache_key = f"{settings.enrich_cache_prefix}crowdsec:decisions"
+    decisions_raw: list[dict] = []
+    try:
+        cached = rdb.get(cache_key)
+        if cached:
+            decisions_raw = json.loads(cached)
+        else:
+            fresh = fetch_decisions_stream(settings, startup=True)
+            decisions_raw = [d.model_dump() for d in fresh]
+            try:
+                rdb.setex(cache_key, settings.crowdsec_cache_ttl, json.dumps(decisions_raw))
+            except redis.RedisError as e:
+                log.warning(f"cache write fallida (crowdsec) para {ip}: {e}")
+    except (redis.RedisError, json.JSONDecodeError) as e:
+        result.notes.append(f"crowdsec cache error: {type(e).__name__}")
+        log.warning(f"CrowdSec cache no disponible: {e}")
+
+    for d in decisions_raw:
+        if d.get("ip") == ip:
+            result.crowdsec_observado = True
+            result.crowdsec_scenario = d.get("scenario")
+            result.crowdsec_duration = d.get("duration")
+            break
+
+    return result
+
+
 def count_corroborating_sources(
     result: EnrichmentResult, settings: ResponseSettings
 ) -> tuple[int, list[str]]:
@@ -252,6 +305,15 @@ def enrich(
     result.notes.extend(otx_result.notes)
     result.cached = result.cached or otx_result.cached
     result.reverse_dns = _reverse_dns(src_ip)
+
+    # H37 Fase 3: CrowdSec, solo observacional -- se calcula DESPUÉS de
+    # count_corroborating_sources() para que quede explícito en la lectura
+    # del código que no influye en ese conteo (ver _crowdsec_lookup).
+    crowdsec_result = _crowdsec_lookup(src_ip, settings, rdb)
+    result.crowdsec_observado = crowdsec_result.crowdsec_observado
+    result.crowdsec_scenario = crowdsec_result.crowdsec_scenario
+    result.crowdsec_duration = crowdsec_result.crowdsec_duration
+    result.notes.extend(crowdsec_result.notes)
 
     count, names = count_corroborating_sources(result, settings)
     result.corroboration_count = count

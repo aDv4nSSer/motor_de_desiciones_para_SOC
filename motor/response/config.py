@@ -74,6 +74,20 @@ class ResponseSettings(BaseSettings):
     otx_cache_ttl: int = 21600           # 6h — mismo criterio que AbuseIPDB
     otx_timeout: float = 4.0
 
+    # ── R1: CrowdSec (H37) — bouncer de SOLO LECTURA "r-soar-reader" ────
+    # LAPI corre en .139 (agente local, colección crowdsecurity/suricata),
+    # bindeada solo en la interfaz de VLAN10 (10.10.10.1:8081) para que este
+    # host (.140) pueda alcanzarla sin exponerla en la IP pública ni otras
+    # VLANs. Ver H37 en docs/BITACORA_TECNICA.md.
+    crowdsec_lapi_url: str = ""
+    crowdsec_api_key: str = ""
+    crowdsec_timeout: float = 4.0
+    # TTL corto (5 min, no 6h como AbuseIPDB/OTX): las decisiones de
+    # CrowdSec son mucho más dinámicas (expiran en horas, se revocan) que
+    # una reputación agregada — un cache largo mostraría un "observado"
+    # ya vencido como si siguiera activo.
+    crowdsec_cache_ttl: int = 300
+
     # ── R1: corroboración multi-fuente (gate real de R2, ver enrichment.py) ─
     # Umbral de "hallazgo malicioso corroborado" por fuente. Una fuente no
     # disponible (timeout/sin key/cuota) no cuenta ni a favor ni en contra.
