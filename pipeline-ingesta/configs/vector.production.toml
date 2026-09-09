@@ -143,7 +143,13 @@ inputs = ["parse_eve"]
 uri = "http://10.10.10.3:8000/decide"
 method = "post"
 encoding.codec = "json"
-request.timeout_secs = 2
+# PALIATIVO TEMPORAL — H35 (2026-09-08): motor-soc satura el thread pool bajo
+# el volumen real que trajo el fix de H34 (INPUT/OUTPUT), latencias de
+# 2000-2500ms tumbaban el timeout de 2s y Vector descartaba ~15.5k eventos/2h.
+# Subido a 6s solo para frenar la pérdida mientras se evalúa la mitigación
+# estructural (thread pool vs process pool vs multi-worker) con carga
+# controlada. Revisar y bajar/retirar este comentario cuando eso se resuelva.
+request.timeout_secs = 6
 request.retry_attempts = 2
 
 # ------------------------------------------------------------
