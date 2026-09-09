@@ -60,6 +60,30 @@ class EnrichmentResult(BaseModel):
     # fuente no disponible no cuenta ni a favor ni en contra del conteo.
     corroborating_sources: list[str] = Field(default_factory=list)
     corroboration_count: int = 0
+    # ── H37 Fase 3: CrowdSec, señal SOLO OBSERVACIONAL ──────────────────
+    # Deliberadamente fuera de corroborating_sources/corroboration_count —
+    # no hay evidencia todavía de cuánta señal nueva aporta en este entorno
+    # (0 alertas agregadas en la ventana de Fase 1). Visible/auditable en
+    # soc-decisions para acumular evidencia; revisar en ~5-7 días (ver
+    # PLAN_SPRINTS.md) si se integra de lleno al gate, y con qué peso.
+    crowdsec_observado: bool = False
+    crowdsec_scenario: Optional[str] = None
+    crowdsec_duration: Optional[str] = None
+
+
+class CrowdSecDecision(BaseModel):
+    """
+    Una decisión individual leída del stream de CrowdSec (H37) — bouncer de
+    SOLO LECTURA (r-soar-reader). No implica ninguna acción de bloqueo
+    propia: es una señal más de corroboración local, del mismo tipo que
+    AbuseIPDB/OTX (ver crowdsec_adapter.py). El único punto de bloqueo real
+    del sistema sigue siendo R2 (Wazuh Active Response).
+    """
+    ip: str
+    scenario: str = ""
+    duration: str = ""
+    decision_type: str = ""   # "ban", "captcha", etc. (campo "type" de CrowdSec)
+    origin: Optional[str] = None
 
 
 class BlockResult(BaseModel):
