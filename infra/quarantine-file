@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+quarantine-file.py -- Active Response personalizado de Wazuh.
+Mueve un archivo sospechoso fuera del webroot servible, preservando
+evidencia (no lo borra), como respuesta a un hallazgo FIM de alta confianza
+(ej: archivo ejecutable en una carpeta de solo-uploads de WordPress).
+
+Protocolo: Wazuh AR framework, JSON por stdin.
+  command=add    -> mueve el archivo a cuarentena, permisos 000
+  command=delete -> restaura el archivo a su ubicacion original
+
+Tesis UBO -- hallazgo H12/H13, contencion de compromiso interno.
+"""
+import json
+import logging
+import os
+import shutil
+import sys
+import time
+
+WAZUH_HOME = os.path.abspath(os.path.join(__file__, "../../.."))
+LOG_FILE = os.path.join(WAZUH_HOME, "logs", "active-responses.log")
+QUARANTINE_DIR = os.path.join(WAZUH_HOME, "quarantine")
+
+# Seguridad: solo se permite poner en cuarentena archivos dentro de estas rutas.
+# Nunca archivos del sistema, aunque alguien intente forzarlo via la API.
+ALLOWED_PREFIXES = [
+    "/var/lib/docker/volumes/web_wp_educasex_data/_data/",
+]
+
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                     format="%(asctime)s quarantine-file: %(message)s")
+
+
+def log(msg):
+    logging.info(msg)
+
+
+def is_allowed(path):
+    real = os.path.realpath(path)
+    return any(real.startswith(prefix) for prefix in ALLOWED_PREFIXES)
+
+
+def quarantine_path_for(original):
+    safe_name = original.replace("/", "_").lstrip("_")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(QUARANTINE_DIR, f"{ts}__{safe_name}")
+
+
+def do_add(file_path):
+    if not file_path:
+        log("ERROR: sin file_path en el payload")
+        return False
+    if not is_allowed(file_path):
+        log(f"RECHAZADO: {file_path} fuera de las rutas permitidas para cuarentena")
+        return False
+    if not os.path.isfile(file_path):
+        log(f"AVISO: {file_path} no existe (¿ya en cuarentena o eliminado?)")
+        return False
+
+    os.makedirs(QUARANTINE_DIR, exist_ok=True)
+    dest = quarantine_path_for(file_path)
+    try:
+        shutil.move(file_path, dest)
+        os.chmod(dest, 0o000)
+        with open(dest + ".origin", "w") as f:
+            f.write(file_path)
+        log(f"CUARENTENA: {file_path} -> {dest} (permisos 000)")
+        return True
+    except Exception as e:
+        log(f"ERROR moviendo a cuarentena {file_path}: {e}")
+        return False
+
+
+def do_delete(file_path):
+    if not file_path:
+        log("ERROR: sin file_path en el payload de restauracion")
+        return False
+    if not is_allowed(file_path):
+        log(f"RECHAZADO: restauracion de {file_path} fuera de rutas permitidas")
+        return False
+    if not os.path.isdir(QUARANTINE_DIR):
+        log(f"AVISO: no hay carpeta de cuarentena, nada que restaurar para {file_path}")
+        return False
+
+    for name in os.listdir(QUARANTINE_DIR):
+        origin_file = os.path.join(QUARANTINE_DIR, name)
+        if not origin_file.endswith(".origin"):
+            continue
+        with open(origin_file) as f:
+            original = f.read().strip()
+        if original == file_path:
+            quarantined_file = origin_file[: -len(".origin")]
+            try:
+                os.chmod(quarantined_file, 0o644)
+                shutil.move(quarantined_file, file_path)
+                os.remove(origin_file)
+                log(f"RESTAURADO: {quarantined_file} -> {file_path}")
+                return True
+            except Exception as e:
+                log(f"ERROR restaurando {file_path}: {e}")
+                return False
+
+    log(f"AVISO: no se encontro version en cuarentena de {file_path}")
+    return False
+
+
+def main():
+    try:
+        raw = sys.stdin.readline()
+        msg = json.loads(raw)
+    except Exception as e:
+        log(f"ERROR leyendo JSON de stdin: {e}")
+        sys.exit(1)
+
+    command = msg.get("command", "")
+    alert_data = msg.get("parameters", {}).get("alert", {}).get("data", {})
+    file_path = alert_data.get("file_path", "")
+
+    log(f"Starting. command={command} file_path={file_path}")
+
+    if command == "add":
+        ok = do_add(file_path)
+    elif command == "delete":
+        ok = do_delete(file_path)
+    else:
+        log(f"ERROR: comando desconocido '{command}'")
+        ok = False
+
+    log("Ended.")
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

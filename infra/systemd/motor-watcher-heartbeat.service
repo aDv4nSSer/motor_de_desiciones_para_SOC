@@ -1,0 +1,11 @@
+[Unit]
+Description=Motor SOC - Chequeo de heartbeat del vigilante FIM
+After=network.target
+
+[Service]
+Type=oneshot
+User=aiayala
+WorkingDirectory=/home/aiayala/tesis/vigilante
+EnvironmentFile=/etc/motor-soc/watcher.env
+EnvironmentFile=/etc/motor-soc/notify.env
+ExecStart=/usr/bin/python3 /home/aiayala/tesis/vigilante/heartbeat_check.py

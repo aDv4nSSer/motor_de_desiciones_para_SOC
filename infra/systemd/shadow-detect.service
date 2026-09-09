@@ -1,0 +1,10 @@
+[Unit]
+Description=Motor SOC - Deteccion experimental DNS/DGA + relay L7 (modo observacion)
+After=network.target
+
+[Service]
+Type=oneshot
+User=aiayala
+WorkingDirectory=/home/aiayala/tesis/vigilante
+EnvironmentFile=/etc/motor-soc/shadow-detect.env
+ExecStart=/usr/bin/python3 /home/aiayala/tesis/vigilante/shadow_detect.py
