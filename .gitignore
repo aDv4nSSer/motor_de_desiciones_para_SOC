@@ -56,4 +56,4 @@ Thumbs.db
 # --- Claude Code: contenido de terceros, no versionar ---
 .claude/skills/
 
-graphify-out/
+# --- Graphify: solo se versiona graph.json + GRAPH_REPORT.md (ver graphify-out/.gitignore) ---

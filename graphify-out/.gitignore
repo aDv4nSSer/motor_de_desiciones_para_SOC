@@ -1,0 +1,6 @@
+# Solo versionamos el grafo y el reporte — son livianos y dan contexto rápido en un pull nuevo.
+# Todo lo demás es regenerable con `graphify update .` (o pesado / de solo-cache local).
+*
+!.gitignore
+!graph.json
+!GRAPH_REPORT.md
