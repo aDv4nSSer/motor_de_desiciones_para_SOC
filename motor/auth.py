@@ -27,7 +27,7 @@ import redis
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from users import Role, User, authenticate, role_at_least
+from users import Role, User, authenticate, get_user_record, role_at_least
 
 log = logging.getLogger("motor.auth")
 
@@ -137,6 +137,18 @@ def get_current_user(
 
     Fail closed en cada caso: sin header -> 401; token expirado/inválido -> 401;
     claim de rol desconocido -> 401 (nunca se asume un rol por defecto).
+
+    Revocación: además de firma y vigencia, se relee el usuario en Redis en
+    cada request. Usuario borrado, deshabilitado o con rol distinto al del
+    token -> 401 (un JWT emitido no sobrevive a una baja ni a un cambio de
+    rol). Si Redis no responde -> 503: no se puede confirmar que el usuario
+    siga activo y no se deja pasar el token. A diferencia de TI/contexto
+    ("unavailable" y la decisión continúa), acá el dato faltante ES el
+    control de acceso — degradar abierto sería otorgar acceso.
+
+    Raises:
+        HTTPException 401 si el token o el usuario no son válidos, 503 si no
+        se pudo verificar el usuario contra Redis.
     """
     if credentials is None:
         raise HTTPException(
@@ -160,7 +172,27 @@ def get_current_user(
     if not username or role not in ("N1", "N2", "CISO"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token con claims inválidos")
 
-    return User(username=username, role=role, created_at="", disabled=False)
+    try:
+        record = get_user_record(username)
+    except redis.RedisError as e:
+        log.error(f"no se pudo verificar el estado del usuario {username!r} en Redis: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo verificar el usuario, reintente",
+        )
+    if record is None or record.disabled or record.role != role:
+        reason = ("inexistente" if record is None
+                  else "deshabilitado" if record.disabled else "rol_cambiado")
+        log_access_event(username, "token_rejected_user_state",
+                          {"reason": reason, "token_role": role})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sesión revocada, inicie sesión nuevamente",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return User(username=record.username, role=record.role,
+                created_at=record.created_at, disabled=record.disabled)
 
 
 def require_role(minimum: Role):
