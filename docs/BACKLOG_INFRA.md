@@ -107,3 +107,31 @@ requiere acceso físico a un switch que no es del proyecto, y no hay tiempo
 de validarlo con seguridad antes de la próxima sesión. No intentar sin
 acceso físico confirmado y ventana de mantenimiento (tocar el switch puede
 afectar tráfico real de producción de `.138`/`.139`/`.140`).
+
+## App FastAPI legacy en la raíz (`main.py` + `api/`) con el schema Golden 11 v4
+
+Detectado 2026-09-30 durante la versión de rutas a `/api/v1` (commit `79e2074`).
+
+En la raíz del repo sigue existiendo una segunda app FastAPI: `main.py` monta
+`api/endpoints/predict.py` (`POST /predict/supervised`, `POST /predict/anomaly`)
+con el schema `api/schemas/prediction.py` de **11 features del Golden Subset
+v4**, el feature set de `model_golden11_v4_latest.pkl`, que tiene DATA LEAKAGE
+documentado y que `.claude/rules/model-contract.md` marca como "NUNCA usar en
+producción". Carga el modelo desde `ML_MODEL_PATH` (default
+`./models/classifier.pkl`).
+
+`motor-soc.service` **no** la levanta (corre `uvicorn main:app` con
+`WorkingDirectory=.../motor`, es decir `motor/main.py`), así que hoy no está
+en el camino de ninguna decisión. Tiene tests propios en
+`tests/unit/test_predict.py`, que se ejecutan en la suite.
+
+**Riesgo:** confusión. Alguien que lea el repo, o que corra `uvicorn main:app`
+desde la raíz, puede terminar sirviendo predicciones con el feature set con
+leakage. Además, sus rutas no están versionadas (`/predict/*`, sin `/api/v1`).
+
+**Propuesta (no implementada):** eliminar `main.py` de la raíz, `api/` y
+`tests/unit/test_predict.py` en un commit `refactor:` propio, después de
+confirmar con Joaquín que ningún notebook o script de reentrenamiento importa
+`api.schemas.prediction`.
+
+**Prioridad:** baja. No es bloqueante porque no está desplegada.
