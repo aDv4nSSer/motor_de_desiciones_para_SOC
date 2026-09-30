@@ -50,7 +50,17 @@ def create_pending_approval(record: ResponseRecord, rdb: redis.Redis) -> dict:
         "resolved_at": None,
     }
     try:
-        rdb.set(f"{APPROVALS_KEY_PREFIX}{record.trace_id}", json.dumps(approval))
+        # NX: si el worker reprocesa el mismo trace_id (reintento, redelivery
+        # del stream) no se pisa el registro existente -- en particular uno
+        # ya aprobado/rechazado, que volvería a quedar "pending".
+        if not rdb.set(f"{APPROVALS_KEY_PREFIX}{record.trace_id}", json.dumps(approval), nx=True):
+            existing = get_approval(record.trace_id, rdb)
+            if existing is None:
+                return approval
+            if existing.get("status") == "pending":
+                # Repara el índice si un intento previo cayó entre set y sadd.
+                rdb.sadd(APPROVALS_INDEX_KEY, record.trace_id)
+            return existing
         rdb.sadd(APPROVALS_INDEX_KEY, record.trace_id)
     except redis.RedisError as e:
         log.error(f"no se pudo registrar aprobacion pendiente {record.trace_id}: {e}")
@@ -90,7 +100,11 @@ def resolve_approval(
     eso lo hace el llamador (main.py) DESPUÉS de esta función, solo si
     decision == "approved", para mantener esta función libre de side effects
     de red (fácil de testear, y consistente con el resto del código de R2)."""
-    approval = get_approval(trace_id, rdb)
+    try:
+        approval = get_approval(trace_id, rdb)
+    except redis.RedisError as e:
+        log.error(f"no se pudo leer aprobacion {trace_id} para resolverla: {e}")
+        return None
     if approval is None:
         return None
     if approval["status"] != "pending":
