@@ -9,12 +9,20 @@ import importlib
 import sys
 from pathlib import Path
 
+import dotenv
 import pytest
 
 MOTOR_PATH = str(Path(__file__).resolve().parents[2] / "motor")
 
 
 def _reload_redis_client(monkeypatch, redis_password: str | None):
+    # redis_client.py llama load_dotenv() al importarse: en un host con
+    # motor/.env real (ej. .140) eso repone REDIS_PASSWORD después del
+    # delenv y el test deja de probar lo que dice. Se neutraliza antes del
+    # import (redis_client hace `from dotenv import load_dotenv`, que lee el
+    # atributo del módulo en ese momento) para que el entorno sea solo el
+    # que arma el test.
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
     if redis_password is None:
         monkeypatch.delenv("REDIS_PASSWORD", raising=False)
     else:
