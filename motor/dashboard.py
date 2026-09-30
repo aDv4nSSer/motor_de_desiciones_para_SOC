@@ -107,8 +107,34 @@ def get_stats(window_minutes: int = 60) -> dict:
 
 
 # ── Últimas decisiones ──────────────────────────────────────────────────────
-def get_recent_decisions(limit: int = 50) -> list[dict]:
-    query = {"size": limit, "sort": [{"timestamp": {"order": "desc"}}]}
+DECISIONS_MAX_LIMIT = 200  # tope por página: ~150k T2+/día hacen inmanejable un listado sin límite
+
+
+def get_recent_decisions(
+    limit: int = 50, tier_min: int = 0, before: datetime | None = None,
+) -> list[dict]:
+    """Últimas decisiones de soc-decisions, más recientes primero.
+
+    Args:
+        limit: tamaño de página (se acota a DECISIONS_MAX_LIMIT).
+        tier_min: solo decisiones con tier >= tier_min (2 = vista de alertas T2+).
+        before: cursor de paginación — solo decisiones con timestamp
+            estrictamente anterior (se pasa el timestamp del último ítem de la
+            página previa). Sin cursor, la página más reciente.
+
+    Returns:
+        Lista de documentos (_source); [] si OpenSearch no responde.
+    """
+    filters: list[dict] = []
+    if tier_min > 0:
+        filters.append({"range": {"tier": {"gte": tier_min}}})
+    if before is not None:
+        filters.append({"range": {"timestamp": {"lt": before.isoformat()}}})
+    query = {
+        "size": min(limit, DECISIONS_MAX_LIMIT),
+        "sort": [{"timestamp": {"order": "desc"}}],
+        "query": {"bool": {"filter": filters}} if filters else {"match_all": {}},
+    }
     result = _os_request("POST", f"/{OS_INDEX}/_search", query)
     if result is None:
         return []

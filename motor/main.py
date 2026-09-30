@@ -19,6 +19,7 @@ from dashboard import (
     _get_redis as get_dashboard_redis,
 )
 from dashboard import (
+    DECISIONS_MAX_LIMIT,
     get_active_blocks,
     get_experimental_detections,
     get_port_stats,
@@ -30,7 +31,7 @@ from dashboard import (
     list_cases,
     update_case_state,
 )
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -281,52 +282,63 @@ async def root():
     }
 
 # ── Dashboard: endpoints de solo lectura ────────────────────────────────────
+# Todos los endpoints de dashboard/auth son `def`, no `async def`, a
+# propósito: hacen IO síncrono (OpenSearch vía urllib con timeout 5s, Redis
+# síncrono, bcrypt). Dentro de `async def` ese IO bloquearía el único event
+# loop de uvicorn — el mismo que atiende /decide (Fast Path <100ms). Como
+# `def`, FastAPI los corre en su threadpool. Lo verifica
+# tests/unit/test_dashboard_endpoints.py.
 @app.get("/api/v1/dashboard/stats")
-async def dashboard_stats(window_minutes: int = 60, user: User = Depends(get_current_user)):
+def dashboard_stats(window_minutes: int = 60, user: User = Depends(get_current_user)):
     return get_stats(window_minutes)
 
 @app.get("/api/v1/dashboard/decisions")
-async def dashboard_decisions(limit: int = 50, user: User = Depends(get_current_user)):
-    return get_recent_decisions(min(limit, 200))
+def dashboard_decisions(
+    limit: int = Query(50, ge=1, le=DECISIONS_MAX_LIMIT),
+    tier_min: int = Query(0, ge=0, le=3),
+    before: datetime | None = Query(None, description="Cursor: timestamp del último ítem de la página previa"),
+    user: User = Depends(get_current_user),
+):
+    return get_recent_decisions(limit, tier_min=tier_min, before=before)
 
 @app.get("/api/v1/dashboard/blocks/active")
-async def dashboard_blocks_active(user: User = Depends(get_current_user)):
+def dashboard_blocks_active(user: User = Depends(get_current_user)):
     return get_active_blocks()
 
 @app.get("/api/v1/dashboard/blocks/recent")
-async def dashboard_blocks_recent(limit: int = 50, user: User = Depends(get_current_user)):
+def dashboard_blocks_recent(limit: int = 50, user: User = Depends(get_current_user)):
     return get_recent_responses(min(limit, 200))
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(user: User = Depends(get_current_user)):
+def dashboard_page(user: User = Depends(get_current_user)):
     with open("dashboard.html", encoding="utf-8") as f:
         return f.read()
 
 @app.get("/api/v1/dashboard/ports")
-async def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: User = Depends(get_current_user)):
+def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: User = Depends(get_current_user)):
     return get_port_stats(window_minutes, top_n)
 
 @app.get("/api/v1/dashboard/precision")
-async def dashboard_precision(window_minutes: int = 60, user: User = Depends(get_current_user)):
+def dashboard_precision(window_minutes: int = 60, user: User = Depends(get_current_user)):
     return get_precision_stats(window_minutes)
 
 @app.get("/api/v1/dashboard/watcher-heartbeat")
-async def dashboard_watcher_heartbeat(user: User = Depends(get_current_user)):
+def dashboard_watcher_heartbeat(user: User = Depends(get_current_user)):
     return get_watcher_heartbeat()
 
 @app.get("/api/v1/dashboard/experimental")
-async def dashboard_experimental(limit: int = 20, user: User = Depends(get_current_user)):
+def dashboard_experimental(limit: int = 20, user: User = Depends(get_current_user)):
     return get_experimental_detections(limit)
 
 
 # ── Casos (requieren autenticacion) ──────────────────────────────────────
 @app.get("/api/v1/dashboard/cases")
-async def dashboard_cases(only_open: bool = False, limit: int = 50, user: User = Depends(get_current_user)):
+def dashboard_cases(only_open: bool = False, limit: int = 50, user: User = Depends(get_current_user)):
     return list_cases(only_open=only_open, limit=limit)
 
 
 @app.post("/api/v1/dashboard/cases/{case_id}/state")
-async def dashboard_update_case(
+def dashboard_update_case(
     case_id: str,
     payload: dict,
     user: User = Depends(get_current_user),
@@ -355,7 +367,7 @@ class LoginResponse(BaseModel):
 
 
 @app.post("/api/v1/auth/login", response_model=LoginResponse)
-async def auth_login_endpoint(payload: LoginRequest):
+def auth_login_endpoint(payload: LoginRequest):
     """Login del dashboard. Devuelve un JWT con el rol embebido (N1/N2/CISO).
 
     No hay endpoint de registro a propósito — los usuarios se crean con
@@ -368,7 +380,7 @@ async def auth_login_endpoint(payload: LoginRequest):
 
 
 @app.get("/api/v1/auth/me")
-async def auth_me(user: User = Depends(get_current_user)):
+def auth_me(user: User = Depends(get_current_user)):
     return {"username": user.username, "role": user.role}
 
 
@@ -380,7 +392,7 @@ async def auth_me(user: User = Depends(get_current_user)):
 # insuficiente; cuarentena de host quedará en "N2"/"CISO" cuando el
 # pendiente #3 de Wazuh esté integrado).
 @app.get("/api/v1/dashboard/approvals")
-async def dashboard_approvals(user: User = Depends(get_current_user)):
+def dashboard_approvals(user: User = Depends(get_current_user)):
     rdb = get_dashboard_redis()
     return list_pending_approvals(rdb)
 
@@ -391,7 +403,7 @@ class ApprovalDecision(BaseModel):
 
 
 @app.post("/api/v1/dashboard/approvals/{trace_id}/resolve")
-async def dashboard_resolve_approval(
+def dashboard_resolve_approval(
     trace_id: str, payload: ApprovalDecision, user: User = Depends(get_current_user),
 ):
     rdb = get_dashboard_redis()
@@ -457,7 +469,7 @@ async def dashboard_resolve_approval(
 
 # ── Cumplimiento / CISO (pendiente #10 — backend inicial, dashboard visual pendiente) ──
 @app.get("/api/v1/dashboard/compliance")
-async def dashboard_compliance(window_minutes: int = 1440, user: User = Depends(require_ciso)):
+def dashboard_compliance(window_minutes: int = 1440, user: User = Depends(require_ciso)):
     """Métricas de valor para CISO (sección 7 de la especificación, Fase 1:
     fatiga de alertas + MTTD/MTTR). Reutiliza get_stats/get_precision_stats
     ya existentes -- no se inventa ninguna cifra nueva."""
