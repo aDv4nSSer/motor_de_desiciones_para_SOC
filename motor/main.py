@@ -401,8 +401,14 @@ async def dashboard_resolve_approval(
     if approval["status"] != "pending":
         raise HTTPException(status_code=409, detail=f"Ya resuelta ({approval['status']})")
 
-    required_level = approval.get("approval_level", "N1")
-    if ROLE_LEVEL.get(user.role, 0) < ROLE_LEVEL.get(required_level, 1):
+    # Fail closed: un approval_level vacío, ausente o desconocido (ej.
+    # BlockResult.approval_level default "", o un typo "n2") exige CISO —
+    # nunca se degrada a N1. Si no, cualquier productor que olvide setear el
+    # nivel dejaría a un N1 aprobar una acción de alto impacto.
+    required_level = approval.get("approval_level")
+    if required_level not in ROLE_LEVEL:
+        required_level = "CISO"
+    if ROLE_LEVEL.get(user.role, 0) < ROLE_LEVEL[required_level]:
         log_access_event(user.username, "approval_denied_role",
                           {"trace_id": trace_id, "required": required_level, "actual": user.role})
         raise HTTPException(
