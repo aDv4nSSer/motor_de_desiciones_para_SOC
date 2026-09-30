@@ -543,7 +543,7 @@ async function handleCaseAction(caseId, newState, btn) {
   const original = btn.textContent;
   btn.textContent = '···';
   try {
-    await fetchJSON(`/api/dashboard/cases/${caseId}/state`, {
+    await fetchJSON(`/api/v1/dashboard/cases/${caseId}/state`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ state: newState, note: notes[newState] || '' }),
@@ -757,16 +757,16 @@ async function refresh() {
   const windowMin = Number($('windowSelect').value);
   try {
     const [stats, decisions, blocks, responses, ports, openCases, listedCases, precision, watcherHeartbeat, experimental] = await Promise.all([
-      fetchJSON(`/api/dashboard/stats?window_minutes=${windowMin}`),
-      fetchJSON(`/api/dashboard/decisions?limit=100`),
-      fetchJSON(`/api/dashboard/blocks/active`),
-      fetchJSON(`/api/dashboard/blocks/recent?limit=50`),
-      fetchJSON(`/api/dashboard/ports?window_minutes=${windowMin}&top_n=15`),
-      fetchJSON(`/api/dashboard/cases?only_open=true&limit=100`),
-      fetchJSON(`/api/dashboard/cases?only_open=${caseFilter === 'open'}&limit=50`),
-      fetchJSON(`/api/dashboard/precision?window_minutes=${windowMin}`),
-      fetchJSON(`/api/dashboard/watcher-heartbeat`),
-      fetchJSON(`/api/dashboard/experimental?limit=20`),
+      fetchJSON(`/api/v1/dashboard/stats?window_minutes=${windowMin}`),
+      fetchJSON(`/api/v1/dashboard/decisions?limit=100`),
+      fetchJSON(`/api/v1/dashboard/blocks/active`),
+      fetchJSON(`/api/v1/dashboard/blocks/recent?limit=50`),
+      fetchJSON(`/api/v1/dashboard/ports?window_minutes=${windowMin}&top_n=15`),
+      fetchJSON(`/api/v1/dashboard/cases?only_open=true&limit=100`),
+      fetchJSON(`/api/v1/dashboard/cases?only_open=${caseFilter === 'open'}&limit=50`),
+      fetchJSON(`/api/v1/dashboard/precision?window_minutes=${windowMin}`),
+      fetchJSON(`/api/v1/dashboard/watcher-heartbeat`),
+      fetchJSON(`/api/v1/dashboard/experimental?limit=20`),
     ]);
 
     lastSuccessAt = new Date();

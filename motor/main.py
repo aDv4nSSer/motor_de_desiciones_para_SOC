@@ -223,7 +223,10 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
     return response
 
 # ── Endpoint principal ─────────────────────────────────────────────────────────
-@app.post("/decide")
+@app.post("/api/v1/decide")
+# Alias sin versionar: Vector en .139 todavía postea a /decide. Se mantiene
+# hasta redesplegar Vector con la URL nueva; retirar después.
+@app.post("/decide", include_in_schema=False, deprecated=True)
 async def decide(request: Request):
     """
     Fast Path (<100ms): acepta un evento único o array de eventos de Vector.
@@ -274,23 +277,23 @@ async def root():
     return {
         "service": "Motor de Decisiones SOC",
         "version": "0.2.0",
-        "endpoints": {"POST /decide": "Clasificar flow", "GET /health": "Estado"}
+        "endpoints": {"POST /api/v1/decide": "Clasificar flow", "GET /health": "Estado"}
     }
 
 # ── Dashboard: endpoints de solo lectura ────────────────────────────────────
-@app.get("/api/dashboard/stats")
+@app.get("/api/v1/dashboard/stats")
 async def dashboard_stats(window_minutes: int = 60, user: User = Depends(get_current_user)):
     return get_stats(window_minutes)
 
-@app.get("/api/dashboard/decisions")
+@app.get("/api/v1/dashboard/decisions")
 async def dashboard_decisions(limit: int = 50, user: User = Depends(get_current_user)):
     return get_recent_decisions(min(limit, 200))
 
-@app.get("/api/dashboard/blocks/active")
+@app.get("/api/v1/dashboard/blocks/active")
 async def dashboard_blocks_active(user: User = Depends(get_current_user)):
     return get_active_blocks()
 
-@app.get("/api/dashboard/blocks/recent")
+@app.get("/api/v1/dashboard/blocks/recent")
 async def dashboard_blocks_recent(limit: int = 50, user: User = Depends(get_current_user)):
     return get_recent_responses(min(limit, 200))
 
@@ -299,30 +302,30 @@ async def dashboard_page(user: User = Depends(get_current_user)):
     with open("dashboard.html", encoding="utf-8") as f:
         return f.read()
 
-@app.get("/api/dashboard/ports")
+@app.get("/api/v1/dashboard/ports")
 async def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: User = Depends(get_current_user)):
     return get_port_stats(window_minutes, top_n)
 
-@app.get("/api/dashboard/precision")
+@app.get("/api/v1/dashboard/precision")
 async def dashboard_precision(window_minutes: int = 60, user: User = Depends(get_current_user)):
     return get_precision_stats(window_minutes)
 
-@app.get("/api/dashboard/watcher-heartbeat")
+@app.get("/api/v1/dashboard/watcher-heartbeat")
 async def dashboard_watcher_heartbeat(user: User = Depends(get_current_user)):
     return get_watcher_heartbeat()
 
-@app.get("/api/dashboard/experimental")
+@app.get("/api/v1/dashboard/experimental")
 async def dashboard_experimental(limit: int = 20, user: User = Depends(get_current_user)):
     return get_experimental_detections(limit)
 
 
 # ── Casos (requieren autenticacion) ──────────────────────────────────────
-@app.get("/api/dashboard/cases")
+@app.get("/api/v1/dashboard/cases")
 async def dashboard_cases(only_open: bool = False, limit: int = 50, user: User = Depends(get_current_user)):
     return list_cases(only_open=only_open, limit=limit)
 
 
-@app.post("/api/dashboard/cases/{case_id}/state")
+@app.post("/api/v1/dashboard/cases/{case_id}/state")
 async def dashboard_update_case(
     case_id: str,
     payload: dict,
@@ -351,7 +354,7 @@ class LoginResponse(BaseModel):
     role: str
 
 
-@app.post("/api/auth/login", response_model=LoginResponse)
+@app.post("/api/v1/auth/login", response_model=LoginResponse)
 async def auth_login_endpoint(payload: LoginRequest):
     """Login del dashboard. Devuelve un JWT con el rol embebido (N1/N2/CISO).
 
@@ -364,7 +367,7 @@ async def auth_login_endpoint(payload: LoginRequest):
     return LoginResponse(access_token=token, role=record.role if record else "N1")
 
 
-@app.get("/api/auth/me")
+@app.get("/api/v1/auth/me")
 async def auth_me(user: User = Depends(get_current_user)):
     return {"username": user.username, "role": user.role}
 
@@ -376,7 +379,7 @@ async def auth_me(user: User = Depends(get_current_user)):
 # propio registro (hoy siempre "N1" — bloqueos de red con corroboración
 # insuficiente; cuarentena de host quedará en "N2"/"CISO" cuando el
 # pendiente #3 de Wazuh esté integrado).
-@app.get("/api/dashboard/approvals")
+@app.get("/api/v1/dashboard/approvals")
 async def dashboard_approvals(user: User = Depends(get_current_user)):
     rdb = get_dashboard_redis()
     return list_pending_approvals(rdb)
@@ -387,7 +390,7 @@ class ApprovalDecision(BaseModel):
     note: str = ""
 
 
-@app.post("/api/dashboard/approvals/{trace_id}/resolve")
+@app.post("/api/v1/dashboard/approvals/{trace_id}/resolve")
 async def dashboard_resolve_approval(
     trace_id: str, payload: ApprovalDecision, user: User = Depends(get_current_user),
 ):
@@ -447,7 +450,7 @@ async def dashboard_resolve_approval(
 
 
 # ── Cumplimiento / CISO (pendiente #10 — backend inicial, dashboard visual pendiente) ──
-@app.get("/api/dashboard/compliance")
+@app.get("/api/v1/dashboard/compliance")
 async def dashboard_compliance(window_minutes: int = 1440, user: User = Depends(require_ciso)):
     """Métricas de valor para CISO (sección 7 de la especificación, Fase 1:
     fatiga de alertas + MTTD/MTTR). Reutiliza get_stats/get_precision_stats

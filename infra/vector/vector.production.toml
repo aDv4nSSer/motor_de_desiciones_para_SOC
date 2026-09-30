@@ -138,7 +138,7 @@ encoding.codec = "json"
 [sinks.motor_soc]
 type = "http"
 inputs = ["parse_eve"]
-uri = "http://200.54.12.140:8000/decide"
+uri = "http://200.54.12.140:8000/api/v1/decide"
 method = "post"
 encoding.codec = "json"
 request.timeout_secs = 2

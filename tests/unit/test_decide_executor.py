@@ -39,7 +39,7 @@ PAYLOAD = {
 class TestDecideSingleEvent:
     def test_single_event_returns_decision_object(self, monkeypatch) -> None:
         client, _ = _client(monkeypatch)
-        resp = client.post("/decide", json=PAYLOAD)
+        resp = client.post("/api/v1/decide", json=PAYLOAD)
         assert resp.status_code == 200
         body = resp.json()
         assert "tier" in body and "trace_id" in body and "decision" in body
@@ -48,7 +48,7 @@ class TestDecideSingleEvent:
 class TestDecideBatch:
     def test_batch_returns_list_same_length(self, monkeypatch) -> None:
         client, _ = _client(monkeypatch)
-        resp = client.post("/decide", json=[PAYLOAD, PAYLOAD, PAYLOAD])
+        resp = client.post("/api/v1/decide", json=[PAYLOAD, PAYLOAD, PAYLOAD])
         assert resp.status_code == 200
         body = resp.json()
         assert isinstance(body, list)
@@ -62,7 +62,7 @@ class TestDecideMalformedInput:
     def test_invalid_json_returns_400(self, monkeypatch) -> None:
         client, _ = _client(monkeypatch)
         resp = client.post(
-            "/decide", content=b"{not valid json",
+            "/api/v1/decide", content=b"{not valid json",
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
@@ -84,10 +84,32 @@ class TestDecideUsesExecutor:
             return original(*args, **kwargs)
 
         monkeypatch.setattr(main, "process_event", wrapped)
-        resp = client.post("/decide", json=PAYLOAD)
+        resp = client.post("/api/v1/decide", json=PAYLOAD)
         assert resp.status_code == 200
         assert len(calling_threads) == 1
         assert calling_threads[0] is not threading.main_thread(), (
             "process_event debe correr en un worker thread del executor, "
             "no en el hilo principal del event loop"
         )
+
+
+class TestApiVersioning:
+    def test_legacy_decide_alias_still_serves_vector(self, monkeypatch) -> None:
+        """Vector en .139 postea a /decide hasta que se redespliegue con
+        /api/v1/decide — el alias no debe romper el Fast Path mientras tanto."""
+        client, _ = _client(monkeypatch)
+        resp = client.post("/decide", json=PAYLOAD)
+        assert resp.status_code == 200
+        assert "tier" in resp.json()
+
+    def test_every_api_route_is_versioned(self, monkeypatch) -> None:
+        """CLAUDE.md: URLs versionadas /api/v1/... en todos los endpoints
+        sin excepción. Fuera de /api/ solo quedan health, raíz, la página
+        HTML del dashboard y el alias temporal de /decide."""
+        _, main = _client(monkeypatch)
+        allowed_unversioned = {"/health", "/", "/dashboard", "/decide"}
+        paths = {r.path for r in main.app.routes if hasattr(r, "methods")}
+        paths -= {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+        offenders = sorted(p for p in paths
+                           if not p.startswith("/api/v1/") and p not in allowed_unversioned)
+        assert offenders == []
