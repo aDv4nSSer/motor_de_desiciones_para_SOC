@@ -3,25 +3,47 @@ main.py — Motor de Decisiones SOC v2
 FastAPI: recibe flows de Vector (single o batch), clasifica con ML, publica a Redis.
 Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
-import asyncio, uuid, logging, time
+import asyncio
+import json
+import logging
 import multiprocessing
+import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from schemas import FlowFeatures, DecisionResponse, RiskTier
+from auth import get_current_user, log_access_event, require_ciso
+from auth import login as auth_login
+from dashboard import (
+    _get_redis as get_dashboard_redis,
+)
+from dashboard import (
+    get_active_blocks,
+    get_experimental_detections,
+    get_port_stats,
+    get_precision_stats,
+    get_recent_decisions,
+    get_recent_responses,
+    get_stats,
+    get_watcher_heartbeat,
+    list_cases,
+    update_case_state,
+)
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+
 # H36: "from model import get_model" NO va a nivel de módulo a propósito —
 # ver _init_score_worker() más abajo para el porqué (contención de joblib/
 # sklearn con nuestro propio ProcessPoolExecutor, encontrada en FASE 2).
 from redis_client import publish_decision, publish_flow
+from response.approvals import get_approval, list_pending_approvals, resolve_approval
+from response.config import get_settings as get_response_settings
+from response.enforcer import build_enforcer
 from response.queue import enqueue_response_task
-from dashboard import (
-    get_stats, get_recent_decisions, get_active_blocks, get_recent_responses,
-    get_port_stats, list_cases, update_case_state,
-    get_precision_stats, get_watcher_heartbeat, get_experimental_detections,
-)
-from auth import verify_credentials
+from schemas import FlowFeatures
+from users import ROLE_LEVEL, User, get_user_record
 
 logging.basicConfig(
     level=logging.INFO,
@@ -257,46 +279,46 @@ async def root():
 
 # ── Dashboard: endpoints de solo lectura ────────────────────────────────────
 @app.get("/api/dashboard/stats")
-async def dashboard_stats(window_minutes: int = 60, user: str = Depends(verify_credentials)):
+async def dashboard_stats(window_minutes: int = 60, user: User = Depends(get_current_user)):
     return get_stats(window_minutes)
 
 @app.get("/api/dashboard/decisions")
-async def dashboard_decisions(limit: int = 50, user: str = Depends(verify_credentials)):
+async def dashboard_decisions(limit: int = 50, user: User = Depends(get_current_user)):
     return get_recent_decisions(min(limit, 200))
 
 @app.get("/api/dashboard/blocks/active")
-async def dashboard_blocks_active(user: str = Depends(verify_credentials)):
+async def dashboard_blocks_active(user: User = Depends(get_current_user)):
     return get_active_blocks()
 
 @app.get("/api/dashboard/blocks/recent")
-async def dashboard_blocks_recent(limit: int = 50, user: str = Depends(verify_credentials)):
+async def dashboard_blocks_recent(limit: int = 50, user: User = Depends(get_current_user)):
     return get_recent_responses(min(limit, 200))
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(user: str = Depends(verify_credentials)):
+async def dashboard_page(user: User = Depends(get_current_user)):
     with open("dashboard.html", encoding="utf-8") as f:
         return f.read()
 
 @app.get("/api/dashboard/ports")
-async def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: str = Depends(verify_credentials)):
+async def dashboard_ports(window_minutes: int = 60, top_n: int = 15, user: User = Depends(get_current_user)):
     return get_port_stats(window_minutes, top_n)
 
 @app.get("/api/dashboard/precision")
-async def dashboard_precision(window_minutes: int = 60, user: str = Depends(verify_credentials)):
+async def dashboard_precision(window_minutes: int = 60, user: User = Depends(get_current_user)):
     return get_precision_stats(window_minutes)
 
 @app.get("/api/dashboard/watcher-heartbeat")
-async def dashboard_watcher_heartbeat(user: str = Depends(verify_credentials)):
+async def dashboard_watcher_heartbeat(user: User = Depends(get_current_user)):
     return get_watcher_heartbeat()
 
 @app.get("/api/dashboard/experimental")
-async def dashboard_experimental(limit: int = 20, user: str = Depends(verify_credentials)):
+async def dashboard_experimental(limit: int = 20, user: User = Depends(get_current_user)):
     return get_experimental_detections(limit)
 
 
 # ── Casos (requieren autenticacion) ──────────────────────────────────────
 @app.get("/api/dashboard/cases")
-async def dashboard_cases(only_open: bool = False, limit: int = 50, user: str = Depends(verify_credentials)):
+async def dashboard_cases(only_open: bool = False, limit: int = 50, user: User = Depends(get_current_user)):
     return list_cases(only_open=only_open, limit=limit)
 
 
@@ -304,14 +326,142 @@ async def dashboard_cases(only_open: bool = False, limit: int = 50, user: str = 
 async def dashboard_update_case(
     case_id: str,
     payload: dict,
-    user: str = Depends(verify_credentials),
+    user: User = Depends(get_current_user),
 ):
     new_state = payload.get("state", "")
     note = payload.get("note", "")
     try:
-        case = update_case_state(case_id, new_state, note, actor=user)
+        case = update_case_state(case_id, new_state, note, actor=user.username)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if case is None:
         raise HTTPException(status_code=404, detail="Caso no encontrado")
     return case
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str
+
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+async def auth_login_endpoint(payload: LoginRequest):
+    """Login del dashboard. Devuelve un JWT con el rol embebido (N1/N2/CISO).
+
+    No hay endpoint de registro a propósito — los usuarios se crean con
+    scripts/manage_users.py, corrido directamente en `.140`.
+    """
+    token = auth_login(payload.username, payload.password)
+    # auth_login ya audita login_success/login_failed y lanza 401 si falla.
+    record = get_user_record(payload.username)
+    return LoginResponse(access_token=token, role=record.role if record else "N1")
+
+
+@app.get("/api/auth/me")
+async def auth_me(user: User = Depends(get_current_user)):
+    return {"username": user.username, "role": user.role}
+
+
+# ── Aprobaciones humanas (accion_recomendada con requires_approval=True) ──
+# Panel de aprobación del dashboard Operativo (pendiente #9 de la
+# especificación). Cualquier operador autenticado (N1+) puede VER la cola;
+# resolver una aprobación puntual exige el approval_level que trae el
+# propio registro (hoy siempre "N1" — bloqueos de red con corroboración
+# insuficiente; cuarentena de host quedará en "N2"/"CISO" cuando el
+# pendiente #3 de Wazuh esté integrado).
+@app.get("/api/dashboard/approvals")
+async def dashboard_approvals(user: User = Depends(get_current_user)):
+    rdb = get_dashboard_redis()
+    return list_pending_approvals(rdb)
+
+
+class ApprovalDecision(BaseModel):
+    decision: str  # "approved" | "rejected"
+    note: str = ""
+
+
+@app.post("/api/dashboard/approvals/{trace_id}/resolve")
+async def dashboard_resolve_approval(
+    trace_id: str, payload: ApprovalDecision, user: User = Depends(get_current_user),
+):
+    rdb = get_dashboard_redis()
+    approval = get_approval(trace_id, rdb)
+    if approval is None:
+        raise HTTPException(status_code=404, detail="Aprobación no encontrada")
+    if approval["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"Ya resuelta ({approval['status']})")
+
+    required_level = approval.get("approval_level", "N1")
+    if ROLE_LEVEL.get(user.role, 0) < ROLE_LEVEL.get(required_level, 1):
+        log_access_event(user.username, "approval_denied_role",
+                          {"trace_id": trace_id, "required": required_level, "actual": user.role})
+        raise HTTPException(
+            status_code=403,
+            detail=f"Esta aprobación requiere rol {required_level} o superior",
+        )
+
+    if payload.decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision debe ser 'approved' o 'rejected'")
+
+    resolved = resolve_approval(trace_id, user.username, payload.decision, rdb)
+    if resolved is None:
+        raise HTTPException(status_code=500, detail="No se pudo resolver la aprobación")
+
+    if payload.decision == "approved":
+        # Ejecuta AHORA el bloqueo que R2 había dejado pendiente. Se emite un
+        # registro de auditoría NUEVO (no se edita el original en
+        # soc:response:audit -- ese stream es solo de escritura) para que
+        # quede trazado quién aprobó y con qué rol.
+        settings = get_response_settings()
+        enforcer = build_enforcer(settings)
+        enforced, error = enforcer.block(approval["src_ip"], settings.block_ttl_seconds)
+        try:
+            audit_payload = {
+                "trace_id": trace_id,
+                "manual_approval": True,
+                "approved_by": user.username,
+                "approver_role": user.role,
+                "src_ip": approval["src_ip"],
+                "enforced": enforced,
+                "error": error,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            rdb.xadd("soc:response:audit", {"data": json.dumps(audit_payload)},
+                     maxlen=100_000, approximate=True)
+        except Exception as e:  # noqa: BLE001 — auditar nunca debe tumbar la respuesta al operador
+            log.error(f"no se pudo auditar aprobacion manual de {trace_id}: {e}")
+        log_access_event(user.username, "approval_granted",
+                          {"trace_id": trace_id, "src_ip": approval["src_ip"], "enforced": enforced})
+        resolved["enforced"] = enforced
+    else:
+        log_access_event(user.username, "approval_rejected", {"trace_id": trace_id})
+
+    return resolved
+
+
+# ── Cumplimiento / CISO (pendiente #10 — backend inicial, dashboard visual pendiente) ──
+@app.get("/api/dashboard/compliance")
+async def dashboard_compliance(window_minutes: int = 1440, user: User = Depends(require_ciso)):
+    """Métricas de valor para CISO (sección 7 de la especificación, Fase 1:
+    fatiga de alertas + MTTD/MTTR). Reutiliza get_stats/get_precision_stats
+    ya existentes -- no se inventa ninguna cifra nueva."""
+    stats = get_stats(window_minutes)
+    precision = get_precision_stats(window_minutes)
+    total = stats.get("total_decisiones") or 0
+    por_decision = stats.get("por_decision", {})
+    auto_resuelto = sum(v for k, v in por_decision.items() if k in ("ALLOW", "LOG"))
+    fatiga_pct = round(100 * auto_resuelto / total, 1) if total else None
+    return {
+        "window_minutes": window_minutes,
+        "fatiga_alertas_pct": fatiga_pct,
+        "latencia_avg_ms": stats.get("latencia_avg_ms"),
+        "latencia_p95_ms": stats.get("latencia_p95_ms"),
+        "precision_bloqueos": precision,
+    }

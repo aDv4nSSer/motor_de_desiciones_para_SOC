@@ -7,7 +7,7 @@ que producen R1 (enriquecimiento pasivo) y R2 (acción activa).
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -34,8 +34,8 @@ class ResponseTask(BaseModel):
     trace_id: str
     tier: int
     risk_score: float
-    src_ip: Optional[str] = None
-    dst_ip: Optional[str] = None
+    src_ip: str | None = None
+    dst_ip: str | None = None
     dst_port: int = Field(default=0, alias="L4_DST_PORT")
     classtype: str = ""
     classtype_override: bool = False
@@ -46,13 +46,13 @@ class ResponseTask(BaseModel):
 
 class EnrichmentResult(BaseModel):
     """Resultado de R1 — enriquecimiento pasivo de un evento."""
-    src_ip: Optional[str] = None
-    reverse_dns: Optional[str] = None
-    abuseipdb_score: Optional[int] = None        # 0-100, confidence of abuse
-    abuseipdb_total_reports: Optional[int] = None
-    abuseipdb_country: Optional[str] = None
+    src_ip: str | None = None
+    reverse_dns: str | None = None
+    abuseipdb_score: int | None = None        # 0-100, confidence of abuse
+    abuseipdb_total_reports: int | None = None
+    abuseipdb_country: str | None = None
     abuseipdb_available: bool = True             # False si la API falló / no configurada
-    otx_pulse_count: Optional[int] = None        # reportes de amenaza comunitarios (OTX pulses)
+    otx_pulse_count: int | None = None        # reportes de amenaza comunitarios (OTX pulses)
     otx_available: bool = True                   # False si la API falló / no configurada
     cached: bool = False
     notes: list[str] = Field(default_factory=list)
@@ -67,8 +67,8 @@ class EnrichmentResult(BaseModel):
     # soc-decisions para acumular evidencia; revisar en ~5-7 días (ver
     # PLAN_SPRINTS.md) si se integra de lleno al gate, y con qué peso.
     crowdsec_observado: bool = False
-    crowdsec_scenario: Optional[str] = None
-    crowdsec_duration: Optional[str] = None
+    crowdsec_scenario: str | None = None
+    crowdsec_duration: str | None = None
 
 
 class CrowdSecDecision(BaseModel):
@@ -83,22 +83,40 @@ class CrowdSecDecision(BaseModel):
     scenario: str = ""
     duration: str = ""
     decision_type: str = ""   # "ban", "captcha", etc. (campo "type" de CrowdSec)
-    origin: Optional[str] = None
+    origin: str | None = None
 
 
 class BlockResult(BaseModel):
     """Resultado de R2 — intento de bloqueo de una IP."""
-    src_ip: Optional[str] = None
+    src_ip: str | None = None
     action: ActionType = ActionType.NOOP
     enforced: bool = False        # True solo si efectivamente se bloqueó
     ttl_seconds: int = 0
     reason: str = ""              # por qué se bloqueó o por qué se omitió
     enforcer: str = ""            # qué backend ejecutó (wazuh_api / dry_run)
-    error: Optional[str] = None
+    error: str | None = None
     # Poblado solo cuando action == BLOCK_PENDING_APPROVAL (tabla sección 4
     # de la especificación: score alto con corroboración insuficiente).
     requires_approval: bool = False
     approval_level: str = ""      # "N1" | "N2" | "CISO" — nivel mínimo requerido
+
+
+#: `accion_recomendada` — strings exactos que usa el dashboard/reporting,
+#: mapeados 1:1 a los renglones de ORIGEN RED de la tabla en la sección 4 de
+#: docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md. Los renglones de origen
+#: HOST (FIM crítico, escalamiento de privilegios -> cuarentena) NO están
+#: representados acá todavía: ResponseTask no lleva ningún campo de origen
+#: porque el pendiente #3 (consulta a eventos de Wazuh por host) no está
+#: integrado — no hay ningún evento real que hoy llegue por esa vía. Agregar
+#: ese renglón sin la señal real detrás sería fabricar una acción sobre datos
+#: que no existen. Mismo criterio para "rate_limiting": la tabla lo reserva
+#: para "ataque volumétrico sostenido", y hoy no se calcula ninguna señal de
+#: sostenido en el tiempo (todo el scoring es por-flujo) — se deja fuera
+#: deliberadamente hasta diseñar esa señal con evidencia, no a las apuradas.
+ACCION_NINGUNA = "ninguna"
+ACCION_ALERTAR_CREAR_CASO = "alertar_crear_caso"
+ACCION_BLOQUEO_IP = "bloqueo_ip"
+ACCION_ALERTAR_PENDIENTE_APROBACION = "alertar_pendiente_aprobacion"
 
 
 class ResponseRecord(BaseModel):
@@ -106,11 +124,19 @@ class ResponseRecord(BaseModel):
     trace_id: str
     tier: int
     risk_score: float
-    src_ip: Optional[str] = None
-    dst_ip: Optional[str] = None
+    src_ip: str | None = None
+    dst_ip: str | None = None
     dst_port: int = 0
-    enrichment: Optional[EnrichmentResult] = None
-    block: Optional[BlockResult] = None
+    enrichment: EnrichmentResult | None = None
+    block: BlockResult | None = None
+    # Acción recomendada según tabla sección 4 de la especificación —
+    # ver constantes ACCION_* arriba. "" si el evento no llegó a evaluarse
+    # (tier < r1_min_tier, no pasa por el worker de respuesta en absoluto).
+    accion_recomendada: str = ""
+    # Poblado cuando accion_recomendada == ACCION_ALERTAR_CREAR_CASO —
+    # referencia al caso abierto en soc:cases: (mismo esquema que
+    # vigilante/cases.py, ver response/cases.py).
+    case_id: str | None = None
     processed_at: float = 0.0
     worker: str = "response_worker"
 

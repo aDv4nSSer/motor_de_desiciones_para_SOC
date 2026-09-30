@@ -10,6 +10,10 @@ requests>=2.31.0
 lightgbm>=4.0.0
 python-dotenv>=1.0.0  # opensearch_indexer.py, dashboard.py, shadow_detect.py, redis_client.py -- load_dotenv()
 
+# Auth dashboard (JWT + roles, ver motor/auth.py y motor/users.py)
+pyjwt>=2.8.0
+bcrypt>=4.1.0
+
 # Vigilante (corre en .139, mismo requirements por consistencia)
 # redis y requests ya cubiertos arriba
 tldextract>=5.1.0  # shadow_detect.py -- Public Suffix List real, sin llamadas de red en runtime

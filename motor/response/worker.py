@@ -20,11 +20,21 @@ import logging
 import time
 
 import redis
-
+from response.approvals import create_pending_approval
+from response.cases import open_case
 from response.config import get_settings
 from response.enforcer import build_enforcer, respond_block
 from response.enrichment import enrich
-from response.schemas import ActionType, BlockResult, ResponseRecord, ResponseTask
+from response.schemas import (
+    ACCION_ALERTAR_CREAR_CASO,
+    ACCION_ALERTAR_PENDIENTE_APROBACION,
+    ACCION_BLOQUEO_IP,
+    ACCION_NINGUNA,
+    ActionType,
+    BlockResult,
+    ResponseRecord,
+    ResponseTask,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,12 +73,44 @@ def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
             f"cached={e.cached} avail={e.abuseipdb_available}"
         )
 
+    # ── T2: alertar + crear caso automático (tabla sección 4, origen Red) ──
+    # Solo T2 exacto -- T3 tiene su propia rama abajo, T0/T1 no generan
+    # ningún caso (accion_recomendada queda en su default "" -> ACCION_NINGUNA
+    # se asigna explícitamente para que el dashboard no tenga que inferirlo).
+    if task.tier == 2:
+        record.accion_recomendada = ACCION_ALERTAR_CREAR_CASO
+        case = open_case(
+            kind="network_t2_unconfirmed",
+            host=task.src_ip or "desconocido",
+            detail={
+                "trace_id": task.trace_id,
+                "risk_score": task.risk_score,
+                "dst_port": task.dst_port,
+                "classtype": task.classtype,
+                "corroboration_count": (
+                    record.enrichment.corroboration_count if record.enrichment else 0
+                ),
+            },
+            rdb=rdb,
+        )
+        record.case_id = case["case_id"]
+        log.info(f"[{task.trace_id[:8]}] T2 caso automático abierto: {case['case_id']}")
+    else:
+        # Default para T0/T1 (y para cualquier tier fuera de 2 que no vaya a
+        # pasar por la rama T3 de abajo) — la rama R2 lo sobreescribe si
+        # corresponde.
+        record.accion_recomendada = ACCION_NINGUNA
+
     # ── R2: acción activa (bloqueo) ─────────────────────────────────────
     if task.tier >= settings.r2_min_tier:
         corroboration_count = record.enrichment.corroboration_count if record.enrichment else 0
 
         if corroboration_count >= settings.min_corroborating_sources_for_autoblock:
             record.block = respond_block(task.src_ip, settings, rdb, enforcer, task.trace_id)
+            record.accion_recomendada = (
+                ACCION_BLOQUEO_IP if record.block.action == ActionType.BLOCK
+                else ACCION_NINGUNA  # ya bloqueada / safelisted / dry_run sin ejecutar
+            )
         else:
             # Score/tier alto pero sin corroboración multi-fuente suficiente:
             # no se ejecuta bloqueo automático (evita el falso positivo tipo
@@ -87,6 +129,8 @@ def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
                 requires_approval=True,
                 approval_level="N1",
             )
+            record.accion_recomendada = ACCION_ALERTAR_PENDIENTE_APROBACION
+            create_pending_approval(record, rdb)
 
         b = record.block
         log.info(
