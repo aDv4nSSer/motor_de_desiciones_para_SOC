@@ -1,6 +1,6 @@
 # Motor de decisión basado en riesgo para SOAR en SOC
 
-[![Seguridad (DevSecOps)](https://github.com/aDv4nSSer/motor_de_desiciones_para_SOC/actions/workflows/security.yml/badge.svg?branch=develop)](https://github.com/aDv4nSSer/motor_de_desiciones_para_SOC/actions/workflows/security.yml)
+[![Seguridad (DevSecOps)](https://github.com/aDv4nSSer/motor_de_decisiones_para_SOC/actions/workflows/security.yml/badge.svg?branch=develop)](https://github.com/aDv4nSSer/motor_de_decisiones_para_SOC/actions/workflows/security.yml)
 
 Tesis UBO 2026 — *"Motor de decisión basado en riesgo para SOAR en SOC:
 integración de Machine Learning calibrado con orquestación de respuesta

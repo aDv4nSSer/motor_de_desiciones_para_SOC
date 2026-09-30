@@ -3,7 +3,7 @@
 # Pipeline Golden Subset v4 — desarrollo local con stdin
 # ============================================================
 
-data_dir = "/home/aiayala/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta/.vector-data"
+data_dir = "/home/aiayala/documents/tesis/motor_de_decisiones_para_SOC/pipeline-ingesta/.vector-data"
 
 [sources.eve_stdin]
 type = "stdin"
