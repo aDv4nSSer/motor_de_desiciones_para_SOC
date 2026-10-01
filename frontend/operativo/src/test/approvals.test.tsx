@@ -18,7 +18,7 @@ async function openApprovals(role: 'N1' | 'N2' | 'CISO', resolve: (url: string, 
   const mock = mockFetch({
     '/api/v1/auth/login': () => json(200, { access_token: 't', token_type: 'bearer', role }),
     '/api/v1/dashboard/approvals/': resolve,
-    '/api/v1/dashboard/approvals': () => json(200, list),
+    '/api/v1/dashboard/approvals': () => json(200, { items: list, total: list.length, limit: 1000, available: true }),
   })
   window.location.hash = '#aprobaciones'
   const user = userEvent.setup()
@@ -64,12 +64,12 @@ describe('aprobar / rechazar', () => {
 
   it('409: "ya fue resuelta por otro operador" y se refresca la lista', async () => {
     const { user, calls } = await openApprovals('N1', () => json(409, { detail: 'Ya resuelta (approved)' }))
-    const listCallsBefore = calls.filter((c) => c.url === '/api/v1/dashboard/approvals').length
+    const listCallsBefore = calls.filter((c) => c.url.startsWith('/api/v1/dashboard/approvals?')).length
     await user.click(screen.getByRole('button', { name: /Aprobar/ }))
     await user.click(screen.getByRole('button', { name: 'Confirmar bloqueo' }))
     expect(await screen.findByRole('status', { name: '' })).toHaveTextContent('Ya fue resuelta por otro operador')
     await waitFor(() =>
-      expect(calls.filter((c) => c.url === '/api/v1/dashboard/approvals').length).toBeGreaterThan(listCallsBefore))
+      expect(calls.filter((c) => c.url.startsWith('/api/v1/dashboard/approvals?')).length).toBeGreaterThan(listCallsBefore))
   })
 
   it('cancelar la confirmación no envía nada', async () => {
@@ -90,5 +90,38 @@ describe('aprobar / rechazar', () => {
     await openApprovals('N2', () => json(200, {}), [approval({ approval_level: '' })])
     expect(screen.queryByRole('button', { name: /Aprobar/ })).not.toBeInTheDocument()
     expect(screen.getByText('Requiere rol CISO o superior.')).toBeInTheDocument()
+  })
+})
+
+describe('total real de la cola', () => {
+  it('el encabezado muestra el total del servidor, no el largo de la página', async () => {
+    const many = Array.from({ length: 3 }, (_, i) => approval({ trace_id: `t-${i}`, src_ip: `198.51.100.${i}` }))
+    mockFetch({
+      '/api/v1/auth/login': () => json(200, { access_token: 't', token_type: 'bearer', role: 'N1' }),
+      '/api/v1/dashboard/approvals': () => json(200, { items: many, total: 257, limit: 3, available: true }),
+    })
+    window.location.hash = '#aprobaciones'
+    const user = userEvent.setup()
+    render(<AuthProvider><App /></AuthProvider>)
+    await user.type(screen.getByLabelText('Usuario'), 'op')
+    await user.type(screen.getByLabelText('Contraseña'), 'una-clave-larga')
+    await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }))
+    expect(await screen.findByRole('heading', { name: 'Aprobaciones pendientes (257)' })).toBeInTheDocument()
+    expect(screen.getByText('Se muestran las 3 más recientes de 257 pendientes.')).toBeInTheDocument()
+  })
+
+  it('Redis caído (available=false) no se presenta como cola vacía', async () => {
+    mockFetch({
+      '/api/v1/auth/login': () => json(200, { access_token: 't', token_type: 'bearer', role: 'N1' }),
+      '/api/v1/dashboard/approvals': () => json(200, { items: [], total: 0, limit: 1000, available: false }),
+    })
+    window.location.hash = '#aprobaciones'
+    const user = userEvent.setup()
+    render(<AuthProvider><App /></AuthProvider>)
+    await user.type(screen.getByLabelText('Usuario'), 'op')
+    await user.type(screen.getByLabelText('Contraseña'), 'una-clave-larga')
+    await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('no pudo leer la cola de aprobaciones')
+    expect(screen.queryByText('No hay aprobaciones pendientes')).not.toBeInTheDocument()
   })
 })

@@ -139,3 +139,20 @@ class TestOtrosCaminos:
     def test_inexistente_404(self, app_env) -> None:
         app_env["as_role"]("CISO")
         assert _resolve(app_env, "no-existe").status_code == 404
+
+
+class TestListadoConTotal:
+    def test_endpoint_devuelve_total_y_respeta_limit(self, app_env) -> None:
+        for i in range(7):
+            app_env["pending"](f"t-{i}", "N1")
+        app_env["as_role"]("N1")
+        body = app_env["client"].get("/api/v1/dashboard/approvals", params={"limit": 3}).json()
+        assert body["total"] == 7
+        assert len(body["items"]) == 3
+        assert body["available"] is True
+
+    @pytest.mark.parametrize("limit", [0, 1001])
+    def test_limit_fuera_de_rango_422(self, app_env, limit) -> None:
+        app_env["as_role"]("N1")
+        resp = app_env["client"].get("/api/v1/dashboard/approvals", params={"limit": limit})
+        assert resp.status_code == 422

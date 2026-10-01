@@ -88,6 +88,14 @@ export interface Approval {
   enforced?: boolean
 }
 
+/** GET /api/v1/dashboard/approvals: página + total real de la cola. */
+export interface ApprovalsPage {
+  items: Approval[]
+  total: number
+  limit: number
+  available: boolean
+}
+
 export interface Stats {
   available: boolean
   window_minutes: number

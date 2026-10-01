@@ -41,7 +41,12 @@ from pydantic import BaseModel
 # ver _init_score_worker() más abajo para el porqué (contención de joblib/
 # sklearn con nuestro propio ProcessPoolExecutor, encontrada en FASE 2).
 from redis_client import publish_decision, publish_flow
-from response.approvals import get_approval, list_pending_approvals, resolve_approval
+from response.approvals import (
+    APPROVALS_MAX_LIMIT,
+    get_approval,
+    pending_approvals_page,
+    resolve_approval,
+)
 from response.config import get_settings as get_response_settings
 from response.enforcer import build_enforcer
 from response.queue import enqueue_response_task
@@ -394,9 +399,14 @@ def auth_me(user: User = Depends(get_current_user)):
 # insuficiente; cuarentena de host quedará en "N2"/"CISO" cuando el
 # pendiente #3 de Wazuh esté integrado).
 @app.get("/api/v1/dashboard/approvals")
-def dashboard_approvals(user: User = Depends(get_current_user)):
+def dashboard_approvals(
+    limit: int = Query(100, ge=1, le=APPROVALS_MAX_LIMIT),
+    user: User = Depends(get_current_user),
+):
+    # Devuelve {items, total, limit, available}: el total real de la cola,
+    # no solo la página (antes el panel mostraba 100 de 257 como si fueran todas).
     rdb = get_dashboard_redis()
-    return list_pending_approvals(rdb)
+    return pending_approvals_page(rdb, limit)
 
 
 class ApprovalDecision(BaseModel):

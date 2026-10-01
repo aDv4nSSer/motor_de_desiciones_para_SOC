@@ -23,6 +23,7 @@ from response.approvals import (
     create_pending_approval,
     get_approval,
     list_pending_approvals,
+    pending_approvals_page,
     resolve_approval,
 )
 from response.schemas import ActionType, BlockResult, ResponseRecord
@@ -215,3 +216,30 @@ class TestListPendingApprovals:
         with caplog.at_level(logging.ERROR, logger="response.approvals"):
             assert list_pending_approvals(FakeRedis(fail_on={"smembers"})) == []
         assert "pendientes" in caplog.text
+
+
+class TestPendingApprovalsPage:
+    """El panel mostraba "100" cuando había 257: la página debe traer el total real."""
+
+    def _con_pendientes(self, n: int) -> FakeRedis:
+        rdb = FakeRedis()
+        for i in range(n):
+            create_pending_approval(_record(f"trace-{i:03d}"), rdb)
+        return rdb
+
+    def test_total_real_aunque_la_pagina_sea_menor(self) -> None:
+        page = pending_approvals_page(self._con_pendientes(257), limit=100)
+        assert page["total"] == 257
+        assert len(page["items"]) == 100
+        assert page["limit"] == 100
+        assert page["available"] is True
+
+    def test_total_excluye_resueltas(self) -> None:
+        rdb = self._con_pendientes(5)
+        resolve_approval("trace-001", "n2-ana", "rejected", rdb)
+        assert pending_approvals_page(rdb, limit=100)["total"] == 4
+
+    def test_redis_caido_no_se_confunde_con_cola_vacia(self, caplog) -> None:
+        with caplog.at_level(logging.ERROR, logger="response.approvals"):
+            page = pending_approvals_page(FakeRedis(fail_on={"smembers"}), limit=100)
+        assert page == {"items": [], "total": 0, "limit": 100, "available": False}

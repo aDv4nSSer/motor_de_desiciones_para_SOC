@@ -78,19 +78,46 @@ def get_approval(trace_id: str, rdb: redis.Redis) -> dict | None:
         return None
 
 
-def list_pending_approvals(rdb: redis.Redis, limit: int = 100) -> list[dict]:
+APPROVALS_MAX_LIMIT = 1000  # tope por request del panel (hoy hay ~260 pendientes)
+
+
+def _load_pending(rdb: redis.Redis) -> list[dict] | None:
+    """Todas las aprobaciones pendientes, más recientes primero. None si
+    Redis no responde (distinto de "no hay pendientes")."""
     try:
         trace_ids = rdb.smembers(APPROVALS_INDEX_KEY)
     except redis.RedisError as e:
         log.error(f"error leyendo indice de aprobaciones pendientes: {e}")
-        return []
+        return None
     approvals = []
     for tid in trace_ids:
         approval = get_approval(tid, rdb)
         if approval is not None and approval.get("status") == "pending":
             approvals.append(approval)
     approvals.sort(key=lambda a: a.get("created_at", ""), reverse=True)
-    return approvals[:limit]
+    return approvals
+
+
+def list_pending_approvals(rdb: redis.Redis, limit: int = 100) -> list[dict]:
+    return (_load_pending(rdb) or [])[:limit]
+
+
+def pending_approvals_page(rdb: redis.Redis, limit: int = 100) -> dict:
+    """Página de pendientes con el total real, para que el panel nunca
+    muestre la página como si fuera la cola completa.
+
+    Args:
+        rdb: cliente Redis.
+        limit: máximo de ítems a devolver (más recientes primero).
+
+    Returns:
+        {"items": [...], "total": int, "limit": int, "available": bool};
+        available=False si Redis no respondió (total 0 no significa cola vacía).
+    """
+    pending = _load_pending(rdb)
+    if pending is None:
+        return {"items": [], "total": 0, "limit": limit, "available": False}
+    return {"items": pending[:limit], "total": len(pending), "limit": limit, "available": True}
 
 
 def resolve_approval(

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { CheckCircle, Prohibit, XCircle } from '@phosphor-icons/react'
 import { resolveApproval } from '../api/approvals'
 import { apiFetch } from '../api/client'
-import type { Approval } from '../api/types'
+import type { Approval, ApprovalsPage } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { EmptyState, ErrorNotice, Freshness, LevelBadge, TableSkeleton, TierBadge } from '../components/common'
 import { formatScore, formatTime, requiredLevel, roleReaches, shortId } from '../lib/format'
@@ -11,6 +11,7 @@ import { usePolling } from '../lib/usePolling'
 type Decision = 'approved' | 'rejected'
 
 const PAGE = 50
+const FETCH_LIMIT = 1000 // tope del endpoint; hoy la cola real ronda las 260
 
 interface RowState {
   confirming: Decision | null
@@ -25,7 +26,7 @@ interface Resolved {
 
 export function ApprovalsView() {
   const { user } = useAuth()
-  const poll = usePolling(() => apiFetch<Approval[]>('/api/v1/dashboard/approvals'))
+  const poll = usePolling(() => apiFetch<ApprovalsPage>(`/api/v1/dashboard/approvals?limit=${FETCH_LIMIT}`))
   const [rowState, setRowState] = useState<Record<string, RowState>>({})
   const [removed, setRemoved] = useState<Set<string>>(new Set())
   const [resolved, setResolved] = useState<Resolved[]>([])
@@ -34,7 +35,12 @@ export function ApprovalsView() {
   if (!user) return null
   const role = user.role
 
-  const pending = (poll.data ?? []).filter((a) => a.status === 'pending' && !removed.has(a.trace_id))
+  const page = poll.data
+  const pending = (page?.items ?? []).filter((a) => a.status === 'pending' && !removed.has(a.trace_id))
+  // Total real de la cola (no el largo de la página), descontando lo resuelto en esta sesión.
+  const resolvedHere = (page?.items ?? []).filter((a) => removed.has(a.trace_id)).length
+  const total = page ? Math.max(page.total - resolvedHere, pending.length) : 0
+  const truncated = page ? page.total > page.items.length : false
   const state = (id: string): RowState => rowState[id] ?? { confirming: null, submitting: false, message: null }
   const patch = (id: string, p: Partial<RowState>) =>
     setRowState((prev) => ({ ...prev, [id]: { ...state(id), ...p } }))
@@ -61,7 +67,7 @@ export function ApprovalsView() {
     <section aria-labelledby="approvals-title">
       <header className="view-header">
         <h2 id="approvals-title">
-          Aprobaciones pendientes{poll.data ? ` (${pending.length})` : ''}
+          Aprobaciones pendientes{page?.available ? ` (${total})` : ''}
         </h2>
         <Freshness
           updatedAt={poll.updatedAt} paused={poll.paused}
@@ -73,10 +79,18 @@ export function ApprovalsView() {
       </p>
 
       {poll.error && <ErrorNotice message={poll.error} />}
+      {page && !page.available && (
+        <ErrorNotice message="El motor no pudo leer la cola de aprobaciones. La lista puede estar incompleta: no la tomes como vacía." />
+      )}
+      {truncated && (
+        <p className="notice notice-info" role="status">
+          Se muestran las {page!.items.length} más recientes de {page!.total} pendientes.
+        </p>
+      )}
 
       {poll.loading && !poll.data ? (
         <TableSkeleton cols={7} />
-      ) : pending.length === 0 ? (
+      ) : pending.length === 0 && page?.available !== false ? (
         <EmptyState title="No hay aprobaciones pendientes">
           Las acciones de alto impacto que requieran confirmación humana aparecerán aquí.
         </EmptyState>
