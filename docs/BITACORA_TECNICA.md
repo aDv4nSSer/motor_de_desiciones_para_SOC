@@ -1488,7 +1488,55 @@ curl -H "X-Api-Key: ..." http://10.10.10.1:8081/v1/decisions/stream?startup=true
 
 ---
 
+## H38 — `response-worker` ~15 h atrasado y perdiendo tareas: el stream `soc:response:tasks` está lleno (cap ~200k) y la entrada supera la capacidad de procesamiento
+
+**Fecha:** 2026-09-30 / 2026-10-01 (detectado al validar el Dashboard Operativo contra datos reales)
+
+**Hallazgo:** al cruzar por `trace_id` las últimas 50 alertas T2+ de `soc-decisions` con las últimas 200 respuestas de `soc:response:audit`, **0/50 tenían respuesta**. No es un problema de join: los `trace_id` coinciden de punta a punta (5/5 `trace_id` auditados por el worker existen en `soc-decisions`; 5/5 de las últimas decisiones T2+ están en `soc:decisions` y en `soc:response:tasks`, pero todavía no en `soc:response:audit`). El worker simplemente no las procesó aún:
+
+- Consumer group `response-workers` de `soc:response:tasks`: **`lag` 199.970** (200.008 en la segunda medición), `pending` 76-80, 1 consumidor.
+- `last-delivered-id` con **~54.900 s (≈15.3 h) de antigüedad**: lo que el worker procesa ahora son detecciones de hace ~15 h. Atraso encolado→procesado medido en una respuesta reciente: 54.928 s.
+- El productor (`motor/response/queue.py`) hace `xadd(..., maxlen=200_000, approximate=True)`: **el stream está capado en ~200k y lleno**. Con la entrada por encima de la capacidad, las tareas más viejas se **recortan antes de ser procesadas**: se pierden sin enriquecimiento (R1) ni respuesta (R2). El colchón de ~5.8 días que estimó H35 (backlog creciendo ~1.360/h) se agotó.
+- Carga: **~4 tareas T1+/s** en la última hora según `/api/v1/dashboard/stats` (9.153 T1 + 4.719 T2 + 1.327 T3 = 15.199 en 60 min); en la ventana de medición de 60 s, **entrada 5.00 tareas/s vs. procesamiento 2.60 tareas/s** (3.35 tareas/s promedio sobre las últimas 3.996 tareas auditadas).
+- Pérdida estimada (no medida directamente): diferencia entrada−procesamiento ≈ 1.7-2.4 tareas/s ≈ **6.000-8.600 tareas/hora recortadas sin procesar** mientras el stream siga lleno.
+
+**Diagnóstico — dónde se va el tiempo (solo lectura, sin reiniciar ni tocar configuración, sin gastar cuota de APIs):** scripts en `scripts/diagnostico/h38_worker_lag_rates.py` y `h38_worker_lag_stages.py`. Duración por tarea = diferencia entre `processed_at` consecutivos (el worker es secuencial y `processed_at` marca el INICIO de cada tarea, así que cada intervalo se atribuye a la tarea anterior; una primera pasada lo atribuyó a la siguiente y daba una conclusión distinta, corregida acá).
+
+| Perfil de tarea (3.996 tareas) | % tareas | Mediana | p95 | % del tiempo del worker |
+|---|---|---|---|---|
+| TI con timeout/error de red | 3.4% | 4.51 s | 5.26 s | **51.0%** |
+| TI desde caché | 29.3% | 0.086 s | 0.75 s | 20.4% |
+| IP privada (sin TI) | 64.4% | 0.083 s | 0.10 s | 18.7% |
+| TI con HTTP 429 (cuota) | 3.0% | 0.45 s | 3.55 s | 9.9% |
+
+- **Causa dominante: llamadas síncronas a TI que fallan y NO se cachean.** Los errores de las últimas 4.000 respuestas son `otx error: ReadTimeout` (130) y `abuseipdb HTTP 429` (210, cuota diaria de 900 agotada). Cada `ReadTimeout` de OTX cuesta el timeout completo (4 s) y, como `enrichment.py` solo cachea éxitos (TTL 6 h), la misma IP vuelve a pagar el timeout en la tarea siguiente. CLAUDE.md exige "negative caching obligatorio"; acá no está implementado. ~61% del tiempo (51.0% + 9.9%) va a fallos de TI.
+- **Causa nueva, no prevista: costo fijo de CrowdSec en cada tarea.** `_crowdsec_lookup` lee de Redis y deserializa la caché completa de decisiones de CrowdSec (**2.862 KiB, 23.804 decisiones**) en **cada** tarea, incluidas las de IP privada: medido **0.072 s por llamada**, que es casi todo el piso de ~0.083 s por tarea. ≈24% del tiempo total.
+- **`R1_MIN_TIER=1` pesa menos de lo esperado:** las T1 son 49.5% de las tareas pero solo **16.1% del tiempo** (son mayormente baratas). Subirlo a 2 recorta carga, pero no ataca la causa.
+- **Consumidor único:** multiplica el problema (todo es secuencial, `xreadgroup count=16`), pero no es la causa raíz: con el costo por tarea actual, más consumidores escalarían también los timeouts.
+- **IPs privadas:** 64.4% de las tareas son de solo 3 IPs internas (`10.10.10.3` 1.770, `10.10.10.1` 508, `10.30.30.2` 296 en la muestra), el mismo síntoma de NAT de H28. Se enriquecen sin valor posible (DNS + CrowdSec).
+- Descartados con medición: DNS inverso (mediana 0.007-0.01 s, máx. 0.21 s), Redis (`PING` mediana 0.145 ms, p99 0.626 ms), R2 con bloqueo vía Wazuh API (44 tareas, mediana 0.54 s, 2.8% del tiempo).
+
+**Implicancias para la tesis (resultados/limitaciones):** mientras dure el atraso, R1/R2 actúan ~15 h tarde, las aprobaciones humanas se crean ~15 h después de la detección (`created_at` refleja el procesamiento, no la detección) y parte de las tareas se pierde sin procesar. Cualquier métrica de MTTR, tasa de bloqueo o cobertura de enriquecimiento calculada sobre `soc:response:audit` en este período está sesgada y debe acotarse o excluirse, igual que la ventana de H25.
+
+**Opciones a decidir (ninguna aplicada; decisión de arquitectura pendiente con Antonio):**
+1. Negative caching de fallos de TI (TTL corto, ej. 5-15 min) en `enrichment.py`. Sin RAM adicional ni procesos nuevos; ataca el ~61%.
+2. Parsear la caché de CrowdSec una vez por refresco (estructura en memoria indexada por IP) en vez de en cada tarea. Sin procesos nuevos; ataca el ~24%.
+3. No enriquecer IPs privadas (o deduplicar por IP dentro de una ventana). Recorta ~64% de las tareas.
+4. Subir `R1_MIN_TIER` a 2: ~16% del tiempo; decisión de alcance operacional.
+5. Más consumidores en el group: escala capacidad pero suma RAM y procesos en un host con recursos limitados.
+
+Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a menos de ~0.02 s, por encima de 5 tareas/s de entrada sin procesos adicionales. Además queda decidir qué hacer con el backlog actual de ~200k tareas de ~15 h de antigüedad (procesarlas tarde vs. descartarlas explícitamente).
+
+**Evidencia:** `XINFO GROUPS soc:response:tasks` (lag, pending, last-delivered-id, entries-read); `XINFO STREAM` (entries-added) en dos muestras separadas por 60 s; últimas 4.000 entradas de `soc:response:audit` (`processed_at`, `enrichment.notes`, `cached`, `src_ip`, `block.action`); `GET /api/v1/dashboard/stats?window_minutes=60`; cruce por `trace_id` entre `soc-decisions` (`/_doc/<trace_id>`) y los streams de Redis; medición directa de `_reverse_dns` y `_crowdsec_lookup` en `.140`; tamaño de `soc:enrich:crowdsec:decisions`.
+
+**Estado: ABIERTO — diagnóstico cerrado, fix pendiente de decisión.** No se tocó configuración ni se reinició `response-worker` (decisión explícita de Antonio: definirlo con calma).
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
+
+- **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
+
 
 - **`--workers 2` para `motor-soc.service`, evaluado pero no aplicado** (H30): el `run_in_executor` ya mitiga el bloqueo del event loop; un segundo worker de proceso completo daría paralelismo real adicional pero duplica el modelo en memoria por proceso — pendiente confirmar con Joaquín si el modelo tolera esa duplicación sin problema (RAM disponible en `.140` no parece ser el límite real, ver H30 original, pero no se asumió sin preguntar).
 - **Redis en `.140` probablemente solo acepta conexiones en `127.0.0.1`, sin política explícita de acceso cross-host** (H33): decidir con Antonio si `.139` necesita alcanzarlo de verdad (y con qué restricción de red) o si el diseño de `vigilante/cases.py` debería cambiar para no depender de eso. Mientras tanto, el heartbeat del FIM sigue sin poder escribirse.
