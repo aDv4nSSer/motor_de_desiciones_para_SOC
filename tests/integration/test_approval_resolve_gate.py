@@ -51,8 +51,8 @@ def app_env(monkeypatch, mocker):
             lambda: User(username=f"user-{role.lower()}", role=role, created_at="", disabled=False)
         )
 
-    def pending(trace_id: str, level: str | None) -> None:
-        create_pending_approval(_record(trace_id, approval_level=level or ""), rdb)
+    def pending(trace_id: str, level: str | None, src_ip: str = "1.2.3.4") -> None:
+        create_pending_approval(_record(trace_id, approval_level=level or "", src_ip=src_ip), rdb)
         if level is None:  # registro sin la clave approval_level
             import json
             stored = get_approval(trace_id, rdb)
@@ -156,3 +156,35 @@ class TestListadoConTotal:
         app_env["as_role"]("N1")
         resp = app_env["client"].get("/api/v1/dashboard/approvals", params={"limit": limit})
         assert resp.status_code == 422
+
+
+class TestSafelist:
+    """La aprobación manual llama al enforcer directo: sin este gate, aprobar
+    la IP del bastion o de un gateway bloquearía la propia infraestructura."""
+
+    @pytest.mark.parametrize("ip", ["200.54.12.139", "10.30.30.1", "10.10.10.3"])
+    def test_aprobar_ip_de_infra_422_sin_bloquear(self, app_env, monkeypatch, ip) -> None:
+        from response.config import ResponseSettings
+        monkeypatch.setattr(app_env["main"], "get_response_settings",
+                            lambda: ResponseSettings(response_safelist_extra="200.54.12.139"))
+        app_env["pending"]("t-infra", "N1", src_ip=ip)
+        app_env["as_role"]("CISO")
+        resp = _resolve(app_env, "t-infra", "approved")
+        assert resp.status_code == 422
+        assert "safelist" in resp.json()["detail"]
+        app_env["enforcer"].block.assert_not_called()
+        assert app_env["get"]("t-infra")["status"] == "pending"
+
+    def test_rechazar_ip_de_infra_si_se_permite(self, app_env) -> None:
+        app_env["pending"]("t-infra", "N1", src_ip="10.30.30.1")
+        app_env["as_role"]("N1")
+        assert _resolve(app_env, "t-infra", "rejected").status_code == 200
+        app_env["enforcer"].block.assert_not_called()
+
+    def test_listado_marca_safelisted(self, app_env) -> None:
+        app_env["pending"]("t-infra", "N1", src_ip="10.30.30.1")
+        app_env["pending"]("t-ext", "N1", src_ip="1.2.3.4")
+        app_env["as_role"]("N1")
+        items = {i["trace_id"]: i for i in app_env["client"].get("/api/v1/dashboard/approvals").json()["items"]}
+        assert items["t-infra"]["safelisted"] is True
+        assert items["t-ext"]["safelisted"] is False

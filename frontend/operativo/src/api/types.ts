@@ -86,6 +86,8 @@ export interface Approval {
   resolved_by: string | null
   resolved_at: string | null
   enforced?: boolean
+  /** IP de infraestructura propia: el servidor rechaza aprobarla (422). */
+  safelisted?: boolean
 }
 
 /** GET /api/v1/dashboard/approvals: página + total real de la cola. */

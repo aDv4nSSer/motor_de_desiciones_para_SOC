@@ -1531,6 +1531,8 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 **Estado: ABIERTO — diagnóstico cerrado, fix pendiente de decisión.** No se tocó configuración ni se reinició `response-worker` (decisión explícita de Antonio: definirlo con calma).
 
+**Derivado de H38, resuelto el mismo día — la aprobación manual se saltaba la safelist:** al corregir el conteo del panel (mostraba 100 de 257; ver commit `3e1de14`), el total real resultó ser **5.282 aprobaciones pendientes** (todas T3, nivel N1, 345 IPs distintas; la IP más repetida, `95.40.160.2`, con 449), creadas por el worker al procesar el backlog. Entre ellas, **`200.54.12.139` (IP pública del propio bastion, 90) y `10.30.30.1` (gateway de VLAN 30, 107)**. Ambas están en la safelist (`is_safelisted` → `True`), pero: (1) el worker crea la aprobación pendiente sin consultar la safelist, y (2) `dashboard_resolve_approval` ejecutaba `enforcer.block()` directo, sin pasar por `respond_block()`, que es donde vive el chequeo. Con `RESPONSE_MODE=enforce` y `WAZUH_TARGET_AGENTS=all`, aprobar una de esas habría disparado `firewall-drop` sobre la propia infraestructura. **Fix aplicado en `motor-soc`** (no en el worker): el endpoint rechaza con 422 aprobar una IP de safelist (rechazar sigue permitido) y el listado marca `safelisted`, que el panel usa para ofrecer solo "Rechazar". Pendiente: que el worker no cree aprobaciones para IPs de safelist, deduplicar por IP y definir expiración de aprobaciones viejas (una cola de 5.282 no es revisable por personas).
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)

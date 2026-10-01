@@ -29,6 +29,7 @@ export async function resolveApproval(traceId: string, decision: Decision, role:
         return { kind: 'forbidden', message: `Tu rol (${role}) no alcanza para este nivel (requiere ${requiredLevel(level)}).` }
       }
       if (e.status === 409) return { kind: 'conflict', message: 'Ya fue resuelta por otro operador.' }
+      if (e.status === 422) return { kind: 'forbidden', message: e.detail || 'El servidor no permite aprobar esta acción.' }
       if (e.status === 404) return { kind: 'gone', message: 'La aprobación ya no existe.' }
       return { kind: 'error', message: `El motor no pudo resolverla (HTTP ${e.status}). No se aplicó ningún cambio confirmado; reintenta.` }
     }

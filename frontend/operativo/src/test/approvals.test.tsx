@@ -26,7 +26,7 @@ async function openApprovals(role: 'N1' | 'N2' | 'CISO', resolve: (url: string, 
   await user.type(screen.getByLabelText('Usuario'), 'op')
   await user.type(screen.getByLabelText('Contraseña'), 'una-clave-larga')
   await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }))
-  await screen.findByText('203.0.113.50')
+  await screen.findByRole('heading', { name: /Aprobaciones pendientes \(\d+\)/ })
   return { user, ...mock }
 }
 
@@ -123,5 +123,23 @@ describe('total real de la cola', () => {
     await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('no pudo leer la cola de aprobaciones')
     expect(screen.queryByText('No hay aprobaciones pendientes')).not.toBeInTheDocument()
+  })
+})
+
+describe('IPs de infraestructura (safelist)', () => {
+  it('no ofrece Aprobar, solo Rechazar, y lo explica', async () => {
+    await openApprovals('CISO', () => json(200, {}), [approval({ src_ip: '200.54.12.139', safelisted: true })])
+    expect(screen.getByText('Infraestructura propia')).toBeInTheDocument()
+    expect(screen.getByText('IP en la safelist: no se puede bloquear.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Aprobar/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Rechazar/ })).toBeInTheDocument()
+  })
+
+  it('si el servidor responde 422 se muestra su motivo y el ítem queda', async () => {
+    const { user } = await openApprovals('N1', () => json(422, { detail: 'La IP es infraestructura propia (safelist): no se puede bloquear. Rechaza la aprobación.' }))
+    await user.click(screen.getByRole('button', { name: /Aprobar/ }))
+    await user.click(screen.getByRole('button', { name: 'Confirmar bloqueo' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('infraestructura propia (safelist)')
+    expect(screen.getByRole('heading', { name: /Aprobaciones pendientes \(1\)/ })).toBeInTheDocument()
   })
 })

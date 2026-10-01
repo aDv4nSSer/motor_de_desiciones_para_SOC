@@ -67,11 +67,12 @@ class FakeRedis:
         return self._sets.get(key, set())
 
 
-def _record(trace_id: str = "trace-cuarentena-1", approval_level: str = "N2") -> ResponseRecord:
+def _record(trace_id: str = "trace-cuarentena-1", approval_level: str = "N2",
+            src_ip: str = "1.2.3.4") -> ResponseRecord:
     return ResponseRecord(
-        trace_id=trace_id, tier=3, risk_score=0.93, src_ip="203.0.113.50",
+        trace_id=trace_id, tier=3, risk_score=0.93, src_ip=src_ip,
         block=BlockResult(
-            src_ip="203.0.113.50", action=ActionType.BLOCK_PENDING_APPROVAL,
+            src_ip=src_ip, action=ActionType.BLOCK_PENDING_APPROVAL,
             reason="corroboración insuficiente", requires_approval=True,
             approval_level=approval_level,
         ),

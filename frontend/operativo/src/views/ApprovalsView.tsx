@@ -107,6 +107,7 @@ export function ApprovalsView() {
                     <TierBadge tier={a.tier} />
                     <span className="mono strong">{a.src_ip ?? 'IP sin dato'}</span>
                     <LevelBadge level={level} />
+                    {a.safelisted && <span className="badge sev-high">Infraestructura propia</span>}
                   </div>
                   <p className="approval-reason">{a.reason || 'Sin motivo registrado'}</p>
                   <p className="muted small mono">
@@ -122,6 +123,13 @@ export function ApprovalsView() {
                 <div className="approval-actions">
                   {!allowed ? (
                     <p className="muted small">Requiere rol {level} o superior.</p>
+                  ) : a.safelisted && !s.confirming ? (
+                    <>
+                      <p className="muted small">IP en la safelist: no se puede bloquear.</p>
+                      <button type="button" className="btn btn-secondary" onClick={() => patch(a.trace_id, { confirming: 'rejected', message: null })}>
+                        <Prohibit size={18} aria-hidden="true" /> Rechazar
+                      </button>
+                    </>
                   ) : s.confirming ? (
                     <div className="confirm" role="group" aria-label="Confirmar resolución">
                       <p className="small">

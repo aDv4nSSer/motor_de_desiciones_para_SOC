@@ -48,7 +48,7 @@ from response.approvals import (
     resolve_approval,
 )
 from response.config import get_settings as get_response_settings
-from response.enforcer import build_enforcer
+from response.enforcer import build_enforcer, is_safelisted
 from response.queue import enqueue_response_task
 from schemas import FlowFeatures
 from users import ROLE_LEVEL, User, get_user_record
@@ -406,7 +406,13 @@ def dashboard_approvals(
     # Devuelve {items, total, limit, available}: el total real de la cola,
     # no solo la página (antes el panel mostraba 100 de 257 como si fueran todas).
     rdb = get_dashboard_redis()
-    return pending_approvals_page(rdb, limit)
+    page = pending_approvals_page(rdb, limit)
+    # Marca las IPs de safelist (infra propia): el panel no ofrece aprobarlas
+    # y el endpoint de resolución lo rechaza igual (ver más abajo).
+    settings = get_response_settings()
+    for item in page["items"]:
+        item["safelisted"] = is_safelisted(item.get("src_ip") or "", settings)
+    return page
 
 
 class ApprovalDecision(BaseModel):
@@ -442,6 +448,19 @@ def dashboard_resolve_approval(
 
     if payload.decision not in ("approved", "rejected"):
         raise HTTPException(status_code=400, detail="decision debe ser 'approved' o 'rejected'")
+
+    # Safelist ANTES de resolver: la aprobación manual llama al enforcer
+    # directo (no pasa por respond_block, que es donde vive el chequeo), así
+    # que sin esto un "Aprobar" sobre la IP del bastion o de un gateway
+    # dispararía firewall-drop sobre la propia infraestructura. Rechazar
+    # sigue permitido; la aprobación queda pendiente si se intenta aprobar.
+    if payload.decision == "approved" and is_safelisted(approval.get("src_ip") or "", get_response_settings()):
+        log_access_event(user.username, "approval_denied_safelist",
+                          {"trace_id": trace_id, "src_ip": approval.get("src_ip")})
+        raise HTTPException(
+            status_code=422,
+            detail="La IP es infraestructura propia (safelist): no se puede bloquear. Rechaza la aprobación.",
+        )
 
     resolved = resolve_approval(trace_id, user.username, payload.decision, rdb)
     if resolved is None:
