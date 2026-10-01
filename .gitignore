@@ -57,3 +57,8 @@ Thumbs.db
 .claude/skills/
 
 graphify-out/
+
+# Dashboard Operativo (React/Vite): dependencias y bundle compilado.
+# El bundle se despliega a .140 con scripts/deploy_operativo.sh (rsync), no por git.
+node_modules/
+motor/static/

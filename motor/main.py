@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import time
 import uuid
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -32,7 +33,8 @@ from dashboard import (
     update_case_state,
 )
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # H36: "from model import get_model" NO va a nivel de módulo a propósito —
@@ -486,3 +488,41 @@ def dashboard_compliance(window_minutes: int = 1440, user: User = Depends(requir
         "latencia_p95_ms": stats.get("latencia_p95_ms"),
         "precision_bloqueos": precision,
     }
+
+
+# ── Dashboard Operativo (React/Vite, frontend/operativo) ────────────────────
+# Bundle estático compilado en el Mac y copiado a motor/static/operativo con
+# scripts/deploy_operativo.sh (no se versiona). Mismo origen que la API: sin
+# CORS, JWT solo en memoria del navegador. Sin auth en los estáticos (no
+# contienen datos ni secretos); cada llamada a /api/v1/* sí exige el token.
+OPERATIVO_DIR = Path(__file__).resolve().parent / "static" / "operativo"
+
+
+def mount_operativo(target: FastAPI, directory: Path) -> bool:
+    """Monta el bundle en /operativo si existe.
+
+    Args:
+        target: app donde montar.
+        directory: carpeta con index.html + assets/.
+
+    Returns:
+        True si se montó; False (y log de aviso) si el bundle no está
+        desplegado: el motor arranca igual, /operativo responde 404.
+    """
+    if not (directory / "index.html").is_file():
+        log.warning(f"dashboard operativo no desplegado en {directory}; /operativo no se monta")
+        return False
+
+    # Redirect relativo explícito: detrás del proxy de .139, el redirect
+    # automático de Starlette armaría una URL absoluta http:// (uvicorn no
+    # confía en X-Forwarded-Proto de una IP externa) y el navegador saltaría
+    # de https a http.
+    @target.get("/operativo", include_in_schema=False)
+    def operativo_slash() -> RedirectResponse:
+        return RedirectResponse("/operativo/", status_code=307)
+
+    target.mount("/operativo", StaticFiles(directory=directory, html=True), name="operativo")
+    return True
+
+
+mount_operativo(app, OPERATIVO_DIR)

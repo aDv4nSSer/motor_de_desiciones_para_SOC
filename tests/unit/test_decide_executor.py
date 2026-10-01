@@ -105,9 +105,9 @@ class TestApiVersioning:
     def test_every_api_route_is_versioned(self, monkeypatch) -> None:
         """CLAUDE.md: URLs versionadas /api/v1/... en todos los endpoints
         sin excepción. Fuera de /api/ solo quedan health, raíz, la página
-        HTML del dashboard y el alias temporal de /decide."""
+        HTML del dashboard (/dashboard y /operativo) y el alias temporal de /decide."""
         _, main = _client(monkeypatch)
-        allowed_unversioned = {"/health", "/", "/dashboard", "/decide"}
+        allowed_unversioned = {"/health", "/", "/dashboard", "/operativo", "/decide"}
         paths = {r.path for r in main.app.routes if hasattr(r, "methods")}
         paths -= {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
         offenders = sorted(p for p in paths
