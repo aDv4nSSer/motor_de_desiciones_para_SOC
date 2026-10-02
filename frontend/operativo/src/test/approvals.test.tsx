@@ -143,3 +143,29 @@ describe('IPs de infraestructura (safelist)', () => {
     expect(screen.getByRole('heading', { name: /Aprobaciones pendientes \(1\)/ })).toBeInTheDocument()
   })
 })
+
+describe('dedup por IP y expiración', () => {
+  it('muestra las ocurrencias de la IP en una sola fila', async () => {
+    await openApprovals('N1', () => json(200, {}), [approval({
+      src_ip: '95.40.160.2', occurrences: 449,
+      created_at: '2026-10-02T10:00:00+00:00', last_seen_at: '2026-10-02T12:30:00+00:00',
+    })])
+    expect(screen.getByText('449 ocurrencias')).toBeInTheDocument()
+    expect(screen.getAllByText('95.40.160.2')).toHaveLength(1)
+  })
+
+  it('una sola ocurrencia no muestra el contador', async () => {
+    await openApprovals('N1', () => json(200, {}), [approval({ occurrences: 1 })])
+    expect(screen.queryByText(/^[0-9.]+ ocurrencias$/)).not.toBeInTheDocument()
+  })
+
+  it('409 por expiración se distingue de "resuelta por otro operador"', async () => {
+    const { user } = await openApprovals('N1', () =>
+      json(409, { detail: 'La aprobación expiró (más de 4 h sin resolver). Si la amenaza sigue, un evento nuevo abrirá otra.' }))
+    await user.click(screen.getByRole('button', { name: /Rechazar/ }))
+    await user.click(screen.getByRole('button', { name: 'Confirmar rechazo' }))
+    const msg = await screen.findByText(/La aprobación expiró/)
+    expect(msg).toBeInTheDocument()
+    expect(screen.queryByText('Ya fue resuelta por otro operador.')).not.toBeInTheDocument()
+  })
+})

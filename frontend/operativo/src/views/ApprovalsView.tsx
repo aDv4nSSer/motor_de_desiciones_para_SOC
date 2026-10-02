@@ -75,7 +75,8 @@ export function ApprovalsView() {
         />
       </header>
       <p className="muted view-intro">
-        Aprobar ejecuta la acción en producción (bloqueo de la IP de origen). Cada aprobación exige el nivel que trae el registro; tu rol es <strong>{role}</strong>.
+        Aprobar ejecuta la acción en producción (bloqueo de la IP de origen). Hay una aprobación por IP: los eventos repetidos suman ocurrencias.
+        Las que pasan 4 h sin resolver expiran solas. Cada aprobación exige el nivel que trae el registro; tu rol es <strong>{role}</strong>.
       </p>
 
       {poll.error && <ErrorNotice message={poll.error} />}
@@ -111,7 +112,13 @@ export function ApprovalsView() {
                   </div>
                   <p className="approval-reason">{a.reason || 'Sin motivo registrado'}</p>
                   <p className="muted small mono">
-                    {formatTime(a.created_at)}, riesgo {formatScore(a.risk_score)}, trace {shortId(a.trace_id)}
+                    {(a.occurrences ?? 1) > 1
+                      ? <>
+                          <strong className="occurrences">{(a.occurrences ?? 1).toLocaleString('es-CL')} ocurrencias</strong>
+                          , última {formatTime(a.last_seen_at ?? a.created_at)}, primera {formatTime(a.created_at)}
+                        </>
+                      : formatTime(a.created_at)}
+                    , riesgo {formatScore(a.risk_score)}, trace {shortId(a.trace_id)}
                   </p>
                   {s.message && (
                     <p className={`notice notice-${s.message.tone}`} role={s.message.tone === 'danger' ? 'alert' : 'status'}>

@@ -86,6 +86,10 @@ export interface Approval {
   resolved_by: string | null
   resolved_at: string | null
   enforced?: boolean
+  /** Eventos de la misma IP agrupados en esta aprobación (dedup por IP). */
+  occurrences?: number
+  last_seen_at?: string
+  last_trace_id?: string
   /** IP de infraestructura propia: el servidor rechaza aprobarla (422). */
   safelisted?: boolean
 }
