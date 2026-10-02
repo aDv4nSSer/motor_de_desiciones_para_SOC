@@ -31,6 +31,8 @@ def profile(a):
     # Post-H38-C: un fallo servido desde negative cache o el corte por cuota
     # no llama a la API; se clasifica aparte (si no, su nota "ReadTimeout"
     # lo haría pasar por timeout real).
+    if "evento stale, solo caché" in notes:
+        return "TI stale solo caché (sin llamada)"
     if "negative cache" in notes or "cuota diaria agotada" in notes:
         return "TI negative cache / cuota (sin llamada)"
     if (a.get("block") or {}).get("reason", "").startswith("stale_backlog"):
