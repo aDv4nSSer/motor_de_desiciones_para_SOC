@@ -28,6 +28,13 @@ def profile(a):
     except ValueError:
         return "sin src_ip"
     notes = " ".join(e.get("notes") or [])
+    # Post-H38-C: un fallo servido desde negative cache o el corte por cuota
+    # no llama a la API; se clasifica aparte (si no, su nota "ReadTimeout"
+    # lo haría pasar por timeout real).
+    if "negative cache" in notes or "cuota diaria agotada" in notes:
+        return "TI negative cache / cuota (sin llamada)"
+    if (a.get("block") or {}).get("reason", "").startswith("stale_backlog"):
+        pass  # la antigüedad no cambia el costo de R1; se reporta aparte abajo
     if "Timeout" in notes or "ConnectError" in notes:
         return "TI timeout/error de red"
     if "HTTP 429" in notes:
@@ -49,6 +56,10 @@ for t in (1, 2, 3):
 r2 = [d for _, d, _, act in rows if act == "block"]
 if r2:
     print(f"   R2 con bloqueo ejecutado (Wazuh API): n={len(r2)} mediana {st.median(r2):.2f}s p95 {pct(r2, 95):.2f}s -> {100 * sum(r2) / tot:.1f}% del tiempo")
+stale = sum(1 for a in recs if (a.get("block") or {}).get("reason", "").startswith("stale_backlog"))
+ages = [a["event_age_seconds"] for a in recs if a.get("event_age_seconds") is not None]
+if ages:
+    print(f"   antigüedad de detección: mediana {st.median(ages) / 3600:.2f} h, máx {max(ages) / 3600:.2f} h; R2 omitido por antigüedad: {stale}")
 priv = collections.Counter(a.get("src_ip") for a in recs if profile(a) == "IP privada (sin TI)")
 print(f"   IPs privadas distintas: {len(priv)} -> {priv.most_common(4)}")
 
