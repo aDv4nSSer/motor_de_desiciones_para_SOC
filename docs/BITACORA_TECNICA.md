@@ -1535,8 +1535,55 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 ---
 
+## H38 (seguimiento) — fixes A/B/C desplegados: el backlog se drenó en ~30 min y el worker procesa ~3-5x más rápido
+
+**Fecha:** 2026-10-02. Commits `4329c94` (A, tareas stale sin acción), `976bdd9` (B, dedup/expiración/safelist en el worker), `863e75a` (C, negative caching + cuota global + CrowdSec sin parseo para IPs internas), `bfaa463` (A2, tareas stale con R1 solo de caché), `e6a0674` (UI). `motor-soc` reiniciado ~14:05; `response-worker` reiniciado por Antonio a las 14:06:45 (`-03`).
+
+**Primer barrido de aprobaciones:** `14:07:19 barrido de aprobaciones: 27961 expiradas` (28.210 pendientes en Redis antes del reinicio, menos las de < 4 h), en ~28 s; barridos siguientes: 5 y 2. Cero `ERROR`/`Traceback` desde el arranque.
+
+**Mediciones (mismos scripts de H38, `scripts/diagnostico/h38_worker_lag_*.py`):**
+
+| | Antes (H38) | +10 min (14:17) | +30 min (14:37) |
+|---|---|---|---|
+| `lag` de `soc:response:tasks` | 199.970 | 12.909 | 10.888 |
+| Atraso del último entregado | ~15.3 h | 0.99 h | 0.74 h |
+| Entrada vs. procesadas (ventana de 60 s) | 5.00 vs 2.60 tareas/s | 1.45 vs 5.33 | 8.70 vs 11.47 |
+| Throughput sobre las últimas ~4.000 tareas | 3.35 tareas/s | 15.67 tareas/s | 10.58 tareas/s |
+| Costo de una tarea de IP privada (mediana) | 0.083 s | 0.001 s | 0.009 s |
+
+- **Drenaje real:** `entries-read` del grupo pasó de 11.309.740 (antes del reinicio) a 11.510.956 a las 14:38: **~201.000 tareas en ~32 min (~105/s promedio)**. Las tareas stale (R1 solo caché, sin DNS ni APIs) cuestan ~1-2 ms; las frescas, más. Ninguna tarea stale ejecutó bloqueo, abrió aprobación ni caso.
+- **Dónde va el tiempo ahora (14:37, ya sin tareas stale):** consultas reales a OTX 52.2% (mediana 0.50 s), consultas a OTX con error 19.9% (17 tareas, mediana 4.16 s: el primer fallo de cada IP sigue pagando el timeout, la negative cache solo evita la repetición), tareas sin ninguna llamada 19.5% (mediana 0.088 s: es el parseo de la caché de CrowdSec, que para IPs **públicas** se mantiene, tal como se acordó) e IPs privadas 8.4%.
+- **T1:** 72% de las tareas y solo 8.6% del tiempo. `R1_MIN_TIER=1` deja de ser relevante para la capacidad; se mantiene.
+- **AbuseIPDB quedó cortado por cuota durante toda la medición** (corte global por 429): con ~500 IPs públicas distintas cada ~6 min, el límite de 900 consultas/día se agota en minutos. **Implicancia:** el bloqueo automático exige 2 fuentes corroborando; con AbuseIPDB fuera, solo queda OTX (CrowdSec es observacional y no cuenta), así que en la práctica **toda T3 termina en aprobación humana**. Es un límite del plan gratuito de AbuseIPDB, no del código, y hay que declararlo en limitaciones.
+- **Estado a las 14:38:** todavía drenando (≈ +2.8 tareas/s netas, ~10.900 de lag, atraso 0.74 h). Como el atraso ya es < 1 h, las tareas vuelven a ejecutar acciones reales, con ~45 min de demora residual que debería converger a segundos. Re-medir para confirmar que el lag llega a ~0.
+
+**Estado: MITIGADO.** Causa raíz resuelta (negative caching y CrowdSec), backlog drenado sin acciones sobre eventos viejos. Pendiente: confirmar convergencia, el costo de CrowdSec para IPs públicas (~0.07 s/tarea) y el primer fallo de OTX por IP (circuit breaker por proveedor, CLAUDE.md).
+
+---
+
+## H39 — `soc:response:audit` no se persiste en ningún lado: la auditoría de R1/R2, aprobaciones y accesos vive solo en un stream de Redis capado en 100k
+
+**Fecha:** 2026-10-02 (expuesto por el drenaje rápido de H38).
+
+**Hallazgo:** `soc:response:audit` **no tiene consumer group** (`XINFO GROUPS` vacío) y ningún proceso lo lee para persistirlo: `opensearch_indexer.py` consume solo `soc:decisions` (línea 32). Solo lo escriben el worker (`_audit`, expiraciones de aprobaciones), `auth.log_access_event` (logins, accesos denegados, revocaciones) y `main.py` (aprobaciones manuales), y solo lo lee el dashboard (`xrevrange`). El `xadd` usa `maxlen=100_000, approximate=True`.
+
+- A las 14:38, la entrada más vieja disponible tenía **26.2 min**: el drenaje de ~201.000 tareas de H38 desplazó todo lo anterior. **Ya no existen** los registros de R1/`accion_recomendada`/`stale_backlog_event_age>1h` de las tareas stale, ni los **27.961 eventos `approval_expired`** del primer barrido, ni los eventos de acceso anteriores.
+- **Lo que sí queda trazable:** la decisión del Fast Path de cada `trace_id` (tier, scores, features, hash-chain) en `soc-decisions` de OpenSearch, vía `soc:decisions`. Lo que se pierde es la capa de respuesta: enriquecimiento, acción recomendada y ejecutada, aprobaciones humanas y su resolución, y los accesos al dashboard.
+- **Documentación incorrecta:** el docstring de `motor/auth.py` (líneas 9 y 71-72) dice que los eventos de acceso van "al mismo stream que consume `opensearch_indexer.py` hacia `soc-decisions` (hash-chain, append-only)". No es así.
+- **No lo causó H38:** el gap es previo (el stream siempre estuvo capado y sin consumidor). En operación normal (~5 tareas/s), 100k entradas cubren ~5-6 h; el drenaje a ~105/s lo hizo visible en minutos.
+
+**Implicancias:** la especificación (Ley 21.663/ANCI) pide que cada acceso y cada acción restringida por rol queden en el hash-chain de auditoría, y hoy no quedan. Para la tesis, cualquier métrica de R1/R2 o de aprobaciones calculada sobre `soc:response:audit` solo cubre las últimas horas.
+
+**Opciones (ninguna aplicada, decisión pendiente):** (1) un consumer group del indexador sobre `soc:response:audit` que lo persista con hash-chain, en `soc-decisions` o en un índice propio (`soc-responses`, append-only, ISM); (2) subir el `maxlen` como paliativo, sin persistencia real; (3) corregir los docstrings en cualquier caso.
+
+**Estado: ABIERTO.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
+- **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
+- **Persistir `soc:response:audit` (H39):** hoy ningún proceso lo consume; la auditoría de R1/R2, aprobaciones y accesos vive solo en un stream de Redis capado en 100k (~5-6 h en operación normal). Decidir índice y hash-chain, y corregir los docstrings de `motor/auth.py` que afirman lo contrario.
 - **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
 
 

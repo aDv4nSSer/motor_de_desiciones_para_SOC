@@ -33,10 +33,16 @@ def profile(a):
     # lo haría pasar por timeout real).
     if "evento stale, solo caché" in notes:
         return "TI stale solo caché (sin llamada)"
-    if "negative cache" in notes or "cuota diaria agotada" in notes:
-        return "TI negative cache / cuota (sin llamada)"
-    if (a.get("block") or {}).get("reason", "").startswith("stale_backlog"):
-        pass  # la antigüedad no cambia el costo de R1; se reporta aparte abajo
+    # Una tarea solo "no llamó a nada" si NINGUNA fuente consultó la API:
+    # AbuseIPDB cortado (cuota o negative cache) Y OTX desde caché o negative cache.
+    abuse_cut = "cuota diaria agotada" in notes or "abuseipdb no disponible (negative cache" in notes
+    otx_no_call = "otx no disponible (negative cache" in notes or (e.get("cached") and "otx error" not in notes)
+    if abuse_cut and otx_no_call:
+        return "TI sin llamada (negative cache/cuota)"
+    if abuse_cut:
+        if "otx error" in notes:
+            return "OTX real con error (AbuseIPDB cortado)"
+        return "OTX real OK (AbuseIPDB cortado)"
     if "Timeout" in notes or "ConnectError" in notes:
         return "TI timeout/error de red"
     if "HTTP 429" in notes:
