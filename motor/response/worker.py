@@ -103,7 +103,8 @@ def process_task(
 
     # ── R1: enriquecimiento pasivo ──────────────────────────────────────
     if task.tier >= settings.r1_min_tier:
-        record.enrichment = enrich(task.src_ip, settings, rdb)
+        # Stale: R1 solo con caché, sin APIs externas (H38).
+        record.enrichment = enrich(task.src_ip, settings, rdb, cache_only=stale)
         e = record.enrichment
         log.info(
             f"[{task.trace_id[:8]}] R1 ip={task.src_ip} "

@@ -154,8 +154,9 @@ class TestCorroboracion:
         """Igual que una fuente caída: available=False, fuera del conteo."""
         mocker.patch("response.enrichment.httpx.get", side_effect=httpx.ReadTimeout("x"))
         mocker.patch("response.enrichment._reverse_dns", return_value=None)
+        from response.schemas import EnrichmentResult
         mocker.patch("response.enrichment._crowdsec_lookup",
-                     side_effect=lambda ip, s, r: __import__("response.schemas", fromlist=["EnrichmentResult"]).EnrichmentResult(src_ip=ip))
+                     side_effect=lambda ip, *_: EnrichmentResult(src_ip=ip))
         rdb = TTLRedis()
         enrich(IP, _settings(), rdb)
         cached = enrich(IP, _settings(), rdb)
@@ -192,3 +193,47 @@ def test_costo_por_tarea_de_ip_privada_es_bajo(mocker) -> None:
     for _ in range(50):
         _crowdsec_lookup("10.10.10.3", settings, rdb)
     assert (time.perf_counter() - t0) / 50 < 0.002
+
+
+class TestSoloCacheParaEventosStale:
+    """Opción 1 acordada: una tarea stale enriquece solo con lo cacheado."""
+
+    def test_sin_cache_no_llama_a_ninguna_api_ni_dns_ni_lapi(self, mocker) -> None:
+        get = mocker.patch("response.enrichment.httpx.get")
+        dns = mocker.patch("response.enrichment._reverse_dns")
+        fetch = mocker.patch("response.enrichment.fetch_decisions_stream")
+        r = enrich(IP, _settings(), TTLRedis(), cache_only=True)
+        get.assert_not_called()
+        dns.assert_not_called()
+        fetch.assert_not_called()
+        assert r.abuseipdb_available is False and r.otx_available is False
+        assert "abuseipdb no disponible (evento stale, solo caché)" in r.notes
+        assert "otx no disponible (evento stale, solo caché)" in r.notes
+        assert "crowdsec no disponible (evento stale, solo caché)" in r.notes
+        assert r.corroboration_count == 0
+
+    def test_usa_la_cache_positiva_si_existe(self, mocker) -> None:
+        get = mocker.patch("response.enrichment.httpx.get")
+        rdb = TTLRedis()
+        rdb.kv[f"soc:enrich:{IP}"] = json.dumps({"score": 91, "reports": 12, "country": "NL"})
+        rdb.kv[f"soc:enrich:otx:{IP}"] = json.dumps({"pulse_count": 3})
+        rdb.kv["soc:enrich:crowdsec:decisions"] = json.dumps([{"ip": IP, "scenario": "ssh-bf", "duration": "1h"}])
+        r = enrich(IP, _settings(), rdb, cache_only=True)
+        get.assert_not_called()
+        assert r.abuseipdb_score == 91 and r.otx_pulse_count == 3
+        assert r.crowdsec_observado is True
+        assert r.corroboration_count == 2  # la corroboración con datos cacheados sigue siendo real
+
+    def test_respeta_negative_cache_y_cuota(self, mocker) -> None:
+        mocker.patch("response.enrichment.httpx.get")
+        rdb = TTLRedis()
+        rdb.kv["soc:enrich:abuseipdb:quota_exhausted"] = "HTTP 429"
+        rdb.kv[f"soc:enrich:neg:otx:{IP}"] = "ReadTimeout"
+        r = enrich(IP, _settings(), rdb, cache_only=True)
+        assert any("cuota diaria agotada" in n for n in r.notes)
+        assert any("negative cache: ReadTimeout" in n for n in r.notes)
+
+    def test_modo_normal_sigue_llamando(self, mocker) -> None:
+        get = mocker.patch("response.enrichment.httpx.get", return_value=_resp(200, {"pulse_info": {"count": 0}}))
+        _otx_lookup(IP, _settings(), TTLRedis())
+        get.assert_called_once()

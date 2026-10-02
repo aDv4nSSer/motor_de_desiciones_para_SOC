@@ -144,3 +144,15 @@ class TestOrigenDeLaAntiguedad:
         record = process_task(_task(3, age_s=1200), _settings(stale_event_max_age_seconds=900),
                               env["rdb"], env["enforcer"])
         assert record.block.reason == "stale_backlog_event_age>900s"
+
+
+class TestEnriquecimientoSoloCache:
+    def test_stale_pide_r1_en_modo_solo_cache(self, env) -> None:
+        process_task(_task(3, age_s=5 * 3600), _settings(), env["rdb"], env["enforcer"])
+        assert env["enrich"].call_args.kwargs["cache_only"] is True
+
+    def test_fresca_pide_r1_normal(self, env, mocker) -> None:
+        env["respond_block"].return_value = mocker.MagicMock(
+            action=ActionType.BLOCK, enforced=True, reason="ok", enforcer="wazuh_api")
+        process_task(_task(3, age_s=10), _settings(), env["rdb"], env["enforcer"])
+        assert env["enrich"].call_args.kwargs["cache_only"] is False

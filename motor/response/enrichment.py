@@ -57,6 +57,9 @@ def _is_public_ip(ip: str) -> bool:
     return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
 
 
+STALE_NOTE = "no disponible (evento stale, solo caché)"
+
+
 QUOTA_MIN_SECONDS = 60
 QUOTA_MAX_SECONDS = 86400
 
@@ -106,7 +109,7 @@ def quota_reset_seconds(resp: httpx.Response, now: float | None = None) -> int:
 
 
 def _abuseipdb_lookup(
-    ip: str, settings: ResponseSettings, rdb: redis.Redis
+    ip: str, settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
 ) -> EnrichmentResult:
     """
     Consulta AbuseIPDB con cache. Devuelve EnrichmentResult parcial.
@@ -154,7 +157,13 @@ def _abuseipdb_lookup(
         result.notes.append(f"abuseipdb no disponible (negative cache: {neg})")
         return result
 
-    # 4) Consulta API
+    # 4) Evento stale (H38): solo caché, sin gastar cuota de API en tiempo real
+    if cache_only:
+        result.abuseipdb_available = False
+        result.notes.append(f"abuseipdb {STALE_NOTE}")
+        return result
+
+    # 5) Consulta API
     try:
         resp = httpx.get(
             ABUSEIPDB_URL,
@@ -202,7 +211,7 @@ def _abuseipdb_lookup(
 
 
 def _otx_lookup(
-    ip: str, settings: ResponseSettings, rdb: redis.Redis
+    ip: str, settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
 ) -> EnrichmentResult:
     """
     Consulta OTX/AlienVault con cache. Devuelve EnrichmentResult parcial.
@@ -241,7 +250,13 @@ def _otx_lookup(
         result.notes.append(f"otx no disponible (negative cache: {neg})")
         return result
 
-    # 3) Consulta API
+    # 3) Evento stale (H38): solo caché
+    if cache_only:
+        result.otx_available = False
+        result.notes.append(f"otx {STALE_NOTE}")
+        return result
+
+    # 4) Consulta API
     try:
         resp = httpx.get(
             OTX_URL.format(ip=ip),
@@ -277,7 +292,7 @@ def _otx_lookup(
 
 
 def _crowdsec_lookup(
-    ip: str, settings: ResponseSettings, rdb: redis.Redis
+    ip: str, settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
 ) -> EnrichmentResult:
     """
     H37 Fase 3: consulta si `ip` tiene una decisión activa de CrowdSec.
@@ -314,6 +329,8 @@ def _crowdsec_lookup(
         cached = rdb.get(cache_key)
         if cached:
             decisions_raw = json.loads(cached)
+        elif cache_only:
+            result.notes.append(f"crowdsec {STALE_NOTE}")
         else:
             fresh = fetch_decisions_stream(settings, startup=True)
             decisions_raw = [d.model_dump() for d in fresh]
@@ -370,31 +387,37 @@ def count_corroborating_sources(
 
 
 def enrich(
-    src_ip: Optional[str], settings: ResponseSettings, rdb: redis.Redis
+    src_ip: Optional[str], settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
 ) -> EnrichmentResult:
     """
     Punto de entrada de R1. Enriquece una IP de origen con DNS + reputación
     (AbuseIPDB + OTX/AlienVault) y calcula la corroboración multi-fuente que
     consume R2 (ver `count_corroborating_sources`).
     Siempre devuelve un EnrichmentResult, nunca lanza excepción.
+
+    cache_only (H38, tareas stale del backlog): usa solo lo cacheado
+    (positivo, negativo, cuota, decisiones de CrowdSec); no llama APIs de TI,
+    no refresca CrowdSec ni resuelve DNS. Lo que falte queda "no disponible
+    (evento stale)": una detección que no va a ejecutar ninguna acción no
+    gasta cuota de API en tiempo real.
     """
     if not src_ip:
         r = EnrichmentResult()
         r.notes.append("sin src_ip")
         return r
 
-    result = _abuseipdb_lookup(src_ip, settings, rdb)
-    otx_result = _otx_lookup(src_ip, settings, rdb)
+    result = _abuseipdb_lookup(src_ip, settings, rdb, cache_only)
+    otx_result = _otx_lookup(src_ip, settings, rdb, cache_only)
     result.otx_pulse_count = otx_result.otx_pulse_count
     result.otx_available = otx_result.otx_available
     result.notes.extend(otx_result.notes)
     result.cached = result.cached or otx_result.cached
-    result.reverse_dns = _reverse_dns(src_ip)
+    result.reverse_dns = None if cache_only else _reverse_dns(src_ip)
 
     # H37 Fase 3: CrowdSec, solo observacional -- se calcula DESPUÉS de
     # count_corroborating_sources() para que quede explícito en la lectura
     # del código que no influye en ese conteo (ver _crowdsec_lookup).
-    crowdsec_result = _crowdsec_lookup(src_ip, settings, rdb)
+    crowdsec_result = _crowdsec_lookup(src_ip, settings, rdb, cache_only)
     result.crowdsec_observado = crowdsec_result.crowdsec_observado
     result.crowdsec_scenario = crowdsec_result.crowdsec_scenario
     result.crowdsec_duration = crowdsec_result.crowdsec_duration
