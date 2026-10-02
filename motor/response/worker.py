@@ -23,7 +23,7 @@ import redis
 from response.approvals import create_pending_approval
 from response.cases import open_case
 from response.config import get_settings
-from response.enforcer import build_enforcer, respond_block
+from response.enforcer import build_enforcer, is_safelisted, respond_block
 from response.enrichment import enrich
 from response.schemas import (
     ACCION_ALERTAR_CREAR_CASO,
@@ -52,7 +52,44 @@ def _audit(record: ResponseRecord, rdb: redis.Redis):
         log.warning(f"no se pudo auditar {record.trace_id}: {e}")
 
 
-def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
+def stale_reason(max_age_seconds: int) -> str:
+    """Motivo auditado de una acción omitida por antigüedad, ej.
+    "stale_backlog_event_age>1h" (distinto de un skip por safelist)."""
+    span = f"{max_age_seconds // 3600}h" if max_age_seconds % 3600 == 0 else f"{max_age_seconds}s"
+    return f"stale_backlog_event_age>{span}"
+
+
+def event_age_seconds(task: ResponseTask, enqueued_at: float | None, now: float) -> float | None:
+    """Antigüedad de la detección: task.ts (lo fija el Fast Path al encolar)
+    o, si falta, la marca de tiempo del ID del mensaje en el stream. None si
+    no hay ninguna (la tarea se trata como fresca, igual que antes de H38)."""
+    origin = task.ts or enqueued_at
+    return max(0.0, now - origin) if origin else None
+
+
+def process_task(
+    task: ResponseTask, settings, rdb, enforcer, enqueued_at: float | None = None,
+) -> ResponseRecord:
+    """Procesa una tarea de respuesta (R1 + T2 + R2) y la audita.
+
+    Args:
+        task: tarea encolada por el Fast Path.
+        settings: ResponseSettings.
+        rdb: cliente Redis.
+        enforcer: backend de bloqueo (dry_run / wazuh_api).
+        enqueued_at: epoch del ID del mensaje en el stream, respaldo si
+            task.ts no viene.
+
+    Returns:
+        El ResponseRecord auditado.
+    """
+    now = time.time()
+    age = event_age_seconds(task, enqueued_at, now)
+    # H38: una tarea del backlog con la detección más vieja que el umbral
+    # completa R1 y se audita con su accion_recomendada, pero no ejecuta
+    # nada (ni bloqueo, ni aprobación, ni caso): actuar horas después no es
+    # respuesta, y en enforce bloquearía IPs vistas hace un día.
+    stale = age is not None and age > settings.stale_event_max_age_seconds
     record = ResponseRecord(
         trace_id=task.trace_id,
         tier=task.tier,
@@ -60,7 +97,8 @@ def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
         src_ip=task.src_ip,
         dst_ip=task.dst_ip,
         dst_port=task.dst_port,
-        processed_at=time.time(),
+        processed_at=now,
+        event_age_seconds=round(age, 1) if age is not None else None,
     )
 
     # ── R1: enriquecimiento pasivo ──────────────────────────────────────
@@ -77,7 +115,10 @@ def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
     # Solo T2 exacto -- T3 tiene su propia rama abajo, T0/T1 no generan
     # ningún caso (accion_recomendada queda en su default "" -> ACCION_NINGUNA
     # se asigna explícitamente para que el dashboard no tenga que inferirlo).
-    if task.tier == 2:
+    if task.tier == 2 and stale:
+        record.accion_recomendada = ACCION_ALERTAR_CREAR_CASO
+        log.info(f"[{task.trace_id[:8]}] T2 sin caso: {stale_reason(settings.stale_event_max_age_seconds)} (age={age:.0f}s)")
+    elif task.tier == 2:
         record.accion_recomendada = ACCION_ALERTAR_CREAR_CASO
         case = open_case(
             kind="network_t2_unconfirmed",
@@ -104,8 +145,23 @@ def process_task(task: ResponseTask, settings, rdb, enforcer) -> ResponseRecord:
     # ── R2: acción activa (bloqueo) ─────────────────────────────────────
     if task.tier >= settings.r2_min_tier:
         corroboration_count = record.enrichment.corroboration_count if record.enrichment else 0
+        corroborated = corroboration_count >= settings.min_corroborating_sources_for_autoblock
 
-        if corroboration_count >= settings.min_corroborating_sources_for_autoblock:
+        if stale:
+            # accion_recomendada = lo que se habría recomendado, para
+            # trazabilidad; la acción en sí se omite y queda explícito por qué.
+            reason = stale_reason(settings.stale_event_max_age_seconds)
+            record.block = BlockResult(
+                src_ip=task.src_ip, action=ActionType.BLOCK_SKIPPED, enforced=False,
+                enforcer="none", reason=reason,
+            )
+            if task.src_ip and is_safelisted(task.src_ip, settings):
+                record.accion_recomendada = ACCION_NINGUNA
+            elif corroborated:
+                record.accion_recomendada = ACCION_BLOQUEO_IP
+            else:
+                record.accion_recomendada = ACCION_ALERTAR_PENDIENTE_APROBACION
+        elif corroborated:
             record.block = respond_block(task.src_ip, settings, rdb, enforcer, task.trace_id)
             record.accion_recomendada = (
                 ACCION_BLOQUEO_IP if record.block.action == ActionType.BLOCK
@@ -184,7 +240,8 @@ def run():
                 try:
                     raw = fields.get("data", "{}")
                     task = ResponseTask(**json.loads(raw))
-                    process_task(task, settings, rdb, enforcer)
+                    process_task(task, settings, rdb, enforcer,
+                                 enqueued_at=int(msg_id.split("-")[0]) / 1000)
                 except Exception as e:  # noqa: BLE001 — el worker nunca debe morir
                     log.error(f"tarea {msg_id} falló: {e}")
                 finally:

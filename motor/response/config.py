@@ -60,6 +60,17 @@ class ResponseSettings(BaseSettings):
     blocks_key_prefix: str = "soc:blocks:"        # soc:blocks:<ip> con TTL
     enrich_cache_prefix: str = "soc:enrich:"      # cache AbuseIPDB por IP
 
+    # ── Frescura de tareas (H38) ───────────────────────────────────────
+    # Una tarea cuya detección original (task.ts, encolado por el Fast Path)
+    # tiene más de esta antigüedad completa R1 y se audita con su
+    # accion_recomendada, pero NO ejecuta bloqueo ni abre aprobación/caso:
+    # actuar horas después de la detección (backlog de H38) no es respuesta.
+    stale_event_max_age_seconds: int = 3600
+
+    # ── Aprobaciones humanas (H38) ─────────────────────────────────────
+    approval_ttl_seconds: int = 14400            # 4 h sin resolver -> expired
+    approval_sweep_interval_seconds: int = 60    # barrido de expiración en el worker
+
     # ── R2: parámetros de bloqueo ──────────────────────────────────────
     block_ttl_seconds: int = 1800        # 30 min — alineado con Wazuh AR timeout
     block_extend_on_repeat: bool = True  # si re-ataca, extender TTL en vez de re-bloquear

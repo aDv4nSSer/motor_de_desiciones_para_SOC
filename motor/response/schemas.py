@@ -138,6 +138,9 @@ class ResponseRecord(BaseModel):
     # vigilante/cases.py, ver response/cases.py).
     case_id: str | None = None
     processed_at: float = 0.0
+    # Segundos entre la detección (task.ts) y el inicio del procesamiento.
+    # None si la tarea no trae marca de tiempo (ver worker.process_task).
+    event_age_seconds: float | None = None
     worker: str = "response_worker"
 
     def to_audit_dict(self) -> dict[str, Any]:
