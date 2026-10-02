@@ -47,6 +47,7 @@ from response.approvals import (
     pending_approvals_page,
     resolve_approval,
 )
+from response.approvals import is_expired as is_approval_expired
 from response.config import get_settings as get_response_settings
 from response.enforcer import build_enforcer, is_safelisted
 from response.queue import enqueue_response_task
@@ -406,10 +407,12 @@ def dashboard_approvals(
     # Devuelve {items, total, limit, available}: el total real de la cola,
     # no solo la página (antes el panel mostraba 100 de 257 como si fueran todas).
     rdb = get_dashboard_redis()
-    page = pending_approvals_page(rdb, limit)
+    settings = get_response_settings()
+    # ttl: oculta las vencidas aunque el barrido del worker no haya corrido
+    # todavía (p. ej. con el worker caído). Solo lectura.
+    page = pending_approvals_page(rdb, limit, ttl_seconds=settings.approval_ttl_seconds)
     # Marca las IPs de safelist (infra propia): el panel no ofrece aprobarlas
     # y el endpoint de resolución lo rechaza igual (ver más abajo).
-    settings = get_response_settings()
     for item in page["items"]:
         item["safelisted"] = is_safelisted(item.get("src_ip") or "", settings)
     return page
@@ -428,6 +431,16 @@ def dashboard_resolve_approval(
     approval = get_approval(trace_id, rdb)
     if approval is None:
         raise HTTPException(status_code=404, detail="Aprobación no encontrada")
+    if approval["status"] == "expired" or (
+        approval["status"] == "pending"
+        and is_approval_expired(approval, get_response_settings().approval_ttl_seconds)
+    ):
+        # Vencida: nadie la decidió a tiempo. La transición a "expired" y su
+        # auditoría las hace el barrido del worker; acá solo no se actúa.
+        raise HTTPException(
+            status_code=409,
+            detail="La aprobación expiró (más de 4 h sin resolver). Si la amenaza sigue, un evento nuevo abrirá otra.",
+        )
     if approval["status"] != "pending":
         raise HTTPException(status_code=409, detail=f"Ya resuelta ({approval['status']})")
 

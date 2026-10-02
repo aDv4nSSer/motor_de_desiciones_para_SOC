@@ -20,7 +20,7 @@ import logging
 import time
 
 import redis
-from response.approvals import create_pending_approval
+from response.approvals import create_pending_approval, expire_stale_approvals
 from response.cases import open_case
 from response.config import get_settings
 from response.enforcer import build_enforcer, is_safelisted, respond_block
@@ -167,6 +167,15 @@ def process_task(
                 ACCION_BLOQUEO_IP if record.block.action == ActionType.BLOCK
                 else ACCION_NINGUNA  # ya bloqueada / safelisted / dry_run sin ejecutar
             )
+        elif task.src_ip and is_safelisted(task.src_ip, settings):
+            # Infra propia: nunca se ofrece aprobar un bloqueo sobre ella (la
+            # aprobación manual iba directo al enforcer, ver H38). Mismo
+            # motivo que usa respond_block para el skip por safelist.
+            record.block = BlockResult(
+                src_ip=task.src_ip, action=ActionType.BLOCK_SKIPPED, enforced=False,
+                enforcer="none", reason="safelisted (infra del lab)",
+            )
+            record.accion_recomendada = ACCION_NINGUNA
         else:
             # Score/tier alto pero sin corroboración multi-fuente suficiente:
             # no se ejecuta bloqueo automático (evita el falso positivo tipo
@@ -199,6 +208,31 @@ def process_task(
     return record
 
 
+def sweep_expired_approvals(settings, rdb) -> int:
+    """Expira las aprobaciones pendientes con más de approval_ttl_seconds y
+    publica cada una en soc:response:audit como "expired" (distinto de un
+    rejected: nadie la decidió). Devuelve cuántas expiró."""
+    expired = expire_stale_approvals(rdb, settings.approval_ttl_seconds)
+    for a in expired:
+        payload = {
+            "approval_expired": True,
+            "trace_id": a["trace_id"],
+            "src_ip": a.get("src_ip"),
+            "status": "expired",
+            "resolved_by": a.get("resolved_by"),
+            "created_at": a.get("created_at"),
+            "expired_at": a.get("resolved_at"),
+            "occurrences": a.get("occurrences", 1),
+            "ttl_seconds": settings.approval_ttl_seconds,
+        }
+        try:
+            rdb.xadd("soc:response:audit", {"data": json.dumps(payload)},
+                     maxlen=100_000, approximate=True)
+        except redis.RedisError as e:
+            log.warning(f"no se pudo auditar expiración de {a['trace_id']}: {e}")
+    return len(expired)
+
+
 def run():
     settings = get_settings()
     rdb = redis.Redis(
@@ -221,7 +255,17 @@ def run():
         if "BUSYGROUP" not in str(e):
             raise
 
+    last_sweep = 0.0
     while True:
+        if time.time() - last_sweep >= settings.approval_sweep_interval_seconds:
+            last_sweep = time.time()
+            try:
+                n = sweep_expired_approvals(settings, rdb)
+                if n:
+                    log.info(f"barrido de aprobaciones: {n} expiradas")
+            except Exception as e:  # noqa: BLE001 — el barrido nunca debe tumbar el worker
+                log.error(f"barrido de aprobaciones falló: {e}")
+
         try:
             msgs = rdb.xreadgroup(
                 settings.response_group, settings.response_consumer,

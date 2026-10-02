@@ -44,7 +44,8 @@ def app_env(monkeypatch, mocker):
     enforcer = mocker.MagicMock()
     enforcer.block.return_value = (True, None)
     monkeypatch.setattr(main, "build_enforcer", lambda settings: enforcer)
-    monkeypatch.setattr(main, "get_response_settings", lambda: mocker.MagicMock(block_ttl_seconds=3600))
+    monkeypatch.setattr(main, "get_response_settings", lambda: mocker.MagicMock(
+        block_ttl_seconds=3600, approval_ttl_seconds=14400, safelist=set()))
 
     def as_role(role: str) -> None:
         main.app.dependency_overrides[main.get_current_user] = (
@@ -144,7 +145,7 @@ class TestOtrosCaminos:
 class TestListadoConTotal:
     def test_endpoint_devuelve_total_y_respeta_limit(self, app_env) -> None:
         for i in range(7):
-            app_env["pending"](f"t-{i}", "N1")
+            app_env["pending"](f"t-{i}", "N1", src_ip=f"1.2.3.{10 + i}")
         app_env["as_role"]("N1")
         body = app_env["client"].get("/api/v1/dashboard/approvals", params={"limit": 3}).json()
         assert body["total"] == 7
@@ -188,3 +189,44 @@ class TestSafelist:
         items = {i["trace_id"]: i for i in app_env["client"].get("/api/v1/dashboard/approvals").json()["items"]}
         assert items["t-infra"]["safelisted"] is True
         assert items["t-ext"]["safelisted"] is False
+
+
+class TestExpiradas:
+    def _envejecer(self, app_env, trace_id: str, hours: float) -> None:
+        import json as _json
+        from datetime import datetime, timedelta, timezone
+        a = app_env["get"](trace_id)
+        a["created_at"] = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        app_env["rdb"]._kv[f"soc:approvals:{trace_id}"] = _json.dumps(a)
+
+    def test_pendiente_vencida_por_edad_409_sin_ejecutar(self, app_env) -> None:
+        """Aunque el barrido del worker no haya corrido, motor-soc no actúa
+        sobre una aprobación de más de 4 h."""
+        app_env["pending"]("t-vieja", "N1")
+        self._envejecer(app_env, "t-vieja", 5)
+        app_env["as_role"]("CISO")
+        resp = _resolve(app_env, "t-vieja")
+        assert resp.status_code == 409
+        assert "expiró" in resp.json()["detail"]
+        app_env["enforcer"].block.assert_not_called()
+
+    def test_ya_expirada_409_con_mensaje_de_expiracion(self, app_env) -> None:
+        from response.approvals import expire_stale_approvals
+        app_env["pending"]("t-vieja", "N1")
+        self._envejecer(app_env, "t-vieja", 5)
+        expire_stale_approvals(app_env["rdb"], 4 * 3600)
+        app_env["as_role"]("N1")
+        resp = _resolve(app_env, "t-vieja", "rejected")
+        assert resp.status_code == 409
+        assert "expiró" in resp.json()["detail"]
+
+    def test_listado_no_muestra_vencidas_y_trae_ocurrencias(self, app_env) -> None:
+        app_env["pending"]("t-vieja", "N1", src_ip="1.1.1.1")
+        self._envejecer(app_env, "t-vieja", 5)
+        app_env["pending"]("t-a", "N1", src_ip="2.2.2.2")
+        app_env["pending"]("t-b", "N1", src_ip="2.2.2.2")
+        app_env["as_role"]("N1")
+        body = app_env["client"].get("/api/v1/dashboard/approvals").json()
+        assert body["total"] == 1
+        assert body["items"][0]["src_ip"] == "2.2.2.2"
+        assert body["items"][0]["occurrences"] == 2

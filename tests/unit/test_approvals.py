@@ -30,29 +30,45 @@ from response.schemas import ActionType, BlockResult, ResponseRecord
 
 
 class FakeRedis:
-    """Redis mínimo en memoria — solo lo que approvals.py necesita
-    (get/set con nx/sadd/srem/smembers). `fail_on` hace que esos comandos
-    lancen RedisError para probar la degradación."""
+    """Redis mínimo en memoria — lo que approvals.py necesita: strings
+    (get/set nx/delete), sets (sadd/srem/smembers), hashes (hset/hincrby/
+    hgetall) y pipeline con WATCH/MULTI/EXEC. Cada escritura sube la versión
+    de la clave; EXEC lanza WatchError si una clave vigilada cambió, igual
+    que Redis. `fail_on` hace que esos comandos lancen RedisError.
+    `on_watch` permite inyectar una escritura concurrente entre WATCH y EXEC."""
 
     def __init__(self, fail_on: set[str] | None = None):
         self._kv: dict[str, str] = {}
         self._sets: dict[str, set[str]] = {}
+        self._hashes: dict[str, dict[str, str]] = {}
+        self._ver: dict[str, int] = {}
         self._fail_on = fail_on or set()
+        self.on_watch = None
 
     def _maybe_fail(self, op: str) -> None:
         if op in self._fail_on:
             raise redis.ConnectionError(f"redis caído ({op})")
+
+    def _touch(self, key) -> None:
+        self._ver[key] = self._ver.get(key, 0) + 1
 
     def set(self, key, value, nx=False):
         self._maybe_fail("set")
         if nx and key in self._kv:
             return None
         self._kv[key] = value
+        self._touch(key)
         return True
 
     def get(self, key):
         self._maybe_fail("get")
         return self._kv.get(key)
+
+    def delete(self, key):
+        self._maybe_fail("delete")
+        existed = self._kv.pop(key, None) is not None
+        self._touch(key)
+        return int(existed)
 
     def sadd(self, key, value):
         self._maybe_fail("sadd")
@@ -64,7 +80,71 @@ class FakeRedis:
 
     def smembers(self, key):
         self._maybe_fail("smembers")
-        return self._sets.get(key, set())
+        return set(self._sets.get(key, set()))
+
+    def hset(self, key, mapping):
+        self._maybe_fail("hset")
+        self._hashes.setdefault(key, {}).update({k: str(v) for k, v in mapping.items()})
+
+    def hincrby(self, key, field, amount=1):
+        self._maybe_fail("hincrby")
+        h = self._hashes.setdefault(key, {})
+        h[field] = str(int(h.get(field, 0)) + amount)
+        return int(h[field])
+
+    def hgetall(self, key):
+        self._maybe_fail("hgetall")
+        return dict(self._hashes.get(key, {}))
+
+    def pipeline(self, transaction=True):
+        return _FakePipeline(self)
+
+
+class _FakePipeline:
+    def __init__(self, r: FakeRedis):
+        self.r = r
+        self.watched: dict[str, int] = {}
+        self.queued: list[tuple[str, tuple, dict]] = []
+        self.buffering = True  # sin WATCH, todo se encola hasta execute()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def watch(self, *keys):
+        self.buffering = False
+        for k in keys:
+            self.watched[k] = self.r._ver.get(k, 0)
+        if self.r.on_watch:
+            hook, self.r.on_watch = self.r.on_watch, None
+            hook()
+
+    def unwatch(self):
+        self.watched = {}
+
+    def multi(self):
+        self.buffering = True
+
+    def __getattr__(self, name):
+        target = getattr(self.r, name)
+
+        def call(*args, **kwargs):
+            if self.buffering:
+                self.queued.append((name, args, kwargs))
+                return self
+            return target(*args, **kwargs)
+        return call
+
+    def execute(self):
+        for k, v in self.watched.items():
+            if self.r._ver.get(k, 0) != v:
+                self.queued = []
+                raise redis.WatchError(f"clave vigilada cambió: {k}")
+        results = [getattr(self.r, n)(*a, **kw) for n, a, kw in self.queued]
+        self.queued, self.watched = [], {}
+        return results
 
 
 def _record(trace_id: str = "trace-cuarentena-1", approval_level: str = "N2",
@@ -85,7 +165,9 @@ class TestCreatePendingApproval:
         approval = create_pending_approval(_record(), rdb)
         assert approval["status"] == "pending"
         assert approval["approval_level"] == "N2"
-        assert get_approval("trace-cuarentena-1", rdb) == approval
+        assert approval["occurrences"] == 1
+        stored = get_approval("trace-cuarentena-1", rdb)
+        assert stored.items() <= approval.items()
         assert rdb.smembers(APPROVALS_INDEX_KEY) == {"trace-cuarentena-1"}
 
     def test_idempotente_mismo_trace_id_no_duplica_ni_pisa(self) -> None:
@@ -202,7 +284,7 @@ class TestListPendingApprovals:
     def test_solo_pendientes_mas_recientes_primero_con_limite(self) -> None:
         rdb = FakeRedis()
         for i in range(3):
-            create_pending_approval(_record(f"trace-{i}"), rdb)
+            create_pending_approval(_record(f"trace-{i}", src_ip=f"1.2.3.{10 + i}"), rdb)
             stored = json.loads(rdb.get(f"{APPROVALS_KEY_PREFIX}trace-{i}"))
             stored["created_at"] = f"2026-09-30T10:0{i}:00+00:00"
             rdb.set(f"{APPROVALS_KEY_PREFIX}trace-{i}", json.dumps(stored))
@@ -225,7 +307,7 @@ class TestPendingApprovalsPage:
     def _con_pendientes(self, n: int) -> FakeRedis:
         rdb = FakeRedis()
         for i in range(n):
-            create_pending_approval(_record(f"trace-{i:03d}"), rdb)
+            create_pending_approval(_record(f"trace-{i:03d}", src_ip=f"1.2.{i // 200}.{i % 200}"), rdb)
         return rdb
 
     def test_total_real_aunque_la_pagina_sea_menor(self) -> None:

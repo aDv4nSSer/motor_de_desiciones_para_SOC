@@ -32,20 +32,20 @@ def _settings(**overrides) -> ResponseSettings:
 def _task(tier: int = 3) -> ResponseTask:
     return ResponseTask(
         trace_id="trace-corrob-1", tier=tier, risk_score=0.9,
-        src_ip="203.0.113.5", dst_ip="10.10.10.3", L4_DST_PORT=443,
+        src_ip="1.2.3.5", dst_ip="10.10.10.3", L4_DST_PORT=443,
     )
 
 
 class TestTwoOrMoreSourcesGoesAutomatic:
     def test_two_sources_corroborate_calls_respond_block(self, mocker) -> None:
         settings = _settings()
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
             return_value=EnrichmentResult(
-                src_ip="203.0.113.5", corroboration_count=2,
+                src_ip="1.2.3.5", corroboration_count=2,
                 corroborating_sources=["abuseipdb", "otx"],
             ),
         )
@@ -68,13 +68,13 @@ class TestFewerThanTwoSourcesRequiresApproval:
         self, mocker
     ) -> None:
         settings = _settings()
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
             return_value=EnrichmentResult(
-                src_ip="203.0.113.5", corroboration_count=1,
+                src_ip="1.2.3.5", corroboration_count=1,
                 corroborating_sources=["abuseipdb"],
             ),
         )
@@ -90,13 +90,13 @@ class TestFewerThanTwoSourcesRequiresApproval:
 
     def test_zero_sources_skips_respond_block(self, mocker) -> None:
         settings = _settings()
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
             return_value=EnrichmentResult(
-                src_ip="203.0.113.5", corroboration_count=0, corroborating_sources=[],
+                src_ip="1.2.3.5", corroboration_count=0, corroborating_sources=[],
             ),
         )
         respond_block = mocker.patch("response.worker.respond_block")
@@ -110,13 +110,13 @@ class TestFewerThanTwoSourcesRequiresApproval:
         """Fuente caída no cuenta a favor: aunque el score haya sido alto,
         si no quedó corroborado por al menos 2 fuentes disponibles, no bloquea."""
         settings = _settings()
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
             return_value=EnrichmentResult(
-                src_ip="203.0.113.5", abuseipdb_score=95, abuseipdb_available=False,
+                src_ip="1.2.3.5", abuseipdb_score=95, abuseipdb_available=False,
                 corroboration_count=0, corroborating_sources=[],
             ),
         )
@@ -134,7 +134,7 @@ class TestEnrichmentMissingFailsSafe:
         corroboración se trata igual que corroboración insuficiente — nunca
         se asume corroborado sin datos."""
         settings = _settings(r1_min_tier=5)  # fuerza a que R1 no dispare
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         enrich_mock = mocker.patch("response.worker.enrich")
@@ -150,12 +150,12 @@ class TestEnrichmentMissingFailsSafe:
 class TestBelowR2ThresholdNeverReachesGate:
     def test_tier_below_r2_min_tier_does_not_touch_block_logic(self, mocker) -> None:
         settings = _settings()
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
-            return_value=EnrichmentResult(src_ip="203.0.113.5"),
+            return_value=EnrichmentResult(src_ip="1.2.3.5"),
         )
         respond_block = mocker.patch("response.worker.respond_block")
 
@@ -185,13 +185,13 @@ class TestR2MinTierDefaultMatchesSpec:
         corroborando NO debe intentar bloquear — la tabla de la especificación
         no contempla bloqueo automático en T2 bajo ninguna circunstancia."""
         settings = ResponseSettings(response_mode="dry_run")
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
             return_value=EnrichmentResult(
-                src_ip="203.0.113.5", corroboration_count=2,
+                src_ip="1.2.3.5", corroboration_count=2,
                 corroborating_sources=["abuseipdb", "otx"],
             ),
         )
@@ -208,13 +208,13 @@ class TestR2MinTierDefaultMatchesSpec:
         """Confirma que subir r2_min_tier a 3 no rompió el camino automático
         real de T3 con corroboración suficiente."""
         settings = ResponseSettings(response_mode="dry_run")
-        rdb = mocker.MagicMock()
+        rdb = mocker.MagicMock(**{'get.return_value': None})  # Redis vacío: sin aprobación abierta para la IP
         enforcer = mocker.MagicMock(name="dry_run")
 
         mocker.patch(
             "response.worker.enrich",
             return_value=EnrichmentResult(
-                src_ip="203.0.113.5", corroboration_count=2,
+                src_ip="1.2.3.5", corroboration_count=2,
                 corroborating_sources=["abuseipdb", "otx"],
             ),
         )

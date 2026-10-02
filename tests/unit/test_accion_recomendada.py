@@ -34,7 +34,7 @@ def _settings(**overrides) -> ResponseSettings:
 
 def _task(tier: int) -> ResponseTask:
     return ResponseTask(trace_id=f"trace-accion-{tier}", tier=tier, risk_score=0.5,
-                         src_ip="203.0.113.9", dst_ip="10.10.10.3", L4_DST_PORT=443)
+                         src_ip="1.2.3.9", dst_ip="10.10.10.3", L4_DST_PORT=443)
 
 
 class TestT0T1SinAccion:
@@ -48,7 +48,7 @@ class TestT0T1SinAccion:
     def test_tier_one_enriches_pero_sigue_sin_accion(self, mocker) -> None:
         settings = _settings()
         rdb = mocker.MagicMock()
-        mocker.patch("response.worker.enrich", return_value=EnrichmentResult(src_ip="203.0.113.9"))
+        mocker.patch("response.worker.enrich", return_value=EnrichmentResult(src_ip="1.2.3.9"))
         record = process_task(_task(1), settings, rdb, mocker.MagicMock())
         assert record.accion_recomendada == ACCION_NINGUNA
 
@@ -57,7 +57,7 @@ class TestT2AlertaYCaso:
     def test_tier_two_recomienda_alertar_y_abre_caso(self, mocker) -> None:
         settings = _settings()
         rdb = mocker.MagicMock()
-        mocker.patch("response.worker.enrich", return_value=EnrichmentResult(src_ip="203.0.113.9"))
+        mocker.patch("response.worker.enrich", return_value=EnrichmentResult(src_ip="1.2.3.9"))
         open_case_mock = mocker.patch(
             "response.worker.open_case",
             return_value={"case_id": "caso-123", "kind": "network_t2_unconfirmed"},
@@ -78,7 +78,7 @@ class TestT3RedRecomendaciones:
         rdb = mocker.MagicMock()
         mocker.patch(
             "response.worker.enrich",
-            return_value=EnrichmentResult(src_ip="203.0.113.9", corroboration_count=2,
+            return_value=EnrichmentResult(src_ip="1.2.3.9", corroboration_count=2,
                                            corroborating_sources=["abuseipdb", "otx"]),
         )
         mocker.patch(
@@ -97,7 +97,7 @@ class TestT3RedRecomendaciones:
         rdb = mocker.MagicMock()
         mocker.patch(
             "response.worker.enrich",
-            return_value=EnrichmentResult(src_ip="203.0.113.9", corroboration_count=1,
+            return_value=EnrichmentResult(src_ip="1.2.3.9", corroboration_count=1,
                                            corroborating_sources=["abuseipdb"]),
         )
         create_pending_mock = mocker.patch("response.worker.create_pending_approval")
@@ -115,7 +115,7 @@ class TestT3RedRecomendaciones:
         rdb = mocker.MagicMock()
         mocker.patch(
             "response.worker.enrich",
-            return_value=EnrichmentResult(src_ip="203.0.113.9", corroboration_count=2,
+            return_value=EnrichmentResult(src_ip="1.2.3.9", corroboration_count=2,
                                            corroborating_sources=["abuseipdb", "otx"]),
         )
         mocker.patch(
