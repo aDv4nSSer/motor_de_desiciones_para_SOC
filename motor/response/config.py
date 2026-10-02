@@ -85,6 +85,13 @@ class ResponseSettings(BaseSettings):
     otx_cache_ttl: int = 21600           # 6h — mismo criterio que AbuseIPDB
     otx_timeout: float = 4.0
 
+    # ── R1: negative caching de TI (H38, "negative caching obligatorio") ─
+    # Un fallo de red/HTTP de AbuseIPDB u OTX se cachea por IP este tiempo:
+    # sin esto, cada tarea de la misma IP volvía a pagar el timeout de 4 s
+    # (~61% del tiempo del worker en H38). El 429 de cuota de AbuseIPDB no es
+    # por IP: corta la fuente entera hasta el reset (Retry-After).
+    ti_negative_cache_ttl: int = 600
+
     # ── R1: CrowdSec (H37) — bouncer de SOLO LECTURA "r-soar-reader" ────
     # LAPI corre en .139 (agente local, colección crowdsecurity/suricata),
     # bindeada solo en la interfaz de VLAN10 (10.10.10.1:8081) para que este

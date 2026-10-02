@@ -38,7 +38,9 @@ def test_crowdsec_signal_alone_does_not_trigger_autoblock():
         crowdsec_api_key="fake-key",  # pragma: allowlist secret -- valor de prueba, no un secreto real
     )
     rdb = _FakeRedis()
-    ip = "203.0.113.55"  # TEST-NET-3, RFC 5737 -- IP pública de documentación
+    # IP pública real: 203.0.113.0/24 (TEST-NET-3) es de documentación y
+    # ipaddress la trata como no global, así que _crowdsec_lookup ya no la busca.
+    ip = "1.2.3.55"
 
     fake_decision = CrowdSecDecision(
         ip=ip, scenario="crowdsecurity/ssh-bf", duration="3h59m",

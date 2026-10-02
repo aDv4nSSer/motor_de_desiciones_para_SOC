@@ -16,6 +16,8 @@ import ipaddress
 import json
 import logging
 import socket
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -55,6 +57,54 @@ def _is_public_ip(ip: str) -> bool:
     return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
 
 
+QUOTA_MIN_SECONDS = 60
+QUOTA_MAX_SECONDS = 86400
+
+
+def _neg_key(settings: ResponseSettings, provider: str, ip: str) -> str:
+    return f"{settings.enrich_cache_prefix}neg:{provider}:{ip}"
+
+
+def _abuseipdb_quota_key(settings: ResponseSettings) -> str:
+    return f"{settings.enrich_cache_prefix}abuseipdb:quota_exhausted"
+
+
+def _negative_reason(rdb: redis.Redis, key: str) -> Optional[str]:
+    """Motivo cacheado de un fallo reciente, o None. Un error de Redis acá
+    no bloquea: se sigue como si no hubiera negative cache."""
+    try:
+        raw = rdb.get(key)
+    except redis.RedisError as e:
+        log.warning(f"negative cache no legible ({key}): {e}")
+        return None
+    return raw if raw else None
+
+
+def _set_negative(rdb: redis.Redis, key: str, ttl: int, reason: str) -> None:
+    try:
+        rdb.setex(key, ttl, reason)
+    except redis.RedisError as e:
+        log.warning(f"negative cache no escribible ({key}): {e}")
+
+
+def quota_reset_seconds(resp: httpx.Response, now: float | None = None) -> int:
+    """Segundos hasta que se repone la cuota de AbuseIPDB tras un 429:
+    Retry-After; si falta, X-RateLimit-Reset (epoch); si falta, la próxima
+    medianoche UTC. Acotado a [1 min, 24 h]."""
+    now = now if now is not None else time.time()
+    seconds: float | None = None
+    try:
+        seconds = float(resp.headers["Retry-After"])
+    except (KeyError, ValueError):
+        try:
+            seconds = float(resp.headers["X-RateLimit-Reset"]) - now
+        except (KeyError, ValueError):
+            today = datetime.fromtimestamp(now, timezone.utc).date()
+            midnight = datetime.combine(today + timedelta(days=1), datetime.min.time(), timezone.utc)
+            seconds = midnight.timestamp() - now
+    return int(min(QUOTA_MAX_SECONDS, max(QUOTA_MIN_SECONDS, seconds)))
+
+
 def _abuseipdb_lookup(
     ip: str, settings: ResponseSettings, rdb: redis.Redis
 ) -> EnrichmentResult:
@@ -90,7 +140,21 @@ def _abuseipdb_lookup(
     except (redis.RedisError, json.JSONDecodeError) as e:
         log.warning(f"cache read fallida para {ip}: {e}")
 
-    # 2) Cache miss -> consulta API
+    # 2) Cuota de la cuenta agotada: corte global hasta el reset (no por IP)
+    quota = _negative_reason(rdb, _abuseipdb_quota_key(settings))
+    if quota:
+        result.abuseipdb_available = False
+        result.notes.append("abuseipdb: cuota diaria agotada, sin consultar hasta el reset")
+        return result
+
+    # 3) Fallo reciente para esta IP (negative cache)
+    neg = _negative_reason(rdb, _neg_key(settings, "abuseipdb", ip))
+    if neg:
+        result.abuseipdb_available = False
+        result.notes.append(f"abuseipdb no disponible (negative cache: {neg})")
+        return result
+
+    # 4) Consulta API
     try:
         resp = httpx.get(
             ABUSEIPDB_URL,
@@ -123,10 +187,15 @@ def _abuseipdb_lookup(
         code = e.response.status_code
         result.notes.append(f"abuseipdb HTTP {code}")
         if code == 429:
-            log.warning("AbuseIPDB rate limit (900/día) alcanzado")
+            wait = quota_reset_seconds(e.response)
+            _set_negative(rdb, _abuseipdb_quota_key(settings), wait, "HTTP 429")
+            log.warning(f"AbuseIPDB cuota agotada: sin consultas por {wait}s")
+        else:
+            _set_negative(rdb, _neg_key(settings, "abuseipdb", ip), settings.ti_negative_cache_ttl, f"HTTP {code}")
     except (httpx.HTTPError, ValueError) as e:
         result.abuseipdb_available = False
         result.notes.append(f"abuseipdb error: {type(e).__name__}")
+        _set_negative(rdb, _neg_key(settings, "abuseipdb", ip), settings.ti_negative_cache_ttl, type(e).__name__)
         log.warning(f"AbuseIPDB no disponible para {ip}: {e}")
 
     return result
@@ -165,7 +234,14 @@ def _otx_lookup(
     except (redis.RedisError, json.JSONDecodeError) as e:
         log.warning(f"cache read fallida (otx) para {ip}: {e}")
 
-    # 2) Cache miss -> consulta API
+    # 2) Fallo reciente para esta IP (negative cache)
+    neg = _negative_reason(rdb, _neg_key(settings, "otx", ip))
+    if neg:
+        result.otx_available = False
+        result.notes.append(f"otx no disponible (negative cache: {neg})")
+        return result
+
+    # 3) Consulta API
     try:
         resp = httpx.get(
             OTX_URL.format(ip=ip),
@@ -190,9 +266,11 @@ def _otx_lookup(
         result.otx_available = False
         code = e.response.status_code
         result.notes.append(f"otx HTTP {code}")
+        _set_negative(rdb, _neg_key(settings, "otx", ip), settings.ti_negative_cache_ttl, f"HTTP {code}")
     except (httpx.HTTPError, ValueError) as e:
         result.otx_available = False
         result.notes.append(f"otx error: {type(e).__name__}")
+        _set_negative(rdb, _neg_key(settings, "otx", ip), settings.ti_negative_cache_ttl, type(e).__name__)
         log.warning(f"OTX no disponible para {ip}: {e}")
 
     return result
@@ -218,6 +296,13 @@ def _crowdsec_lookup(
     criterio que AbuseIPDB/OTX.
     """
     result = EnrichmentResult(src_ip=ip)
+
+    # H38: la caché de decisiones pesa ~2.8 MiB (23.804 entradas) y se
+    # deserializaba entera en cada tarea, incluidas las de IP interna (64%
+    # de las tareas): una IP no pública no se busca.
+    if not _is_public_ip(ip):
+        result.notes.append("crowdsec: IP no pública, no se consulta")
+        return result
 
     if not settings.crowdsec_lapi_url or not settings.crowdsec_api_key:
         result.notes.append("crowdsec: lapi_url/api_key no configurada")
