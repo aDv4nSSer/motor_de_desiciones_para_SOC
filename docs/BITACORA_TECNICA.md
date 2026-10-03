@@ -1620,7 +1620,11 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 - **`ruff` no está en `.pre-commit-config.yaml`** aunque CLAUDE.md lo lista como hook obligatorio (solo corren bandit, detect-secrets y los hooks genéricos), y el repo no tiene configuración de ruff: corrido a mano con los defaults de ruff 0.16 sobre los archivos de este fix, dio 11 hallazgos (ya corregidos). Agregarlo al hook con una configuración explícita y limpiar el resto del repo de una vez.
 - **Ningún servicio del repo usa `structlog`** pese a que `.claude/rules/observability.md` lo exige (tampoco está instalado en `.140` ni en `requirements.txt`). Todos usan `logging` de la stdlib. Migrar todos los servicios de una sola vez, no parche por parche.
 
-**Estado: RESUELTO** (fix en código; el proceso en ejecución arrancó bien en su segundo intento y no necesitó reinicio para seguir funcionando).
+**Resultado final (2026-10-03):** fix `ce3f29e` desplegado. Antes del reinicio se probó el arranque en frío del código nuevo en un proceso aparte (bootstrap real contra OpenSearch/Redis de producción, idempotente y sin consumir el stream): `bootstrap OK` en una ronda, sin reintentos. Antonio reinició el servicio a las 02:34:54 (`-03`): el proceso nuevo (PID 911048, reemplaza al 905322) logueó solo `cabeza de la cadena: chain_seq=25096 hash=d700d889678c24cc`, sin `bootstrap_retry` ni crash, y quedó en silencio (httpx a WARNING).
+
+**Verificación del hash-chain a través del reinicio:** `scripts/verify_response_chain.py` sobre la cadena completa: **28.552 documentos, `chain_seq` 1 → 28552, cadena íntegra** (exit 0). Empalme explícito entre procesos: el último documento del proceso viejo (`chain_seq` 25096, hash `d700d889678c24cc…`) es la cabeza que leyó el nuevo, y su primer documento (25097) tiene `prev_hash = d700d889678c24cc…`; `verify_chain` del tramo 25094-25099 íntegro. Consumer group sin pérdida (13 pendientes = el lote en vuelo) y lag bajando (77.617 → 77.113 en 30 s, ~17/s neto: el backlog inicial de H39 se termina de persistir en ~1.3 h).
+
+**Estado: CERRADO.** Pendientes que deja este hallazgo, anotados en la lista general (sección *Pendientes detectados*): `ruff` en `.pre-commit-config.yaml` con configuración propia, migración de todos los servicios a `structlog`, y `.opendistro-ism-config` con `replicas: 1` (clúster en `yellow`). Ninguno se abrió en esta sesión.
 
 ---
 
