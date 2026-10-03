@@ -10,10 +10,14 @@ Recorre el índice en porciones de una hora de `timestamp` (cada consulta
 toca solo su porción: ordenar el índice entero vence cualquier timeout en un
 nodo) y con memoria acotada:
 - por documento: recalcula el hash con la fórmula vieja (discrepancias);
-- por enlace: compara cada prev_hash con los hashes de los últimos
-  --window documentos (huecos = prev_hash sin documento previo en la
-  ventana: pérdida, o desorden mayor que la ventana) y cuenta prev_hash
-  repetidos (bifurcaciones), listando las primeras.
+- por enlace: un prev_hash cuyo padre todavía no apareció queda "pendiente
+  de resolver"; si el padre aparece dentro de los siguientes --window
+  documentos (en cualquier sentido), no es hueco. El orden por timestamp
+  NO es el orden de la cadena: el scoring corre en paralelo y un hijo puede
+  tener el mismo timestamp, o uno hasta ~1 ms anterior, que su padre
+  (verificado en H42). Solo cuenta como hueco un padre que no aparece en
+  toda la ventana: pérdida real, o desorden mayor que la ventana.
+  También cuenta prev_hash repetidos (bifurcaciones), listando las primeras.
 
 Por defecto, solo las últimas --hours horas. --all recorre el índice
 completo (~17.9 M documentos): lectura pesada sobre producción, solo con
@@ -60,10 +64,12 @@ class ChainStats:
     def __init__(self, window: int):
         self.window = window
         self.recent: OrderedDict[str, dict] = OrderedDict()   # hash -> doc (últimos N)
-        self.children: dict[str, int] = {}                    # prev_hash -> hijos vistos (acotado igual)
+        self.children: dict[str, int] = {}                    # prev_hash -> hijos vistos
+        self.unresolved: OrderedDict[str, tuple[int, dict]] = OrderedDict()  # prev_hash -> (índice, ejemplo)
         self.total = 0
         self.bad: list[dict] = []
         self.gaps = 0
+        self.inversions_resolved = 0
         self.gap_examples: list[dict] = []
         self.forks: list[dict] = []
         self.first: dict | None = None
@@ -75,12 +81,13 @@ class ChainStats:
             self.first = d
         if legacy_hash(d.get("prev_hash", ""), d) != d.get("hash"):
             self.bad.append({"trace_id": d.get("trace_id"), "timestamp": d.get("timestamp")})
+        # ¿Este documento es el padre que esperaba un hijo ya visto?
+        if self.unresolved.pop(d["hash"], None) is not None:
+            self.inversions_resolved += 1
         prev = d.get("prev_hash")
-        if self.total > 1 and prev not in self.recent:
-            self.gaps += 1
-            if len(self.gap_examples) < MAX_LISTED:
-                self.gap_examples.append({"trace_id": d.get("trace_id"), "timestamp": d.get("timestamp"),
-                                          "prev_hash": prev})
+        if self.total > 1 and prev not in self.recent and prev not in self.unresolved:
+            self.unresolved[prev] = (self.total, {"trace_id": d.get("trace_id"),
+                                                  "timestamp": d.get("timestamp"), "prev_hash": prev})
         n = self.children.get(prev, 0) + 1
         self.children[prev] = n
         if n == 2:
@@ -92,7 +99,25 @@ class ChainStats:
         if len(self.recent) > self.window:
             old_hash, _ = self.recent.popitem(last=False)
             self.children.pop(old_hash, None)
+        # Pendientes que superaron la ventana sin que aparezca el padre: hueco.
+        while self.unresolved:
+            _, (idx, ex) = next(iter(self.unresolved.items()))
+            if self.total - idx <= self.window:
+                break
+            self.unresolved.popitem(last=False)
+            self._gap(ex)
         self.last = d
+
+    def _gap(self, ex: dict) -> None:
+        self.gaps += 1
+        if len(self.gap_examples) < MAX_LISTED:
+            self.gap_examples.append(ex)
+
+    def finish(self) -> None:
+        """Al terminar, lo que quedó sin resolver también es hueco."""
+        while self.unresolved:
+            _, (_, ex) = self.unresolved.popitem(last=False)
+            self._gap(ex)
 
 
 def hourly_slices(start: datetime, end: datetime) -> Iterator[tuple[datetime, datetime]]:
@@ -144,13 +169,15 @@ def main() -> int:
             stats.add(d)
         if args.all and i % 24 == 23:
             print(f"  ... {lo:%Y-%m-%d} | {stats.total} docs | {time.monotonic() - t0:.0f}s", flush=True)
+    stats.finish()
     if not stats.total:
         print(f"índice {LEGACY_INDEX}: {total} documentos; ninguno en la ventana")
         return 0
     print(f"índice {LEGACY_INDEX}: {total} documentos; verificados {stats.total} "
           f"({stats.first['timestamp']} -> {stats.last['timestamp']}) en {time.monotonic() - t0:.0f}s")
     print(f"hash recalculado distinto (contenido de los 4 campos alterado): {len(stats.bad)}")
-    print(f"prev_hash sin documento previo en los últimos {args.window} (huecos): {stats.gaps}")
+    print(f"padre fuera de orden por timestamp, resuelto dentro de la ventana (no es hueco): {stats.inversions_resolved}")
+    print(f"padre que no aparece en {args.window} documentos (huecos: pérdida o desorden mayor): {stats.gaps}")
     print(f"bifurcaciones (prev_hash con 2+ hijos): {len(stats.forks)}")
     for f in stats.forks[:MAX_LISTED]:
         print(f"  bifurcación: padre={f['parent_trace_id']} hijo2={f['child_trace_id']} ts={f['child_timestamp']}")

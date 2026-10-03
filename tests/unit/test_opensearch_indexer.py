@@ -493,9 +493,27 @@ class TestVerificadorLegado:
         fork["hash"] = legacy_hash(fork["prev_hash"], fork)
         docs.insert(8, fork)                      # segundo hijo del mismo padre
         st = self._stats(docs)
+        st.finish()
         assert len(st.bad) == 1 and st.bad[0]["trace_id"] == "old-3"
         assert st.gaps == 1
         assert len(st.forks) == 1 and st.forks[0]["child_trace_id"] == "fork"
+
+    def test_hijo_con_timestamp_anterior_al_padre_no_es_hueco(self) -> None:
+        """Lo que pasa en producción: scoring en paralelo, el hijo puede
+        quedar antes que su padre al ordenar por timestamp."""
+        docs = build_legacy_chain(20)
+        docs[5], docs[6] = docs[6], docs[5]   # hijo antes que el padre
+        docs[12], docs[13] = docs[13], docs[12]
+        st = self._stats(docs, window=100)
+        st.finish()
+        assert st.gaps == 0 and st.inversions_resolved == 2
+
+    def test_padre_que_nunca_aparece_es_hueco(self) -> None:
+        docs = build_legacy_chain(20)
+        del docs[8]
+        st = self._stats(docs, window=5)
+        st.finish()
+        assert st.gaps == 1 and st.gap_examples[0]["trace_id"] == "old-9"
 
     def test_memoria_acotada_a_la_ventana(self) -> None:
         st = self._stats(build_legacy_chain(500), window=50)
