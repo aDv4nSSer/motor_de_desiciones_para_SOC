@@ -1,0 +1,22 @@
+[Unit]
+Description=Motor SOC — Persistencia con hash-chain de soc:response:audit en soc-responses (H39)
+After=network.target redis-server.service
+Requires=redis-server.service
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=aiayala
+WorkingDirectory=/home/aiayala/tesis/repo/motor
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m response_audit_indexer
+Restart=on-failure
+RestartSec=10
+# Journal (no archivo con append): rotación a cargo de journald, a diferencia
+# de worker.log (ver pendiente de H38).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
