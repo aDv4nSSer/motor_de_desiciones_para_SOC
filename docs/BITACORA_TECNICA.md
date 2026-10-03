@@ -1597,7 +1597,7 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 **Referencia de corrección:** `motor/response_audit_indexer.py` (H39) resuelve 1-4 para `soc-responses` (hash del contenido canónico completo, `XACK` después de persistir, cabeza de la cadena leída de OpenSearch, `_create` con 409 en reproceso). Migrar `soc-decisions` implica decidir qué hacer con la cadena histórica (17.7 M documentos con el hash de 4 campos): verificarla tal cual y empezar una cadena nueva desde un corte documentado, no recalcularla.
 
-**Estado: ABIERTO (documentado, sin corregir).**
+**Estado: CERRADO — corregido en H42** (2026-10-03).
 
 ---
 
@@ -1676,17 +1676,38 @@ La cadena vieja **no se recalcula**: se deja tal cual y se ancla. Al primer arra
 - recorrido hasta la cabeza: 146 pasos, 0 bifurcaciones, método `forward_walk_from_state_file`
 - cabeza: `16d65df646f2e78c86390d4b8cf1418562589b09f010b40e06dbd8dd7a4a878e` (trace `fe46f386-3ecd-44f4-9aa8-554623576235`, 2026-10-03T05:56:30Z)
 
-**Corte real:** *pendiente — se completa con los valores del primer documento de la cadena nueva tras el reinicio (hora exacta, último hash de la cadena vieja, `trace_id` de la cabeza, primer `chain_seq` = 1, cantidad de documentos legados, pendientes `trimmed`/`already_in_legacy`).*
+**Corte real (registrado en `chain_cutover` del primer documento de la cadena nueva):**
+- Reinicio de `opensearch-indexer` por Antonio: 03:16:52 (`-03`), PID 920096 (reemplaza al 750833). `cutover_at`: **2026-10-03T06:16:57.767970Z**.
+- Cadena vieja (`soc-decisions`): **17.911.113 documentos**, congelada desde el corte (sin crecimiento en una medición de 20 s; su último documento, 06:16:51.287482Z, es anterior al corte).
+- Archivo de estado viejo: `9e287a2473314641ba50de12e63a4a09e067eae53e18b95431e4ed6303a2948a`; recorrido hasta la cabeza: **74 pasos, 0 bifurcaciones** (`forward_walk_from_state_file`).
+- **Cabeza de la cadena vieja:** `cd0adc3c7104b3409cdbdd0cf61f7d7f0f0ce3b5075498a07dda211fd7406b08`, trace `c0993527-6305-4db9-a1d0-e95a40a60da3`, 2026-10-03T06:16:51.287482Z.
+- **Primer documento de la cadena nueva:** `chain_seq` **1**, índice `soc-decisions-2026.10.03`, stream_id `1791008212924-0`, trace `9291e87d-a84d-4e61-b429-8f9207fd401b` (06:16:52.923812Z), **`prev_hash = cd0adc3c7104b340…`** (la cabeza de arriba), hash `f36d5cd9710f4c238131d541f60be063ce2c8be84765b09cc3d7e07c4a2dbf9c`.
+- Pendientes heredados registrados en el corte: **169.484** (ID más viejo `1781561810063-0`, 2026-06-15; más nuevo `1788637527801-0`); al arrancar, `trimmed=169484`, todos ya recortados del stream: la pérdida histórica descrita arriba, sin novedades.
+- El preview de las 03:07 (`1d69eb00…`) no es la cabeza real: la cadena vieja siguió avanzando hasta el reinicio, como se esperaba.
+
+**Verificación del empalme (independiente del recorrido del indexador):** se buscaron las puntas de la cadena vieja (documentos cuyo `hash` no es `prev_hash` de ningún otro) en sus últimos 30 minutos (8.649 documentos): hay **una sola punta**, `cd0adc3c7104b340…` (trace `c0993527…`), y es exactamente el `prev_hash` de `chain_seq` 1. No hay ambigüedad: la bifurcación de las 05:41:27 (abajo) es una rama muerta, sin sucesores, y no compite como cabeza. `chain_seq` 2 apunta al hash de 1. `scripts/verify_response_chain.py --pattern "soc-decisions-*"`: **1.468 documentos, `chain_seq` 1 → 1468, cadena íntegra** (exit 0), con el corte informado en `chain_seq` 1.
 
 ### Verificación de la cadena vieja (tal cual quedó)
 
-`scripts/verify_decisions_legacy_chain.py` (solo lectura) recalcula cada documento con la fórmula vieja y revisa los enlaces dentro de la ventana. Últimas 6 h (111.758 documentos, 2026-10-02T23:57Z → 2026-10-03T05:57Z): **0 hashes discrepantes, 0 huecos, 1 bifurcación (2 documentos)**. La verificación completa (`--all`, 17.9 M documentos) es una lectura pesada sobre producción y queda pendiente de aprobación. `scripts/verify_response_chain.py --pattern "soc-decisions-*"` verifica la cadena nueva e informa el corte.
+`scripts/verify_decisions_legacy_chain.py --all` (solo lectura, por porciones horarias de `timestamp`, memoria acotada; corrida 2026-10-03 03:36-03:58 `-03`, con el clúster sano antes de lanzarla: 0 tareas pendientes, colas de search/write en 0, heap 33 %, CPU 9 %):
+
+- **Documentos verificados: 17.911.113**, del 2026-06-15T20:03:11Z al 2026-10-03T06:16:51.287482Z (el último antes del corte), en 1.272 s.
+- **Hashes que no calzan con la fórmula vieja: 0.** Ningún documento tiene alterados los 4 campos que la cadena vieja cubría (sobre los demás campos la cadena vieja no puede decir nada: defecto 1).
+- **Huecos reales: 0.** Ningún `prev_hash` quedó sin su padre dentro de una ventana de 200.000 documentos.
+- **Inversiones de orden resueltas: 2.500.125** (hijo que aparece antes que su padre al ordenar por timestamp; ver la nota de abajo). No son pérdidas.
+- **Bifurcaciones: 20** (un mismo `prev_hash` con dos hijos), del 2026-06-15 al 2026-10-03. Una tiene **causa confirmada**: la de las **05:41:27Z del 2026-10-03** (padre `b500844d-776c-499c-94c7-d8dba21e4392`, rama muerta `9c8ea580-8fb4-4f47-956b-7ef699e8802e`, continuación `3d94ab0a-e952-4288-a824-ccae6c977fe0`), con el mismo `trace_id` que el `Error indexando 9c8ea580…: None` tras el `ReadTimeout` de las 02:41:32 (`-03`) en el journal del indexador viejo (defecto 2, detalle arriba). **Las otras 19 tienen causa no determinada:** no se revisaron documento por documento contra el journal de sus fechas (el journal de `opensearch-indexer` desde el 2026-10-02 06:31 solo registra este caso). Son compatibles con los defectos 2 y 3 (respuesta perdida tras escribir; reinicio con estado atrasado), pero no está confirmado.
+
+  Las 20, por fecha del segundo hijo: 2026-06-15T22:16:51Z (`700809ab`→`a60fddc4`), 07-05T01:55:21Z (`942677c3`→`525f6617`), 07-07T10:31:17Z (`16bee336`→`c3e17a5e`), 07-20T01:53:45Z (`94acf179`→`827373b9`), 07-23T08:45:54Z (`5550c3c9`→`5d56060b`), 08-02T08:01:00Z (`33016a37`→`ce7bba1c`), 08-12T20:02:28Z (`a5c68982`→`7cc8f13d`), 09-04T13:35:35Z (`5e95b537`→`7a77283f`), 09-05T10:42:04Z (`310515cd`→`7c8aea88`), 09-05T13:27:25Z (`0d96a6c9`→`9e79a8c4`), 09-05T16:01:29Z (`48c9e1d6`→`1a868991`), 09-05T18:09:52Z (`3645f6af`→`8e8e2dd2`), 09-05T19:45:29Z (`107b68c5`→`d6685353`), 09-06T01:35:36Z (`fdf1f83a`→`047e332b`), 09-17T22:12:29Z (`fec7e2a8`→`6a2a7317`), 09-22T09:11:15Z (`f7f186bb`→`03a4aa60`), 09-25T09:36:23Z (`25fbdb60`→`a22b4ce6`), 10-01T09:23:07Z (`0a2fc752`→`b10ca54d`), 10-02T09:33:18Z (`b184fe33`→`989d7175`), **10-03T05:41:28Z (`b500844d`→`3d94ab0a`, confirmada)**. Log completo en `.140`: `~/tesis/h42_verify/verify_all_v2.log`.
+
+**Nota — por qué la primera corrida dio 2.5 M "huecos" falsos (no repetir la alarma):** la primera versión del verificador recorría la cadena en orden de `timestamp` y marcaba como hueco todo documento cuyo `prev_hash` no estuviera entre los hashes **ya vistos** (los 200.000 anteriores). Pero el orden por `timestamp` no es el orden de la cadena: el scoring corre en paralelo (`ProcessPoolExecutor`, H36) y el indexador encadena en orden de llegada al stream, así que un hijo puede tener el mismo timestamp que su padre, o uno hasta ~1 ms anterior, y aparecer **antes** que él en el recorrido. Muestreo que lo demostró: 6/6 ejemplos y 400/400 documentos aleatorios tenían su padre en el índice, con ≤ 1 ms de diferencia en cualquier sentido. Corregido en `d4716ce`: un padre ausente queda pendiente y solo cuenta como hueco si no aparece dentro de la ventana en ningún sentido; las inversiones se reportan aparte. La segunda corrida da exactamente esos 2.500.125 como inversiones resueltas y **0 huecos**.
+
+`scripts/verify_response_chain.py --pattern "soc-decisions-*"` verifica la cadena nueva e informa el corte.
 
 ### Tests
 
-`tests/unit/test_opensearch_indexer.py`: 32 tests (incluye el verificador de la cadena vieja: alteración, hueco, bifurcación y memoria acotada). Contenido alterado fuera de los 4 campos rompe la cadena nueva y no la vieja; fallo de indexación sin `XACK` y reintento en orden; reproceso con contenido distinto da 409 y no sobrescribe; reinicio sin bifurcación con un archivo de estado equivocado; corte anclado a la cabeza real (con estado atrasado, bifurcación, sin estado y sin cadena vieja), corte dentro del hash y una sola vez; pendientes recortados y ya indexados en el legado; `read_legacy_state` sin `except: pass`; mapping con los tipos del legado; el patrón ISM no alcanza al legado; bootstrap con timeout en la política. Mutaciones verificadas (cada una rompe 1-2 tests): `XACK` antes de persistir, cabeza ignorando OpenSearch, sin ancla a la cadena vieja, sin chequeo de legado en pendientes, sin recorrido hacia adelante. Suite completa: 291 tests.
+`tests/unit/test_opensearch_indexer.py`: 34 tests (incluye el verificador de la cadena vieja: alteración, hueco real, inversión de orden que no es hueco, bifurcación y memoria acotada). Contenido alterado fuera de los 4 campos rompe la cadena nueva y no la vieja; fallo de indexación sin `XACK` y reintento en orden; reproceso con contenido distinto da 409 y no sobrescribe; reinicio sin bifurcación con un archivo de estado equivocado; corte anclado a la cabeza real (con estado atrasado, bifurcación, sin estado y sin cadena vieja), corte dentro del hash y una sola vez; pendientes recortados y ya indexados en el legado; `read_legacy_state` sin `except: pass`; mapping con los tipos del legado; el patrón ISM no alcanza al legado; bootstrap con timeout en la política. Mutaciones verificadas (cada una rompe 1-2 tests): `XACK` antes de persistir, cabeza ignorando OpenSearch, sin ancla a la cadena vieja, sin chequeo de legado en pendientes, sin recorrido hacia adelante. Suite completa: 293 tests.
 
-**Estado: EN CURSO** (código listo; falta despliegue y registro del corte real).
+**Estado: CERRADO.** Código: `dc4cd5f` (fix) y `d4716ce` (verificador). Desplegado por Antonio a las 03:16:52 (`-03`); la cadena nueva escribe decisiones reales (`chain_seq` 1468 íntegro al verificar). Pendientes que deja, en la lista general: avisar a Joaquín del corte (notebooks/Grafana deben leer `soc-decisions,soc-decisions-*`) y decidir retención/compresión del índice legado después de la defensa.
 
 ---
 
@@ -1697,7 +1718,6 @@ La cadena vieja **no se recalcula**: se deja tal cual y se ancla. Al primer arra
 - **Retención/compresión del índice legado `soc-decisions` (H42):** sin política ni cambio de codec hasta después de la defensa (30-oct-2026); decidir después.
 - **Migrar todos los servicios a `structlog` (H41):** `.claude/rules/observability.md` lo exige y ningún servicio lo usa (todos con `logging` de la stdlib; no está en `requirements.txt` ni instalado en `.140`). Hacerlo de una vez, con `trace_id` por contextvars, no parche por parche.
 - **`.opendistro-ism-config` con `number_of_replicas: 1` (H41):** clúster en `yellow` por réplicas sin asignar en un solo nodo (también `soc-experimental-detections`). Llevar a `replicas: 0` como pide CLAUDE.md.
-- **Corregir `soc-decisions` y su indexador (H40):** ISM + `best_compression` + retención, hash sobre el contenido completo, `XACK` solo tras persistir, cabeza de la cadena desde OpenSearch, `_create` append-only. Definir el corte de la cadena histórica.
 - **Persistir `soc:response:audit` (H39):** hoy ningún proceso lo consume; la auditoría de R1/R2, aprobaciones y accesos vive solo en un stream de Redis capado en 100k (~5-6 h en operación normal). Decidir índice y hash-chain, y corregir los docstrings de `motor/auth.py` que afirman lo contrario.
 - **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
 
