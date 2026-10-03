@@ -5,8 +5,10 @@ Reemplaza el HTTP Basic plano anterior (un solo nivel, sin roles) por la
 decisión cerrada en docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md, sección 5:
 JWT sobre FastAPI, tabla de usuarios con rol, protección de rutas por
 dependencia. Cada login (éxito o fallo) y cada acción restringida por rol se
-audita — ver log_access_event() — hacia el mismo stream que consume
-opensearch_indexer.py para el hash-chain de soc-decisions.
+publica — ver log_access_event() — en el stream Redis soc:response:audit.
+OJO (H39): ese stream hoy NO se persiste; ningún proceso lo consume
+(opensearch_indexer.py solo lee soc:decisions) y está capado en 100k
+entradas, así que estos eventos no llegan a ningún hash-chain todavía.
 
 Roles: "N1" < "N2" < "CISO" (ver motor/users.py:ROLE_LEVEL). require_role()
 es acumulativo (N2 pasa cualquier gate de N1); require_ciso() es exacto,
@@ -68,9 +70,11 @@ def _redis_for_audit() -> redis.Redis | None:
 def log_access_event(username: str, event: str, detail: dict | None = None) -> None:
     """Registra un evento de acceso/acción restringida por rol.
 
-    Se publica en el mismo stream (soc:response:audit) que ya consume
-    opensearch_indexer.py hacia soc-decisions (hash-chain, append-only) --
-    no se abre un canal de auditoría paralelo. Fallo aquí se loguea pero
+    Se publica en el stream soc:response:audit, el mismo donde el worker
+    audita R1/R2 -- no se abre un canal de auditoría paralelo. Ese stream
+    NO se persiste todavía (H39: sin consumidor, capado en 100k entradas):
+    hasta que exista el índice soc-responses con hash-chain, estos eventos
+    solo viven unas horas en Redis. Fallo aquí se loguea pero
     NUNCA propaga excepción (ver CLAUDE.md: sin `except Exception: pass`
     silencioso -- se loguea el motivo explícito).
 

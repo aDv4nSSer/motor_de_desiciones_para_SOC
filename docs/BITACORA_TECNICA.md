@@ -1576,7 +1576,9 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 **Opciones (ninguna aplicada, decisión pendiente):** (1) un consumer group del indexador sobre `soc:response:audit` que lo persista con hash-chain, en `soc-decisions` o en un índice propio (`soc-responses`, append-only, ISM); (2) subir el `maxlen` como paliativo, sin persistencia real; (3) corregir los docstrings en cualquier caso.
 
-**Estado: ABIERTO.**
+**Decisión (Antonio, 2026-10-03):** opción (1), un consumer group del indexador con hash-chain en un índice propio `soc-responses` (append-only, ISM), con la misma garantía que `soc-decisions`; descartado subir `maxlen` como parche. Implementación en la próxima sesión, junto con la re-medición del lag de H38. Mientras tanto se corrigieron los docstrings que afirmaban persistencia (`motor/auth.py`, `motor/response/worker.py`).
+
+**Estado: ABIERTO (decidido, sin implementar).**
 
 ---
 

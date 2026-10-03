@@ -7,8 +7,10 @@ Proceso SEPARADO del Fast Path. Consume la stream Redis `soc:response:tasks`
     tier >= r1_min_tier  ->  R1 enrich  (pasivo)
     tier >= r2_min_tier  ->  R2 block   (activo, con salvaguardas)
 
-Cada respuesta se audita como ResponseRecord hacia OpenSearch (mismo índice de
-auditoría con hash-chain) y se loguea de forma estructurada.
+Cada respuesta se publica como ResponseRecord en el stream Redis
+soc:response:audit y se loguea de forma estructurada. OJO (H39): ese stream
+hoy NO llega a OpenSearch ni a ningún hash-chain (sin consumidor, capado en
+100k entradas); solo soc:decisions se indexa en soc-decisions.
 
 Ejecutar como servicio systemd independiente del FastAPI:
     python -m response.worker
