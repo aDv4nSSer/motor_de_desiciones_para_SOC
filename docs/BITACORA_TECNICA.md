@@ -1582,9 +1582,29 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 ---
 
+## H40 — `soc-decisions` no cumple el estándar de CLAUDE.md y su indexador tiene defectos de integridad
+
+**Fecha:** 2026-10-03 (detectado al revisar el patrón a replicar para H39). Documentado, **no corregido** (decisión de Antonio: no mezclar alcance).
+
+**Índice (estado real en `.140`):** sin política ISM (no existe ninguna política ISM en el clúster), `index.codec` por defecto (no `best_compression`), un solo índice de **17.7 M documentos / 14.2 GB** que crece sin límite. Solo `number_of_replicas: 0` cumple. CLAUDE.md exige ISM obligatorio, `best_compression` y retención de 90 días.
+
+**Indexador (`motor/opensearch_indexer.py`):**
+1. **El hash cubre solo 4 campos** (`prev_hash + trace_id + timestamp + tier + risk_score`), no el contenido: alterar `decision`, `ml_score`, `anomaly_score` o las features no rompe la cadena. CLAUDE.md dice `hash = sha256(contenido + prev_hash)`.
+2. **`XACK` aunque la indexación falle:** `index_decision` devuelve el `prev_hash` sin avanzar y el loop hace `xack` igual: la decisión se pierde sin quedar pendiente.
+3. **`last_hash` se guarda en un archivo cada 100 documentos:** un reinicio retoma desde un hash de hasta 99 documentos atrás y la cadena se bifurca (varios documentos con el mismo `prev_hash`).
+4. **`POST /soc-decisions/_doc/{trace_id}` acepta `updated`:** un reproceso sobrescribe el documento; no es append-only (CLAUDE.md prohíbe UPDATE en `soc-decisions`).
+5. `except: pass` desnudo en `load_state`.
+
+**Referencia de corrección:** `motor/response_audit_indexer.py` (H39) resuelve 1-4 para `soc-responses` (hash del contenido canónico completo, `XACK` después de persistir, cabeza de la cadena leída de OpenSearch, `_create` con 409 en reproceso). Migrar `soc-decisions` implica decidir qué hacer con la cadena histórica (17.7 M documentos con el hash de 4 campos): verificarla tal cual y empezar una cadena nueva desde un corte documentado, no recalcularla.
+
+**Estado: ABIERTO (documentado, sin corregir).**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
+- **Corregir `soc-decisions` y su indexador (H40):** ISM + `best_compression` + retención, hash sobre el contenido completo, `XACK` solo tras persistir, cabeza de la cadena desde OpenSearch, `_create` append-only. Definir el corte de la cadena histórica.
 - **Persistir `soc:response:audit` (H39):** hoy ningún proceso lo consume; la auditoría de R1/R2, aprobaciones y accesos vive solo en un stream de Redis capado en 100k (~5-6 h en operación normal). Decidir índice y hash-chain, y corregir los docstrings de `motor/auth.py` que afirman lo contrario.
 - **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
 
