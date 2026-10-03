@@ -1628,9 +1628,73 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 ---
 
+## H42 — Corrección de H40: `soc-decisions` pasa a la cadena con hash del contenido completo, append-only, ISM 90 días y corte documentado de la cadena vieja
+
+**Fecha:** 2026-10-03. Alcance: solo H40 (indexador de `soc-decisions` y su índice). Referencia de diseño: `motor/response_audit_indexer.py` (H39/H41), del que se reutilizan las funciones de cadena y de bootstrap sin modificarlo.
+
+### Los 5 defectos, con su causa exacta y la reproducción contra la versión en producción
+
+Reproducidos ejecutando el `opensearch_indexer.py` de `HEAD` (la versión desplegada en `.140`) contra Redis y OpenSearch simulados:
+
+1. **El hash cubría solo 4 campos.** `compute_hash()` hacía `sha256(prev_hash + trace_id + timestamp + str(tier) + str(risk_score))`. Reproducido: cambiar `decision`, `ml_score` y `L4_DST_PORT` de un documento deja el hash **idéntico**. CLAUDE.md pide `sha256(contenido + prev_hash)`.
+2. **`XACK` aunque la indexación fallara.** `index_decision()` devolvía el `prev_hash` sin avanzar cuando OpenSearch no confirmaba (`created`/`updated`), y el loop hacía `xack` igual. Reproducido: 3 mensajes rechazados por OpenSearch, **3/3 confirmados** en el stream, ninguno queda pendiente. Además, si la escritura sí persistió pero la respuesta no llegó (timeout), el documento siguiente reusa el mismo `prev_hash`: bifurcación. **Confirmado en producción con el documento concreto:** en las últimas 6 h de la cadena vieja hay exactamente 1 bifurcación. Padre `b500844d-776c-499c-94c7-d8dba21e4392` (2026-10-03T05:41:27.101124Z, hash `b4aae32f178777c4…`), con dos hijos: `9c8ea580-8fb4-4f47-956b-7ef699e8802e` (05:41:27.102214Z, hash `ec9f9f97b7510963…`, **rama muerta, 0 sucesores**) y `3d94ab0a-e952-4288-a824-ccae6c977fe0` (05:41:28.311137Z, hash `c936be74f7bfbab0…`, por donde sigue la cadena). El journal del indexador viejo registra a las 02:41:32 (`-03`) `OpenSearch error: The read operation timed out` seguido de **`Error indexando 9c8ea580-8fb4-4f47-956b-7ef699e8802e: None`**: el mismo `trace_id` del hijo muerto, que sí existe en el índice. La escritura persistió, la respuesta venció el timeout de 5 s, la versión vieja devolvió el `prev_hash` sin avanzar e hizo `XACK`, y `3d94ab0a` se encadenó al mismo padre. Además, la línea de progreso siguiente dice `Errores: 0`: el contador no cuenta este caso.
+3. **La cabeza venía de un archivo guardado cada 100 documentos.** `save_state()` solo corría cada 100 indexados y en `KeyboardInterrupt` (SIGINT); systemd detiene con SIGTERM. Reproducido: con el estado en el doc 100 y el último real en el 150, el reinicio indexa `t-150` con el mismo `prev_hash` que `t-100`: **bifurcación**.
+4. **Sobrescritura permitida.** `POST /soc-decisions/_doc/{trace_id}` y se aceptaba `result=updated` como éxito. Reproducido: reindexar `t-1` con otro contenido devuelve `updated` y cuenta como éxito. Viola la prohibición #6 de CLAUDE.md (sin UPDATE en `soc-decisions`).
+5. **`except: pass` desnudo en `load_state()`.** Reproducido: un archivo de estado corrupto devuelve `'genesis'` sin ningún log; la cadena reiniciaba desde genesis en silencio (otra bifurcación).
+
+**Pérdida de datos histórica documentada (no la resuelve este fix):** el consumer group `opensearch-indexer` tiene **169.491 mensajes pendientes** (entregados y nunca confirmados) desde el **2026-06-15**, y **169.484 ya no existen en el stream** (`soc:decisions` se recorta a ~10k entradas). La versión vieja siempre leía con `>` y nunca reprocesaba sus pendientes. No hay forma de saber qué decisiones eran ni si llegaron a indexarse. La versión nueva los confirma y los cuenta al arrancar (`trimmed`), y deja total, ID más viejo y más nuevo dentro de `chain_cutover`. Los pendientes que siguen vivos en el stream (7 al revisarlo) se confirman contra el índice legado por `trace_id`: si ya están, no se duplican (`already_in_legacy`); si no, entran a la cadena nueva.
+
+### Corrección (`motor/opensearch_indexer.py`)
+
+- **Hash del contenido canónico completo:** `hash = sha256(canonical_json(contenido + chain_seq) + prev_hash)`, mismo `chain_document()` que `soc-responses`.
+- **`XACK` solo tras `_create` confirmado**; ante un fallo no sigue con el resto del lote y relee primero sus pendientes.
+- **Cabeza de la cadena desde OpenSearch** (último `chain_seq`), no desde archivo.
+- **`PUT _create/{stream_id}`**: un reproceso recibe 409 y se confirma sin reescribir (append-only).
+- **Sin `except: pass`:** el archivo de estado viejo solo se lee para el corte, y cada error se loguea por su causa (`no encontrado`, `JSONDecodeError`, etc.).
+- **Bootstrap idempotente con reintentos** (patrón H41): template, política ISM, consumer group + cabeza, 1 intento + 3 reintentos (1/2/4 s) y rondas cada 30 s sin terminar el proceso.
+- **Pendientes heredados:** los ya recortados del stream (campos `None`) se confirman y se cuentan (`trimmed`); los vivos que ya están en el índice legado (cayeron antes del `XACK`) se confirman sin duplicar (`already_in_legacy`).
+- **Mensajes con valores no convertibles** se persisten como `doc_type=unparseable` con el contenido crudo, en vez de quedar trabados.
+- **Timestamp por defecto** sale del ID del mensaje, no del reloj: el contenido es determinístico ante un reproceso.
+
+### Índices, ISM y la decisión sobre el índice legado
+
+- **Cadena nueva en índices diarios `soc-decisions-YYYY.MM.DD`**, template con `number_of_replicas: 0`, `codec: best_compression`, `dynamic: false` y **los mismos tipos de campo que el índice legado** (lecturas conjuntas sin conflictos). Política ISM `soc-decisions-retention`: borra cada índice diario a los **90 días**.
+- **El índice legado `soc-decisions` NO recibe la política ISM.** Se creó el 2026-06-16 (~109 días): con `min_index_age: 90d`, ISM lo borraría **entero** (17.9 M documentos) en su siguiente ciclo. El patrón `soc-decisions-*` no lo alcanza (sin guion final). Tampoco se le cambia el codec (requiere cerrar el índice). **Decisión (Antonio): el índice legado queda tal cual, sin política ni cambio de codec, al menos hasta después de la defensa (30-oct-2026); no se toca antes de esa fecha.** Su retención y compresión se deciden después.
+- **Lectores:** el único lector en el repo es `motor/dashboard.py`; pasa a leer `soc-decisions,soc-decisions-*` (legado + cadena nueva).
+- **Aviso pendiente de comunicar a Joaquín (lo comunica Antonio):** después del corte, sus notebooks de reentrenamiento (y Grafana, si lo usa) van a dejar de ver decisiones nuevas si apuntan solo a `soc-decisions`. Tienen que leer `soc-decisions,soc-decisions-*` (mismos campos y tipos). Las métricas sobre `soc-decisions` también deben excluir la ventana de H25, como siempre.
+
+### Corte de la cadena vieja a la nueva
+
+La cadena vieja **no se recalcula**: se deja tal cual y se ancla. Al primer arranque con la cadena nueva vacía, el indexador:
+1. lee el `last_hash` del archivo de estado viejo;
+2. camina hacia adelante en el índice legado (documentos cuyo `prev_hash` es el hash actual) hasta el último, contando bifurcaciones y siguiendo la rama más reciente;
+3. escribe el primer documento de la cadena nueva (`chain_seq` 1) con **`prev_hash` = hash de la cabeza de la cadena vieja** y un objeto `chain_cutover` **dentro del contenido hasheado** con: índice legado, cantidad de documentos, hash del archivo de estado, pasos del recorrido, bifurcaciones vistas, método, `trace_id`/timestamp de la cabeza, hora del corte y **pendientes heredados** de la versión anterior (`XPENDING`: cantidad, ID más viejo y más nuevo, y la entrada más vieja que el stream todavía conserva, para que la pérdida de los ya recortados quede registrada dentro del hash).
+
+**Preview del corte** (snapshot de solo lectura a las 05:56 UTC, con la versión vieja todavía escribiendo; los números reales se calculan al reiniciar y se registran abajo):
+- documentos en `soc-decisions`: 17.905.236
+- hash del archivo de estado: `aac065b97fd0417de267324e719c9cb9d6341d7071c6c274f50a6fd0430b9f49`
+- recorrido hasta la cabeza: 146 pasos, 0 bifurcaciones, método `forward_walk_from_state_file`
+- cabeza: `16d65df646f2e78c86390d4b8cf1418562589b09f010b40e06dbd8dd7a4a878e` (trace `fe46f386-3ecd-44f4-9aa8-554623576235`, 2026-10-03T05:56:30Z)
+
+**Corte real:** *pendiente — se completa con los valores del primer documento de la cadena nueva tras el reinicio (hora exacta, último hash de la cadena vieja, `trace_id` de la cabeza, primer `chain_seq` = 1, cantidad de documentos legados, pendientes `trimmed`/`already_in_legacy`).*
+
+### Verificación de la cadena vieja (tal cual quedó)
+
+`scripts/verify_decisions_legacy_chain.py` (solo lectura) recalcula cada documento con la fórmula vieja y revisa los enlaces dentro de la ventana. Últimas 6 h (111.758 documentos, 2026-10-02T23:57Z → 2026-10-03T05:57Z): **0 hashes discrepantes, 0 huecos, 1 bifurcación (2 documentos)**. La verificación completa (`--all`, 17.9 M documentos) es una lectura pesada sobre producción y queda pendiente de aprobación. `scripts/verify_response_chain.py --pattern "soc-decisions-*"` verifica la cadena nueva e informa el corte.
+
+### Tests
+
+`tests/unit/test_opensearch_indexer.py`: 32 tests (incluye el verificador de la cadena vieja: alteración, hueco, bifurcación y memoria acotada). Contenido alterado fuera de los 4 campos rompe la cadena nueva y no la vieja; fallo de indexación sin `XACK` y reintento en orden; reproceso con contenido distinto da 409 y no sobrescribe; reinicio sin bifurcación con un archivo de estado equivocado; corte anclado a la cabeza real (con estado atrasado, bifurcación, sin estado y sin cadena vieja), corte dentro del hash y una sola vez; pendientes recortados y ya indexados en el legado; `read_legacy_state` sin `except: pass`; mapping con los tipos del legado; el patrón ISM no alcanza al legado; bootstrap con timeout en la política. Mutaciones verificadas (cada una rompe 1-2 tests): `XACK` antes de persistir, cabeza ignorando OpenSearch, sin ancla a la cadena vieja, sin chequeo de legado en pendientes, sin recorrido hacia adelante. Suite completa: 291 tests.
+
+**Estado: EN CURSO** (código listo; falta despliegue y registro del corte real).
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
+- **Avisar a Joaquín del corte de `soc-decisions` (H42):** notebooks de reentrenamiento y Grafana deben leer `soc-decisions,soc-decisions-*` para ver decisiones posteriores al corte. Lo comunica Antonio.
+- **Retención/compresión del índice legado `soc-decisions` (H42):** sin política ni cambio de codec hasta después de la defensa (30-oct-2026); decidir después.
 - **Migrar todos los servicios a `structlog` (H41):** `.claude/rules/observability.md` lo exige y ningún servicio lo usa (todos con `logging` de la stdlib; no está en `requirements.txt` ni instalado en `.140`). Hacerlo de una vez, con `trace_id` por contextvars, no parche por parche.
 - **`.opendistro-ism-config` con `number_of_replicas: 1` (H41):** clúster en `yellow` por réplicas sin asignar en un solo nodo (también `soc-experimental-detections`). Llevar a `replicas: 0` como pide CLAUDE.md.
 - **Corregir `soc-decisions` y su indexador (H40):** ISM + `best_compression` + retención, hash sobre el contenido completo, `XACK` solo tras persistir, cabeza de la cadena desde OpenSearch, `_create` append-only. Definir el corte de la cadena histórica.

@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-verify_response_chain.py — Verifica la integridad del hash-chain de soc-responses (H39).
+verify_response_chain.py — Verifica la integridad de un hash-chain encadenado por chain_seq.
 
-Recorre todos los documentos de soc-responses-* en orden de chain_seq
+Por defecto soc-responses-* (H39); con --pattern soc-decisions-* verifica la
+cadena nueva de decisiones (H42). Recorre todos los documentos en orden de chain_seq
 (search_after, páginas de 1000) y reporta el primer documento alterado, los
 saltos de secuencia y los prev_hash que no apuntan al anterior. Solo lectura.
 
 Uso (en .140, desde motor/ para tomar el .env):
     python3 ../scripts/verify_response_chain.py
+    python3 ../scripts/verify_response_chain.py --pattern "soc-decisions-*"
 
 Código de salida: 0 si la cadena está íntegra, 1 si hay problemas.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "motor"))
 
-from response_audit_indexer import (  # noqa: E402
+from response_audit_indexer import (
     INDEX_PATTERN,
     AuditIndexerSettings,
     OpenSearchClient,
@@ -30,6 +33,9 @@ MAX_REPORTED = 20
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument("--pattern", default=INDEX_PATTERN, help="índices a verificar (default: %(default)s)")
+    pattern = ap.parse_args().pattern
     client = OpenSearchClient(AuditIndexerSettings())
     problems: list[str] = []
     total, last, first_seq = 0, None, None
@@ -38,7 +44,7 @@ def main() -> int:
         body = {"size": PAGE, "sort": [{"chain_seq": "asc"}]}
         if search_after is not None:
             body["search_after"] = search_after
-        r = client.request("POST", f"/{INDEX_PATTERN}/_search", body)
+        r = client.request("POST", f"/{pattern}/_search", body)
         if r.status_code == 404:
             break
         r.raise_for_status()
@@ -48,6 +54,11 @@ def main() -> int:
         docs = [h["_source"] for h in hits]
         if first_seq is None:
             first_seq = docs[0].get("chain_seq")
+            cut = docs[0].get("chain_cutover")
+            if cut:
+                print(f"corte de cadena en chain_seq {first_seq}: prev_hash={docs[0].get('prev_hash')} "
+                      f"(cabeza de {cut.get('legacy_index')}, {cut.get('legacy_doc_count')} docs, "
+                      f"método {cut.get('method')}, {cut.get('cutover_at')})")
         # El último de la página anterior entra como ancla para chequear el empalme.
         checked = verify_chain(([last] if last else []) + docs)
         problems.extend(checked)
@@ -55,7 +66,7 @@ def main() -> int:
         last = docs[-1]
         search_after = hits[-1]["sort"]
     if total == 0:
-        print("soc-responses: sin documentos")
+        print(f"{pattern}: sin documentos")
         return 0
     print(f"documentos verificados: {total} | chain_seq {first_seq} -> {last.get('chain_seq')}")
     if first_seq != 1:

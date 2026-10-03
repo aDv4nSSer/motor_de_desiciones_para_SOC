@@ -29,7 +29,9 @@ log = logging.getLogger("motor.dashboard")
 OS_HOST  = os.environ.get("OS_HOST", "https://localhost:9201")
 OS_USER  = os.environ.get("OS_USER", "admin")
 OS_PASS  = os.environ.get("OS_PASS", "")
-OS_INDEX = "soc-decisions"
+# Índice legado (cadena vieja, hasta el corte de H42) + índices diarios de la
+# cadena nueva. Mismo mapping de campos: búsquedas y agregaciones abarcan ambos.
+OS_INDEX = "soc-decisions,soc-decisions-*"
 
 RESPONSE_AUDIT_STREAM = "soc:response:audit"
 
