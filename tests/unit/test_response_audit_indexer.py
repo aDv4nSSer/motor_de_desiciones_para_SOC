@@ -10,6 +10,7 @@ H39: persistencia de soc:response:audit en soc-responses con hash-chain.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -19,8 +20,8 @@ import redis
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "motor"))
 
-import response_audit_indexer as rai  # noqa: E402
-from response_audit_indexer import (  # noqa: E402
+import response_audit_indexer as rai
+from response_audit_indexer import (
     GENESIS_HASH,
     GROUP,
     STREAM,
@@ -33,7 +34,6 @@ from response_audit_indexer import (  # noqa: E402
     index_name_for,
     verify_chain,
 )
-
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
 
@@ -155,7 +155,7 @@ class TestHashChain:
         docs = osc.all_docs()
         assert [d["chain_seq"] for d in docs] == [1, 2, 3, 4, 5]
         assert docs[0]["prev_hash"] == GENESIS_HASH
-        for prev, cur in zip(docs, docs[1:]):
+        for prev, cur in itertools.pairwise(docs):
             assert cur["prev_hash"] == prev["hash"]
         assert verify_chain(docs) == []
 
@@ -347,3 +347,141 @@ class TestTiposDeEvento:
         p = rai.ism_policy(90)["policy"]
         assert p["states"][0]["transitions"][0]["conditions"] == {"min_index_age": "90d"}
         assert p["ism_template"][0]["index_patterns"] == ["soc-responses-*"]
+
+
+# ── Bootstrap con reintentos (incidente del primer arranque, 2026-10-03) ──────
+
+import logging
+
+import httpx
+from response_audit_indexer import (
+    BOOTSTRAP_BACKOFF_SECONDS,
+    OpenSearchClient,
+    bootstrap_until_ready,
+    with_retry,
+)
+
+
+class FakeOSServer:
+    """OpenSearch simulado a nivel HTTP para OpenSearchClient (MockTransport).
+    `script` define, por (método, path), una lista de respuestas o excepciones
+    que se consumen en orden; agotada la lista se usa el comportamiento base."""
+
+    def __init__(self):
+        self.policy_exists = False
+        self.calls: list[tuple[str, str]] = []
+        self.script: dict[tuple[str, str], list] = {}
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        key = (request.method, request.url.path)
+        self.calls.append(key)
+        queued = self.script.get(key)
+        if queued:
+            step = queued.pop(0)
+            if callable(step):
+                step = step(request)
+            if isinstance(step, Exception):
+                raise step
+            return step
+        if key == ("PUT", "/_index_template/soc-responses"):
+            return httpx.Response(200, json={"acknowledged": True})
+        if key == ("GET", "/_plugins/_ism/policies/soc-responses-retention"):
+            return httpx.Response(200 if self.policy_exists else 404, json={})
+        if key == ("PUT", "/_plugins/_ism/policies/soc-responses-retention"):
+            if self.policy_exists:
+                return httpx.Response(409, json={})
+            self.policy_exists = True
+            return httpx.Response(201, json={"_id": "soc-responses-retention"})
+        if key == ("POST", "/soc-responses-*/_search"):
+            return httpx.Response(404, json={})
+        return httpx.Response(500, json={"error": f"sin ruta {key}"})
+
+    def client(self) -> OpenSearchClient:
+        return OpenSearchClient(_settings(), transport=httpx.MockTransport(self.handler))
+
+
+def _put_creates_but_times_out(server: FakeOSServer):
+    """Lo que pasó en producción: OpenSearch creó la política (e inicializó
+    .opendistro-ism-config) pero respondió después del read timeout de 5 s."""
+    def step(request):
+        server.policy_exists = True
+        return httpx.ReadTimeout("The read operation timed out", request=request)
+    return step
+
+
+class TestBootstrapConReintentos:
+    def test_reproduce_el_incidente_y_ya_no_mata_el_proceso(self, caplog) -> None:
+        srv = FakeOSServer()
+        srv.script[("PUT", "/_plugins/_ism/policies/soc-responses-retention")] = [_put_creates_but_times_out(srv)]
+        sleeps: list[float] = []
+        ix = ResponseAuditIndexer(FakeStreamRedis(), srv.client(), _settings())
+        with caplog.at_level(logging.WARNING, logger="response_audit_indexer"):
+            assert bootstrap_until_ready(srv.client(), ix, _settings(), sleep=sleeps.append, max_rounds=1) is True
+        assert sleeps == [1.0]  # un reintento con el primer backoff
+        assert srv.policy_exists is True
+        assert srv.calls.count(("PUT", "/_plugins/_ism/policies/soc-responses-retention")) == 1  # no se re-PUTea
+        msg = caplog.records[0].getMessage()
+        assert "op=ism_policy" in msg and "intento=1/4" in msg and "ReadTimeout" in msg
+
+    def test_put_concurrente_que_da_409_cuenta_como_existente(self) -> None:
+        srv = FakeOSServer()
+        srv.script[("GET", "/_plugins/_ism/policies/soc-responses-retention")] = [httpx.Response(404, json={})]
+        srv.script[("PUT", "/_plugins/_ism/policies/soc-responses-retention")] = [httpx.Response(409, json={})]
+        assert srv.client().ensure_policy(90) == "exists"
+
+    def test_backoff_1_2_4_y_relanza_al_agotar(self) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def always_timeout():
+            calls["n"] += 1
+            raise httpx.ConnectTimeout("connect timeout")
+        with pytest.raises(httpx.ConnectTimeout):
+            with_retry("index_template", always_timeout, sleep=sleeps.append)
+        assert calls["n"] == 1 + len(BOOTSTRAP_BACKOFF_SECONDS) == 4
+        assert sleeps == [1.0, 2.0, 4.0]
+
+    def test_5xx_del_template_se_reintenta(self) -> None:
+        srv = FakeOSServer()
+        srv.script[("PUT", "/_index_template/soc-responses")] = [httpx.Response(503, json={}), httpx.Response(503, json={})]
+        sleeps: list[float] = []
+        ix = ResponseAuditIndexer(FakeStreamRedis(), srv.client(), _settings())
+        assert bootstrap_until_ready(srv.client(), ix, _settings(), sleep=sleeps.append, max_rounds=1)
+        assert sleeps == [1.0, 2.0]
+
+    def test_cabeza_de_la_cadena_con_timeout_se_reintenta(self) -> None:
+        srv = FakeOSServer()
+        srv.script[("POST", "/soc-responses-*/_search")] = [
+            lambda req: httpx.ReadTimeout("lento", request=req)]
+        ix = ResponseAuditIndexer(FakeStreamRedis(), srv.client(), _settings())
+        assert bootstrap_until_ready(srv.client(), ix, _settings(), sleep=lambda s: None, max_rounds=1)
+        assert (ix.seq, ix.head_hash) == (0, GENESIS_HASH)
+
+    def test_ronda_fallida_espera_y_repite_en_vez_de_terminar(self, caplog) -> None:
+        srv = FakeOSServer()
+        down = [httpx.Response(503, json={})] * 4  # agota la 1.ª ronda del template
+        srv.script[("PUT", "/_index_template/soc-responses")] = list(down)
+        sleeps: list[float] = []
+        ix = ResponseAuditIndexer(FakeStreamRedis(), srv.client(), _settings())
+        with caplog.at_level(logging.ERROR, logger="response_audit_indexer"):
+            assert bootstrap_until_ready(srv.client(), ix, _settings(), sleep=sleeps.append, max_rounds=2) is True
+        assert sleeps == [1.0, 2.0, 4.0, 30.0]  # 3 backoffs + espera de ronda, después OK
+        assert any("bootstrap_failed ronda=1" in r.getMessage() for r in caplog.records)
+
+    def test_error_no_transitorio_no_se_reintenta(self) -> None:
+        """Un bug (TypeError) no se oculta como si fuera un timeout."""
+        calls = {"n": 0}
+
+        def bug():
+            calls["n"] += 1
+            raise TypeError("bug real")
+        with pytest.raises(TypeError):
+            with_retry("x", bug, sleep=lambda s: None)
+        assert calls["n"] == 1
+
+    def test_httpx_no_loguea_cada_request_en_info(self, monkeypatch) -> None:
+        monkeypatch.setattr(rai, "bootstrap_until_ready", lambda *a, **k: True)
+        monkeypatch.setattr(rai.ResponseAuditIndexer, "run", lambda self: None)
+        monkeypatch.setattr(rai.redis, "Redis", lambda **kw: FakeStreamRedis())
+        rai.main()
+        assert logging.getLogger("httpx").level == logging.WARNING

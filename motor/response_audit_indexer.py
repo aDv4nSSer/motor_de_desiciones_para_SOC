@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 response_audit_indexer.py — Persistencia con hash-chain de soc:response:audit (H39).
 
@@ -34,6 +33,7 @@ import json
 import logging
 import ssl
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,6 +51,13 @@ INDEX_PATTERN = "soc-responses-*"
 TEMPLATE_NAME = "soc-responses"
 ISM_POLICY_ID = "soc-responses-retention"
 GENESIS_HASH = "genesis"
+
+# Bootstrap (template, política ISM, consumer group + cabeza de la cadena):
+# 1 intento + 3 reintentos con backoff 1s/2s/4s por operación. Si una ronda
+# completa falla, el proceso NO muere: espera BOOTSTRAP_ROUND_BACKOFF_SECONDS y
+# repite (los mensajes esperan en el stream; no hay nada que perder).
+BOOTSTRAP_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+BOOTSTRAP_ROUND_BACKOFF_SECONDS = 30.0
 
 #: Campos del contenido que se encadenan, además del payload completo.
 CHAIN_FIELDS = ("chain_seq", "prev_hash", "hash")
@@ -109,7 +116,7 @@ def build_content(msg_id: str, fields: dict[str, Any]) -> dict:
     try:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
-            raise ValueError("payload no es un objeto")
+            raise TypeError("payload no es un objeto")
     except (TypeError, ValueError):
         # Nunca se descarta un evento: se persiste crudo, marcado.
         return {"stream_id": msg_id, "event_time": stream_id_time(msg_id).isoformat(),
@@ -216,34 +223,54 @@ def ism_policy(retention_days: int) -> dict:
 
 
 class OpenSearchClient:
-    def __init__(self, settings: AuditIndexerSettings):
+    def __init__(self, settings: AuditIndexerSettings, transport: httpx.BaseTransport | None = None):
         verify: bool | ssl.SSLContext = True
         if not settings.os_verify_tls:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             verify = ctx
+        # httpx.Client sync: proceso sin event loop (bootstrap + loop bloqueante
+        # sobre XREADGROUP) — excepción consciente a "siempre httpx.AsyncClient"
+        # de CLAUDE.md, ver docs/BITACORA_TECNICA.md H41. Timeout explícito igual
+        # al estándar: connect 2 s, read 5 s.
         self._http = httpx.Client(
             base_url=settings.os_host, auth=(settings.os_user, settings.os_pass), verify=verify,
-            timeout=httpx.Timeout(5.0, connect=2.0),
+            timeout=httpx.Timeout(5.0, connect=2.0), transport=transport,
         )
 
     def request(self, method: str, path: str, body: dict | None = None) -> httpx.Response:
         return self._http.request(method, path, json=body)
 
-    def ensure_template_and_policy(self, retention_days: int) -> None:
+    def ensure_template(self) -> None:
+        """PUT del index template (idempotente: reescribirlo no cambia nada)."""
         tpl = {"index_patterns": [INDEX_PATTERN], "priority": 100, "template": {
             "settings": {"number_of_shards": 1, "number_of_replicas": 0, "codec": "best_compression"},
             "mappings": INDEX_MAPPINGS}}
         r = self.request("PUT", f"/_index_template/{TEMPLATE_NAME}", tpl)
         if r.status_code >= 300:
             raise IndexingError(f"template {TEMPLATE_NAME}: HTTP {r.status_code} {r.text[:200]}")
+
+    def ensure_policy(self, retention_days: int) -> str:
+        """Crea la política ISM si no existe. Idempotente ante reintentos: si
+        un intento anterior la creó pero su respuesta no llegó (timeout), el
+        GET siguiente la encuentra, y un PUT concurrente da 409 = ya existe.
+
+        Returns:
+            "exists" o "created".
+        """
         r = self.request("GET", f"/_plugins/_ism/policies/{ISM_POLICY_ID}")
-        if r.status_code == 404:
-            r = self.request("PUT", f"/_plugins/_ism/policies/{ISM_POLICY_ID}", ism_policy(retention_days))
-            if r.status_code >= 300:
-                raise IndexingError(f"política ISM: HTTP {r.status_code} {r.text[:200]}")
-            log.info(f"política ISM {ISM_POLICY_ID} creada ({retention_days} días)")
+        if r.status_code == 200:
+            return "exists"
+        if r.status_code != 404:
+            raise IndexingError(f"política ISM (GET): HTTP {r.status_code} {r.text[:200]}")
+        r = self.request("PUT", f"/_plugins/_ism/policies/{ISM_POLICY_ID}", ism_policy(retention_days))
+        if r.status_code == 409:
+            return "exists"
+        if r.status_code >= 300:
+            raise IndexingError(f"política ISM (PUT): HTTP {r.status_code} {r.text[:200]}")
+        log.info(f"política ISM {ISM_POLICY_ID} creada ({retention_days} días)")
+        return "created"
 
     def chain_head(self) -> tuple[int, str]:
         """(último chain_seq, su hash) o (0, genesis) si no hay documentos."""
@@ -332,7 +359,7 @@ class ResponseAuditIndexer:
         return done
 
     def run(self) -> None:
-        self.start()
+        """Loop principal. Requiere start() previo (lo hace bootstrap_until_ready)."""
         total = 0
         while True:
             try:
@@ -349,15 +376,65 @@ class ResponseAuditIndexer:
                     log.error(f"cabeza de la cadena no disponible: {e2}")
 
 
+# Errores transitorios de setup: red/timeout de httpx, respuesta no OK de
+# OpenSearch (IndexingError) o Redis no disponible.
+BOOTSTRAP_RETRYABLE = (httpx.HTTPError, IndexingError, redis.RedisError)
+
+
+def with_retry(op: str, fn: Callable[[], Any], sleep: Callable[[float], None] = time.sleep) -> Any:
+    """Ejecuta fn con 1 intento + len(BOOTSTRAP_BACKOFF_SECONDS) reintentos.
+    Loguea cada reintento (operación, intento, causa, espera) y relanza el
+    último error si se agotan."""
+    attempts = len(BOOTSTRAP_BACKOFF_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except BOOTSTRAP_RETRYABLE as e:
+            if attempt == attempts:
+                raise
+            wait = BOOTSTRAP_BACKOFF_SECONDS[attempt - 1]
+            log.warning("bootstrap_retry op=%s intento=%d/%d causa=%s:%s espera_s=%.0f",
+                        op, attempt, attempts, type(e).__name__, str(e)[:200], wait)
+            sleep(wait)
+    raise AssertionError("inalcanzable")
+
+
+def bootstrap_until_ready(os_client: OpenSearchClient, indexer: ResponseAuditIndexer,
+                          settings: AuditIndexerSettings,
+                          sleep: Callable[[float], None] = time.sleep,
+                          max_rounds: int | None = None) -> bool:
+    """Template, política ISM y consumer group + cabeza de la cadena, cada uno
+    con reintentos. Si una ronda falla entera, espera y repite en vez de
+    terminar el proceso. Devuelve True cuando quedó listo; False solo si se
+    agotó max_rounds (usado en tests)."""
+    rounds = 0
+    while max_rounds is None or rounds < max_rounds:
+        rounds += 1
+        try:
+            with_retry("index_template", os_client.ensure_template, sleep)
+            with_retry("ism_policy", lambda: os_client.ensure_policy(settings.retention_days), sleep)
+            with_retry("consumer_group_y_cabeza", indexer.start, sleep)
+            return True
+        except BOOTSTRAP_RETRYABLE as e:
+            log.error("bootstrap_failed ronda=%d causa=%s:%s reintento_ronda_s=%.0f",
+                      rounds, type(e).__name__, str(e)[:200], BOOTSTRAP_ROUND_BACKOFF_SECONDS)
+            sleep(BOOTSTRAP_ROUND_BACKOFF_SECONDS)
+    return False
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [response_audit_indexer] %(levelname)s %(message)s")
+    # httpx loguea cada request en INFO: con un _create por evento eso es una
+    # línea de journal por documento. Solo advertencias/errores.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     s = AuditIndexerSettings()
     os_client = OpenSearchClient(s)
-    os_client.ensure_template_and_policy(s.retention_days)
     rdb = redis.Redis(host=s.redis_host, port=s.redis_port, password=s.redis_password,
                       decode_responses=True, socket_timeout=(s.block_ms / 1000) + 5)
-    ResponseAuditIndexer(rdb, os_client, s).run()
+    indexer = ResponseAuditIndexer(rdb, os_client, s)
+    bootstrap_until_ready(os_client, indexer, s)
+    indexer.run()
 
 
 if __name__ == "__main__":

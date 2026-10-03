@@ -1601,9 +1601,34 @@ Estimación sin validar: 1 + 2 bajarían el costo medio por tarea de ~0.30 s a m
 
 ---
 
+## H41 — `response-audit-indexer` murió en su primer arranque: `ReadTimeout` al crear la primera política ISM del clúster
+
+**Fecha:** 2026-10-03.
+
+**Hallazgo:** al habilitar `response-audit-indexer.service` (H39), la primera corrida terminó con exit code 1 a las 02:12:55 (`-03`) por un `httpx.ReadTimeout` no controlado en `main()`. `Restart=on-failure` lo relanzó a los 10 s y la segunda corrida arrancó bien (`active (running)` desde 02:13:05, `NRestarts=1`). No quedó en crash loop.
+
+**Causa exacta:** `response_audit_indexer.py:243`, el `PUT /_plugins/_ism/policies/soc-responses-retention` de `ensure_template_and_policy()`. Hasta ese momento el clúster **no tenía ninguna política ISM** (ver H40), así que crear la primera obligó a OpenSearch a inicializar en frío su índice de sistema `.opendistro-ism-config`. Log de OpenSearch: empieza a crear el índice a las 05:12:51 UTC (`creating index, cause [api]`) y termina a las 05:12:54 (`Successfully created or updated .opendistro-ism-config with newest mappings`). La política quedó creada del lado del servidor (`last_updated_time` 05:12:51.054), pero la respuesta llegó después del read timeout de 5 s del cliente. La segunda corrida encontró la política con el `GET` (200), saltó el `PUT` y siguió. El clúster no estaba lento en general (`_cluster/health` en 20 ms, sin tareas pendientes): fue la inicialización única de ISM.
+
+**Por qué mató el proceso:** el bootstrap no tenía reintentos ni era idempotente. Un reintento ingenuo tampoco habría alcanzado: el segundo `PUT` da 409 (ya existe) y el código lo trataba como error.
+
+**Fix:** el bootstrap se separa en tres operaciones idempotentes: `ensure_template()`, `ensure_policy()` (primero `GET`, y 409 en el `PUT` = "ya existe") y consumer group + cabeza de la cadena. Cada una con 1 intento + 3 reintentos (backoff 1 s / 2 s / 4 s), solo ante errores transitorios (`httpx.HTTPError`, respuesta no OK de OpenSearch, Redis); un error de programación no se reintenta. Si una ronda completa falla, `bootstrap_failed` y nueva ronda a los 30 s en vez de terminar el proceso (los mensajes esperan en el stream). Cada reintento se loguea con `op`, `intento`, `causa` y `espera_s`. Además, el logger de `httpx` pasa a WARNING: en INFO escribía una línea de journal por documento indexado. Test que reproduce el incidente (el `PUT` crea la política y vence el timeout): la versión anterior falla con `ReadTimeout` no controlado; la nueva termina el bootstrap con un solo `PUT`.
+
+**`httpx.Client` síncrono, excepción consciente a CLAUDE.md:** CLAUDE.md pide `httpx.AsyncClient` con `Timeout(connect=2.0, read=5.0)`. Este indexador es un proceso síncrono sin event loop (bootstrap y luego un loop bloqueante sobre `XREADGROUP`, igual que `response-worker` y `opensearch_indexer.py`). Un `AsyncClient` obligaría a montar `asyncio` solo para envolverlo, sin ganar concurrencia. Se usa `httpx.Client` con **el mismo timeout explícito** del estándar (connect 2 s, read 5 s). Documentado en el código, en la instanciación del cliente.
+
+**Pendientes derivados (no se tocan en este fix):**
+- **`.opendistro-ism-config` con `number_of_replicas: 1`** en un clúster de un solo nodo: la réplica queda sin asignar y el clúster pasa a `yellow` (también `soc-experimental-detections`). No afecta el funcionamiento; CLAUDE.md pide `replicas: 0` en todos los índices.
+- **`ruff` no está en `.pre-commit-config.yaml`** aunque CLAUDE.md lo lista como hook obligatorio (solo corren bandit, detect-secrets y los hooks genéricos), y el repo no tiene configuración de ruff: corrido a mano con los defaults de ruff 0.16 sobre los archivos de este fix, dio 11 hallazgos (ya corregidos). Agregarlo al hook con una configuración explícita y limpiar el resto del repo de una vez.
+- **Ningún servicio del repo usa `structlog`** pese a que `.claude/rules/observability.md` lo exige (tampoco está instalado en `.140` ni en `requirements.txt`). Todos usan `logging` de la stdlib. Migrar todos los servicios de una sola vez, no parche por parche.
+
+**Estado: RESUELTO** (fix en código; el proceso en ejecución arrancó bien en su segundo intento y no necesitó reinicio para seguir funcionando).
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
+- **Migrar todos los servicios a `structlog` (H41):** `.claude/rules/observability.md` lo exige y ningún servicio lo usa (todos con `logging` de la stdlib; no está en `requirements.txt` ni instalado en `.140`). Hacerlo de una vez, con `trace_id` por contextvars, no parche por parche.
+- **`.opendistro-ism-config` con `number_of_replicas: 1` (H41):** clúster en `yellow` por réplicas sin asignar en un solo nodo (también `soc-experimental-detections`). Llevar a `replicas: 0` como pide CLAUDE.md.
 - **Corregir `soc-decisions` y su indexador (H40):** ISM + `best_compression` + retención, hash sobre el contenido completo, `XACK` solo tras persistir, cabeza de la cadena desde OpenSearch, `_create` append-only. Definir el corte de la cadena histórica.
 - **Persistir `soc:response:audit` (H39):** hoy ningún proceso lo consume; la auditoría de R1/R2, aprobaciones y accesos vive solo en un stream de Redis capado en 100k (~5-6 h en operación normal). Decidir índice y hash-chain, y corregir los docstrings de `motor/auth.py` que afirman lo contrario.
 - **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
