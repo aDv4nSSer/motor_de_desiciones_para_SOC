@@ -78,6 +78,9 @@ def get_stats(window_minutes: int = 60) -> dict:
     since = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
     query = {
         "size": 0,
+        # Sin esto OpenSearch topea hits.total en 10.000 y total_decisiones
+        # (denominador de fatiga_alertas_pct) queda falso: 4277,6% en 24 h (H46).
+        "track_total_hits": True,
         "query": {"range": {"timestamp": {"gte": since}}},
         "aggs": {
             "por_tier":     {"terms": {"field": "tier_name", "size": 10}},
