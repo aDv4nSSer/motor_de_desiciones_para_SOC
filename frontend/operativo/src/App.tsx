@@ -1,83 +1,56 @@
-import { useEffect, useRef, useState } from 'react'
-import { Bell, Briefcase, ShieldCheck, SignOut, UserCheck, WarningCircle } from '@phosphor-icons/react'
-import type { Icon } from '@phosphor-icons/react'
+import { useEffect, useState } from 'react'
 import { useAuth } from './auth/AuthContext'
+import { canAccess, findRoute, homeFor } from './app/routes'
+import type { RouteId } from './app/routes'
+import { Forbidden } from './components/common'
+import { Shell } from './components/Shell'
 import { AlertsView } from './views/AlertsView'
 import { ApprovalsView } from './views/ApprovalsView'
+import { AuditView } from './views/AuditView'
 import { CasesView } from './views/CasesView'
+import { ComplianceView } from './views/ComplianceView'
 import { LoginView } from './views/LoginView'
+import { NodesView } from './views/NodesView'
+import { TrendsView } from './views/TrendsView'
+import { UsersView } from './views/UsersView'
 
-type ViewId = 'alertas' | 'aprobaciones' | 'casos'
+const VIEWS: Record<RouteId, () => React.JSX.Element | null> = {
+  alertas: AlertsView,
+  aprobaciones: ApprovalsView,
+  casos: CasesView,
+  nodos: NodesView,
+  auditoria: AuditView,
+  usuarios: UsersView,
+  cumplimiento: ComplianceView,
+  tendencias: TrendsView,
+}
 
-const VIEWS: { id: ViewId; label: string; icon: Icon }[] = [
-  { id: 'alertas', label: 'Alertas', icon: Bell },
-  { id: 'aprobaciones', label: 'Aprobaciones', icon: UserCheck },
-  { id: 'casos', label: 'Casos', icon: Briefcase },
-]
-
-function viewFromHash(): ViewId {
-  const h = window.location.hash.replace('#', '')
-  return VIEWS.some((v) => v.id === h) ? (h as ViewId) : 'alertas'
+function hashId(): string {
+  return window.location.hash.replace('#', '')
 }
 
 export default function App() {
-  const { user, sessionState, logout } = useAuth()
-  const [view, setView] = useState<ViewId>(viewFromHash)
-  const mainRef = useRef<HTMLElement>(null)
+  const { user } = useAuth()
+  const [hash, setHash] = useState(hashId)
 
   useEffect(() => {
-    const onHash = () => setView(viewFromHash())
+    const onHash = () => setHash(hashId())
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
 
-  useEffect(() => {
-    mainRef.current?.focus() // foco al contenido al cambiar de vista (lectores de pantalla)
-  }, [view])
-
   if (!user) return <LoginView />
 
+  // Sin hash o con uno desconocido: la página de inicio del rol.
+  const route = findRoute(hash) ?? findRoute(homeFor(user.role))!
+  const allowed = canAccess(user.role, route)
+  const View = VIEWS[route.id]
+
   return (
-    <div className="shell">
-      <a className="skip-link" href="#main">Saltar al contenido</a>
-      <header className="topbar">
-        <div className="brand">
-          <ShieldCheck size={22} weight="duotone" aria-hidden="true" />
-          <span className="brand-name">R-SOAR</span>
-          <span className="muted">Operativo</span>
-        </div>
-        <nav aria-label="Secciones">
-          <ul className="tabs">
-            {VIEWS.map(({ id, label, icon: IconCmp }) => (
-              <li key={id}>
-                <a href={`#${id}`} className="tab" aria-current={view === id ? 'page' : undefined}>
-                  <IconCmp size={18} aria-hidden="true" /> {label}
-                </a>
-              </li>
-            ))}
-          </ul>
-        </nav>
-        <div className="user">
-          <span className="mono">{user.username}</span>
-          <span className="badge badge-outline">{user.role}</span>
-          <button type="button" className="btn btn-ghost btn-sm" onClick={logout}>
-            <SignOut size={16} aria-hidden="true" /> Cerrar sesión
-          </button>
-        </div>
-      </header>
-
-      {sessionState === 'unverifiable' && (
-        <div className="session-banner" role="status">
-          <WarningCircle size={18} aria-hidden="true" />
-          No se puede verificar tu sesión, reintentando. Los datos en pantalla pueden estar desactualizados.
-        </div>
-      )}
-
-      <main id="main" ref={mainRef} tabIndex={-1} className="content">
-        {view === 'alertas' && <AlertsView />}
-        {view === 'aprobaciones' && <ApprovalsView />}
-        {view === 'casos' && <CasesView />}
-      </main>
-    </div>
+    <Shell current={allowed ? route : undefined} currentId={route.id}>
+      {allowed
+        ? <View key={route.id} />
+        : <Forbidden needs={route.exact ? route.minRole : `${route.minRole} o superior`} />}
+    </Shell>
   )
 }

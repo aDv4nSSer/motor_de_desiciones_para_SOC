@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { bindSession, postLogin } from '../api/client'
+import { bindSession, postLogin, postLogout } from '../api/client'
 import type { LoginResponse, Me } from '../api/types'
 
 export type SessionState = 'ok' | 'unverifiable'
@@ -75,7 +75,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { ok: true }
   }, [])
 
-  const logout = useCallback(() => clear(null), [clear])
+  const logout = useCallback(() => {
+    // Revoca la sesión en el servidor (H43) sin esperar: la pantalla vuelve
+    // al login igual si el motor no responde; el token ya no queda en memoria.
+    const token = tokenRef.current
+    if (token) void postLogout(token)
+    clear(null)
+  }, [clear])
 
   const value = useMemo(
     () => ({ user, sessionState, logoutReason, login, logout }),

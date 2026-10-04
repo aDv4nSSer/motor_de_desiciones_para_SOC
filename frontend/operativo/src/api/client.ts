@@ -85,3 +85,12 @@ export async function postLogin(username: string, password: string): Promise<Res
     body: JSON.stringify({ username, password }),
   })
 }
+
+/** Cierre de sesión en el servidor (revoca el jti). Best-effort: nunca lanza. */
+export async function postLogout(token: string): Promise<void> {
+  try {
+    await fetch('/api/v1/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } })
+  } catch {
+    // sin red: el token igual se descarta del navegador y expira con el JWT
+  }
+}

@@ -116,7 +116,7 @@ Iris Web debe estar listo e integrado desde el inicio (semana 1-2), sin módulo 
 7. Implementar `accion_recomendada` en la salida del motor, con nivel de operador requerido.
 8. Autenticación JWT + tabla de usuarios con rol + protección de rutas.
 9. Panel de aprobación en el dashboard Operativo.
-10. Dashboard Gerencial/CISO: cumplimiento, métricas de valor, historial/auditoría.
+10. Dashboard Gerencial/CISO: cumplimiento, métricas de valor, historial/auditoría. **Implementado en `develop` (2026-10-03/04), despliegue pendiente de coordinar** — ver [H43](BITACORA_TECNICA.md#h43). Pendiente: exportar el reporte ANCI a PDF y medir el tiempo de respuesta humana.
 11. Confirmar puertos SSH internos de `.141` una vez migrado.
 12. Citar fuente para tiempos típicos de detección de brechas en SOC tradicionales.
 13. Redactar sección de Trabajo futuro con las preguntas de investigación del Isolation Forest de host.
