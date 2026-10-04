@@ -24,3 +24,11 @@ repos:
       - id: bandit
         args: ["-ll", "-r", "api/", "motor/"]
         pass_filenames: false
+
+  # ruff (H45): misma versión que .venv (0.16.10), config en ruff.toml con
+  # línea base por archivo de la deuda previa. Solo lint, sin --fix: el hook
+  # no reescribe archivos en el commit.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff-check

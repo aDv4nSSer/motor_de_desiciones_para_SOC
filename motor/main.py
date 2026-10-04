@@ -181,6 +181,10 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+# Dependencias de rol creadas una sola vez a nivel de módulo, no dentro del
+# default de cada endpoint (ruff B008, H45). Mismo comportamiento.
+REQUIRE_N2 = require_role("N2")
+REQUIRE_N2_SESSION = require_role_session("N2")
 
 def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
     """Procesa un evento y retorna la decisión."""
@@ -558,7 +562,7 @@ def dashboard_nodes(user: User = Depends(get_current_user)):
 @app.get("/api/v1/dashboard/audit/trace/{trace_id}")
 def dashboard_audit_trace(
     trace_id: str = PathParam(..., max_length=64),
-    user: User = Depends(require_role("N2")),
+    user: User = Depends(REQUIRE_N2),
 ):
     """Todo lo registrado para un trace_id, con el hash de cada documento
     verificado. N2 no ve los eventos de acceso (vista parcial); CISO sí."""
@@ -570,7 +574,7 @@ def dashboard_audit_trace(
 
 
 @app.get("/api/v1/dashboard/audit/chain")
-def dashboard_audit_chain(user: User = Depends(require_role("N2"))):
+def dashboard_audit_chain(user: User = Depends(REQUIRE_N2)):
     """Verificación en vivo de la cola de las cadenas soc-responses-* y
     soc-decisions-* (audit_view.chain_status, cache 60 s)."""
     return audit_view.chain_status()
@@ -614,13 +618,13 @@ def _admin_call(fn, *args):
 
 
 @app.get("/api/v1/dashboard/users")
-def dashboard_users(user: User = Depends(require_role("N2"))):
+def dashboard_users(user: User = Depends(REQUIRE_N2)):
     return {"items": _admin_call(user_admin.list_accounts, user),
             "assignable_roles": user_admin.assignable_roles(user)}
 
 
 @app.post("/api/v1/dashboard/users", status_code=201)
-def dashboard_create_user(payload: CreateUserRequest, user: User = Depends(require_role("N2"))):
+def dashboard_create_user(payload: CreateUserRequest, user: User = Depends(REQUIRE_N2)):
     created = _admin_call(user_admin.create_account, user, payload.username, payload.password, payload.role)
     return created.model_dump()
 
@@ -629,7 +633,7 @@ def dashboard_create_user(payload: CreateUserRequest, user: User = Depends(requi
 def dashboard_update_user(
     payload: UpdateUserRequest,
     username: str = PathParam(..., max_length=64),
-    user: User = Depends(require_role("N2")),
+    user: User = Depends(REQUIRE_N2),
 ):
     return _admin_call(user_admin.update_account, user, username, payload.role, payload.disabled)
 
@@ -638,13 +642,13 @@ def dashboard_update_user(
 def dashboard_reset_password(
     payload: PasswordRequest,
     username: str = PathParam(..., max_length=64),
-    user: User = Depends(require_role("N2")),
+    user: User = Depends(REQUIRE_N2),
 ):
     return _admin_call(user_admin.reset_password, user, username, payload.password)
 
 
 @app.get("/api/v1/dashboard/sessions")
-def dashboard_sessions(current: tuple[User, str] = Depends(require_role_session("N2"))):
+def dashboard_sessions(current: tuple[User, str] = Depends(REQUIRE_N2_SESSION)):
     user, jti = current
     items = _admin_call(user_admin.visible_sessions, user)
     for item in items:
@@ -656,7 +660,7 @@ def dashboard_sessions(current: tuple[User, str] = Depends(require_role_session(
 def dashboard_revoke_session(
     username: str = PathParam(..., max_length=64),
     jti: str = PathParam(..., max_length=64, pattern=r"^[a-f0-9]+$"),
-    current: tuple[User, str] = Depends(require_role_session("N2")),
+    current: tuple[User, str] = Depends(REQUIRE_N2_SESSION),
 ):
     user, current_jti = current
     return _admin_call(user_admin.revoke, user, username, jti, current_jti)
@@ -665,7 +669,7 @@ def dashboard_revoke_session(
 @app.delete("/api/v1/dashboard/users/{username}/sessions")
 def dashboard_revoke_all_sessions(
     username: str = PathParam(..., max_length=64),
-    current: tuple[User, str] = Depends(require_role_session("N2")),
+    current: tuple[User, str] = Depends(REQUIRE_N2_SESSION),
 ):
     user, current_jti = current
     return _admin_call(user_admin.revoke, user, username, None, current_jti)

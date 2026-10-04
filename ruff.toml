@@ -1,0 +1,60 @@
+# ruff — config del proyecto (H45). Reglas: el set por defecto de ruff 0.16.10,
+# misma versión que fija el hook de .pre-commit-config.yaml.
+
+[lint.flake8-bugbear]
+# FastAPI declara dependencias y parámetros como defaults (Depends/Query/Path):
+# B008 es falso positivo para ese idiom (corrección documentada por ruff).
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.params.Depends",
+]
+
+# ── LÍNEA BASE de deuda previa a H45 — NO agregar entradas ───────────────
+# Cada archivo ignora SOLO los códigos que ya tenía al integrar ruff al
+# pre-commit (2026-10-04, ver H45 en docs/BITACORA_TECNICA.md); archivos nuevos
+# o fuera de esta lista se revisan con el set completo. Al limpiar un archivo,
+# borrar su entrada. Generada con: ruff check . --output-format json.
+[lint.per-file-ignores]
+"api/schemas/prediction.py" = ["UP045"]  # 1
+"main.py" = ["UP035"]  # 1
+"motor/dashboard.py" = ["BLE001", "I001", "LOG015", "S112", "UP037"]  # 8
+"motor/main.py" = ["BLE001", "F841", "RUF100"]  # 3 (+RUF100: el noqa BLE001 existente queda redundante con esta línea base)
+"motor/model.py" = ["BLE001", "F401", "F811", "I001"]  # 10
+"motor/redis_client.py" = ["BLE001", "F401", "I001"]  # 5
+"motor/response/config.py" = ["I001"]  # 1
+"motor/response/crowdsec_adapter.py" = ["I001"]  # 1
+"motor/response/enforcer.py" = ["I001"]  # 1
+"motor/response/enrichment.py" = ["I001", "SIM102", "UP045"]  # 6
+"motor/response/queue.py" = ["F401", "I001"]  # 2
+"motor/schemas.py" = ["I001", "UP045"]  # 8
+"motor/training/retrain_isolation_forest.py" = ["BLE001", "DTZ005", "E722", "EXE001", "F541", "I001", "RUF059"]  # 9
+"motor/training/train_isolation_forest.py" = ["DTZ005", "EXE001", "I001"]  # 4
+"motor/training/train_isolation_forest_v2.py" = ["DTZ005", "EXE001", "F541", "I001"]  # 6
+"pipeline-ingesta/scripts/analizar_dataset.py" = ["F401", "F541", "I001"]  # 10
+"pipeline-ingesta/scripts/ver_parquet_joaquin.py" = ["F541", "I001"]  # 4
+"scripts/diagnostico/h38_worker_lag_rates.py" = ["BLE001", "I001", "RUF007", "S112"]  # 4
+"scripts/diagnostico/h38_worker_lag_stages.py" = ["BLE001", "I001", "RUF007", "S112"]  # 4
+"scripts/manage_users.py" = ["EXE001"]  # 1
+"scripts/training/etiquetador/etiquetador_diario.py" = ["BLE001", "DTZ005", "DTZ007", "E722", "EXE001", "F541", "F841", "I001", "PIE810", "PLR1730", "S112"]  # 20
+"scripts/training/relabeling/correlacion_jsonl.py" = ["BLE001", "EXE001", "F401", "I001", "S112"]  # 5
+"scripts/training/relabeling/re_labeler.py" = ["BLE001", "DTZ007", "EXE001", "F541", "I001", "S112"]  # 13
+"scripts/training/relabeling/resolver_pendientes.py" = ["BLE001", "EXE001", "F401", "I001"]  # 4
+"tests/integration/test_approval_resolve_gate.py" = ["I001", "RUF100"]  # 2
+"tests/integration/test_token_revocation.py" = ["I001", "RUF100"]  # 2
+"tests/unit/test_approvals_dedup_expiry.py" = ["RUF100"]  # 5
+"tests/unit/test_corroboration.py" = ["RUF100"]  # 3
+"tests/unit/test_dashboard_endpoints.py" = ["I001"]  # 1
+"tests/unit/test_decide_executor.py" = ["I001"]  # 1
+"tests/unit/test_enrichment_private_ip_guard.py" = ["RUF100"]  # 2
+"tests/unit/test_otx_enrichment.py" = ["F401", "RUF100"]  # 3
+"tests/unit/test_predict.py" = ["F401", "F841"]  # 2
+"tests/unit/test_response_worker_gating.py" = ["RUF100"]  # 3
+"tests/unit/test_stale_backlog.py" = ["RUF100"]  # 3
+"tests/unit/test_ti_negative_cache.py" = ["RUF100"]  # 2
+"vigilante/cases.py" = ["F401"]  # 1
+"vigilante/heartbeat_check.py" = ["I001"]  # 1
+"vigilante/notify.py" = ["BLE001", "I001"]  # 2
+"vigilante/shadow_detect.py" = ["BLE001", "SIM114"]  # 2
+"vigilante/watcher.py" = ["BLE001", "I001", "SIM103"]  # 6
