@@ -1775,22 +1775,97 @@ La cadena vieja **no se recalcula**: se deja tal cual y se ancla. Al primer arra
 
 ### Pendientes reales al cierre
 
-- **Desplegar** backend y bundle a `.140`, coordinado con Antonio (todos reinician sesión una vez).
+- ~~**Desplegar** backend y bundle a `.140`~~ → hecho en H44 (2026-10-04).
 - **Exportar el reporte ANCI a PDF:** no implementado (la vista lo declara pendiente).
 - **Tiempo de respuesta humana (MTTR):** no medible todavía; el evento `manual_approval` no registra cuándo se abrió la aprobación.
 - **`/metrics` Prometheus y `/health` con dependencias** según `.claude/rules/observability.md`: siguen sin existir en ningún servicio.
-- **Credencial mínima para el enforcer** y **permisos `0600` del `.env` de `.140`** (hallazgos de arriba).
+- **Credencial mínima para el enforcer** (hallazgo de arriba). Los permisos `0600` del `.env` de `.140` quedaron aplicados en H44.
 - Integración con Microsoft Entra ID y multi-tenant: solo como trabajo futuro en la tesis (no hay código).
 
-**Estado: IMPLEMENTADO Y COMMITEADO EN `develop`; despliegue pendiente de coordinar.**
+**Estado: IMPLEMENTADO Y COMMITEADO EN `develop`; DESPLEGADO el 2026-10-04 (ver H44).**
+
+---
+
+## H44 — Despliegue de H39-H43 a producción (`.140`): verificación previa, restart y smoke test por rol
+
+**Fecha:** 2026-10-04, ventana 00:24-00:56 (hora de Chile, -03). Despliegue del backend y del bundle de H43, con verificación previa completa. El orden lo pidió Antonio: línea base, árbol de trabajo, suite, rollback escrito y usuarios activos; recién después, deploy y smoke test.
+
+### Verificación previa (solo lectura, 00:24-00:45)
+
+- **Línea base:** `opensearch-indexer` (activo desde 03-oct 03:16:52, cutover de H42), `response-audit-indexer` (desde 03-oct 02:34:54), `response-worker` y `redis-server` estaban activos con `NRestarts=0`. Los dos indexadores avanzaban: en 45 s, `soc-decisions-*` pasó de 489.687 a 490.096 y `soc-responses-*` de 480.567 a 480.915, con `chain_seq` igual al total de documentos. El legado `soc-decisions` seguía congelado en 17.911.113. **El journal no se pudo leer:** `journalctl -u` pide `sudo` interactivo en `.140` y sin `sudo` devuelve vacío (`aiayala` no está en `systemd-journal`). "Sin reinicios" se apoya en `NRestarts=0` y en el avance de las cadenas.
+- **`motor-soc` corría `95bd8af`, no lo que había en disco (`dc4cd5f`):** el proceso arrancó el 02-oct 13:45:56, un minuto después del pull a `95bd8af`. Los pulls de H39-H42 (03-oct) no se acompañaron de restart de `motor-soc`, solo de los indexadores. Efecto visible: el panel en vivo leía solo el índice legado `soc-decisions` (`dashboard.OS_INDEX`), así que **sus estadísticas estaban congeladas desde el corte de H42 (03-oct 03:16)**. El resto del diff `95bd8af..dc4cd5f` que carga `motor-soc` son docstrings. Este deploy llevó `motor-soc` de `95bd8af` a `4edfd3b`. `response-worker` sigue con el código del 02-oct: su diff hasta `4edfd3b` son docstrings y campos nuevos en `response/config.py`, así que no hizo falta reiniciarlo.
+- **El `chmod 0600` del `.env` (H43) no se había aplicado:** `.env` y sus tres respaldos estaban en `664`.
+- **`a82fac1` y `4edfd3b` no estaban pusheados** (`develop` local iba 2 commits adelante de `origin`), así que un `git pull` en `.140` no habría traído H43. Pendiente de desplegar en ese momento: `d4716ce` (verificador de la cadena vieja), `0f40932` (docs), `a82fac1` y `4edfd3b`. Fuera del deploy quedaron, sin versionar ni commitear, `.claude/rules/{observability,testing}.md`, `especificacion_tecnica_final_r-soar.md` e `infra/systemd/opensearch-indexer.service` (unit anterior a H42, con `WorkingDirectory` viejo; no es la que corre).
+- **Suite sobre `4edfd3b`:** pytest 388 passed; vitest 35 passed; `tsc -b`, `vite build`, bandit y detect-secrets limpios; oxlint con el aviso previo de `AuthContext.tsx`. **ruff no está en `.pre-commit-config.yaml`** (CLAUDE.md dice que sí): a mano da 179 hallazgos, de los cuales 164 ya existían en `dc4cd5f` y los nuevos son todos `B008` (`Depends` como default).
+- **Usuarios activos:** la única cuenta era `aiayala` (CISO). Había cero eventos `access` en `soc-responses-*` desde que existe (03-oct 02:34) y cero en el stream (últimas ~4,6 h). Con JWT de 8 h, no había ninguna sesión viva que el corte por `jti` fuera a cortar.
+- **Rollback escrito antes del deploy.** El destino es `dc4cd5f` y **nunca `95bd8af`**: volver a `95bd8af` dejaría en disco los indexadores de antes de H42, y si alguno se reinicia rompería la cadena nueva. `motor/model.py` no cambia entre ambos commits, así que el `skip-worktree` no se ve afectado:
+  ```bash
+  ssh motor140 'cd ~/tesis/repo && git checkout --detach dc4cd5f && git ls-files -v motor/model.py \
+    && sudo -n systemctl restart motor-soc && sleep 8 && systemctl is-active motor-soc && curl -s localhost:8000/health'
+  scripts/deploy_operativo.sh --rollback
+  ```
+  No fue necesario usarlo.
+
+### Despliegue
+
+1. `git push origin develop` (`0f40932..4edfd3b`).
+2. En `.140`: `git pull --ff-only origin develop` (`dc4cd5f` → `4edfd3b`); `motor/model.py` sigue con `skip-worktree`.
+3. `chmod 600` de `~/tesis/motor-runtime/.env` y sus tres respaldos (`.env.bak-h43-*`, `.env.bak-preH27rotation-*`, `.env.bak-preH32rotation-*`). Los servicios corren como `aiayala`, dueño del archivo; el restart posterior lo valida.
+4. `scripts/deploy_operativo.sh`: tests, build y copia atómica (14 archivos, bundle `index-COZGymx_.js`). El bundle anterior quedó en `operativo.prev`.
+5. **`sudo systemctl restart motor-soc` a las 2026-10-04 00:51:40 -03 (03:51:40Z).** El servicio quedó activo a las 00:51:42 (PID 1085317, `NRestarts=0`), y `/health` respondió 200 a las 00:51:55 con `golden4_v7_1` real. Ventana sin API: ~15 s.
+
+### Smoke test (00:52:05-00:52:45, script en `.140` contra `localhost:8000`)
+
+Por decisión de Antonio, con cuentas de prueba `smoke-ciso`, `smoke-n1` y `smoke-n2`. Las contraseñas se generaron dentro del proceso del script y nunca se imprimieron ni salieron del host. `smoke-ciso` se creó por CLI (evento `user_created` con actor `cli:aiayala`); `smoke-n1` y `smoke-n2` las creó `smoke-ciso` desde la API. Al final, las tres quedaron **dadas de baja**, también auditado.
+
+- **Login y rol:** cada cuenta obtiene su rol en el JWT y en `/auth/me`. Una contraseña incorrecta da 401.
+- **Matriz rol × endpoint (11 endpoints × 3 roles + sin token):** todo según lo esperado.
+  - N1 accede a stats, aprobaciones, bloqueos y nodos; recibe 403 en historial, cadena, accesos, usuarios, sesiones, cumplimiento y tendencias.
+  - N2 suma historial, cadena, usuarios y sesiones; recibe 403 en accesos, cumplimiento y tendencias.
+  - CISO accede a todo.
+  - Sin token: 401 en todos.
+  - Además: N1 no puede crear cuentas (403), N2 no puede asignar el rol N2 (403) y N2 no puede revocar sesiones de un CISO (403).
+- **Nodos con `rsoar-nodes-ro`, confirmado del lado de Wazuh:** en `/var/ossec/logs/api.log` de `.139`, a las 00:52:13, `rsoar-nodes-ro` hizo `POST /security/user/authenticate`, `GET /agents/summary/status` y `GET /agents`, todos 200. Desde el restart, el usuario `wazuh` (enforcer) solo hizo `POST /security/user/authenticate` y `PUT /active-response`; ningún `GET /agents`. El motor tiene `WAZUH_NODES_USER=rsoar-nodes-ro`, distinto de `WAZUH_API_USER`.
+- **"Cadena verificada ✓" en las dos cadenas** (`/audit/chain`, en vivo):
+  - `soc-responses-*`: `ok=True`, 2.001 eslabones (`chain_seq` 485775..487775), sin problemas.
+  - `soc-decisions-*`: `ok=True`, 2.001 eslabones (497409..499409), sin problemas, con el empalme de H42 presente.
+- **Historial:** con el mismo `trace_id`, N2 obtiene `scope=partial` y CISO `scope=full`.
+- **Aprobación sintética, de bajo impacto.** `trace_id smoke-h43-20261004035205`, IP `203.0.113.43` (TEST-NET-3, RFC 5737), nivel N2, con el motivo rotulado "SMOKE TEST deploy H43".
+  - Se vio en el panel de N1.
+  - N1 intentó aprobar: 403 (`approval_denied_role`).
+  - N2 intentó aprobar: **422 `approval_denied_safelist`**. `203.0.113.0/24` es `is_private` en Python, así que cae en la safelist y **no se llamó al enforcer**.
+  - N2 rechazó: 200 (`approval_rejected`). La aprobación salió del índice de pendientes y no quedó bloqueo registrado para la IP.
+  - **Límite:** el camino "aprobar → `firewall-drop`" no se ejercitó, porque no hay forma de hacerlo sin bloquear una IP real enrutable. Lo cubren los tests de `test_approvals*.py` y el R2 automático de abajo.
+  - Esta aprobación cuenta como 1 rechazo en las métricas de cumplimiento: excluirla de cualquier cifra de la tesis.
+- **Logout en servidor:** tras `POST /auth/logout`, el token de N1 da 401 en la request siguiente (`token_rejected_session_revoked`). La baja de `smoke-n2` invalidó su token en la request siguiente.
+- **Auditoría persistida:** 20 s después, `GET /audit/access` (CISO) ya mostraba en `soc-responses-*`, con hash-chain, `login_success`, `login_failed`, `action_denied_role`, `user_admin_denied`, `approval_denied_role`, `approval_denied_safelist`, `approval_rejected`, `audit_trace_viewed`, `logout` y `token_rejected_session_revoked`.
+- **R2 sin cambios (el deploy no reinició `response-worker`):**
+  - El worker siguió activo desde el 02-oct, con `NRestarts=0`.
+  - Hubo `[ENFORCE]` a las 00:52:39, 00:52:47, 00:52:54 y 00:52:55. La API de Wazuh registró 5 `PUT /active-response` con status 200 desde el restart.
+  - En `.138` (`active-responses.log`) hubo 6 `"command":"add"` desde las 00:51: las 4 IPs de esos `[ENFORCE]` (`91.92.42.144`, `.160`, `.124` y `.116`) más 2 posteriores (`.131` y `.143`).
+- **Resultado:** todo en verde, salvo un chequeo agregado por fuera de la lista pedida, `X-Trace-Id` en las respuestas. **No es una regresión:** ninguna versión del motor (ni `95bd8af` ni `4edfd3b`) agrega ese header a las respuestas, y `/health` público tampoco lo trae. Ver pendientes.
+
+### Artefactos que dejó el despliegue (para excluir de métricas)
+
+- **Una decisión sintética en `soc-decisions-*`:** como prueba de vida post-restart se hizo `POST /api/v1/decide` con cuerpo `{}` (error del operador: la prueba debió limitarse a `/health`). El Fast Path la procesó como un flujo real con los 4 features en 0: `trace_id 2fd49fff-5e01-46bf-a0ab-da0160b463ad`, `chain_seq` 499170, 03:51:55.258Z, T2/ALERT, risk 0,7267, sin IP. Es la única decisión con los 4 features en 0 en la ventana 03:51:40-03:52:10Z, a milisegundos del `curl`; en la hora previa hubo 1 de tráfico real, así que la atribución es por tiempo y no por un marcador. `soc-decisions` es append-only: no se borra, se documenta. Sin efecto en R2 (T2 < `R2_MIN_TIER=3`).
+- Cuentas `smoke-ciso`, `smoke-n1` y `smoke-n2` (dadas de baja), la aprobación `smoke-h43-20261004035205` (rechazada) y sus eventos de acceso en `soc-responses-*`.
+
+### Hallazgos nuevos
+
+- **El overall de la vista de nodos da `down` de forma permanente:** `motor-watcher` sin heartbeat hace 66.759 min (~46 días). Es el mismo problema de H33 (el heartbeat del FIM no puede escribir en Redis de `.140`), ahora visible en el panel del CISO. El clúster está en `yellow` (165 shards sin asignar, `replicas: 1` de H41), lo que marca OpenSearch como `degraded`. Ninguno de los dos lo causa este deploy, pero el sello general del panel no va a estar en verde hasta resolverlos.
+- **`X-Trace-Id` no se devuelve en ninguna respuesta** (estándar de CLAUDE.md, "presente en TODA respuesta, sin excepción"). `/decide` lo lee de la request si viene, pero no hay middleware que lo agregue a la respuesta.
+
+**Estado: DESPLEGADO Y VALIDADO EN PRODUCCIÓN (`4edfd3b`, restart 2026-10-04 00:51:40 -03).** Queda fuera de este deploy, para su propia ventana: la credencial del enforcer (`wazuh`/`administrator`) y `/metrics`.
 
 ---
 
 ## Pendientes detectados (no resueltos hoy)
 
-- **Desplegar H43 (dashboard Gerencial/CISO, sesiones con `jti`) a `.140`, coordinado con Antonio:** al desplegar, todos los operadores reinician sesión una vez. El usuario de solo lectura de Wazuh (`rsoar-nodes-ro`) ya existe y sus credenciales ya están en el `.env`. Exportación PDF del reporte ANCI y MTTR humano quedan pendientes (H43).
 - **El enforcer de R2 usa la credencial `administrator` de Wazuh (H43):** reemplazar por un usuario con permiso mínimo (`active-response:command`) en una ventana coordinada.
-- **`~/tesis/motor-runtime/.env` en `.140` con modo `0664` (H43):** contiene todos los secretos del motor; llevarlo (y su respaldo `.env.bak-h43-*`) a `0600`.
+- **`X-Trace-Id` ausente en las respuestas de toda la API (H44):** agregar un middleware que propague el header de la request o genere uno nuevo, y que lo devuelva siempre, incluidas las respuestas de error.
+- **`ruff` no corre en pre-commit (H44):** CLAUDE.md lo da como obligatorio, pero `.pre-commit-config.yaml` solo tiene bandit y detect-secrets. Hay 179 hallazgos en `motor/ scripts/ tests/`; decidir qué reglas aplicar (por ejemplo, ignorar `B008` por ser el patrón de FastAPI) antes de activarlo, para no bloquear commits por deuda previa.
+- **`journalctl -u <servicio>` en `.140` exige `sudo` interactivo (H44):** las auditorías no pueden leer los logs de `motor-soc` ni de los indexadores. Agregar `aiayala` al grupo `systemd-journal`, o sumar `journalctl -u motor-soc*|opensearch-indexer*|response-audit-indexer*` al sudoers de auditoría.
+- **Excluir de métricas los artefactos del deploy de H44:** decisión `2fd49fff-5e01-46bf-a0ab-da0160b463ad` y aprobación `smoke-h43-20261004035205`.
 - **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
 - **Avisar a Joaquín del corte de `soc-decisions` (H42):** notebooks de reentrenamiento y Grafana deben leer `soc-decisions,soc-decisions-*` para ver decisiones posteriores al corte. Lo comunica Antonio.
 - **Retención/compresión del índice legado `soc-decisions` (H42):** sin política ni cambio de codec hasta después de la defensa (30-oct-2026); decidir después.
