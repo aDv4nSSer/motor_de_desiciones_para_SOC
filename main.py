@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.endpoints.predict import router as predict_router
+from api.middleware.trace import TraceIdMiddleware
 
 # ---------------------------------------------------------------------------
 # Logging estructurado (JSON) para integración con pipelines de observabilidad
@@ -77,6 +78,10 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
+
+# Después de CORS a propósito: add_middleware apila hacia afuera, así el
+# header también sale en las respuestas que CORS corta (preflight) (H45).
+app.add_middleware(TraceIdMiddleware)
 
 app.include_router(predict_router)
 

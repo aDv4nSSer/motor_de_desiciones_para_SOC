@@ -66,6 +66,7 @@ from response.queue import enqueue_response_task
 from schemas import FlowFeatures
 from sessions import revoke_session
 from system_status import get_node_status
+from trace_middleware import TraceIdMiddleware
 from users import ROLE_LEVEL, Role, User, get_user_record
 
 logging.basicConfig(
@@ -181,6 +182,9 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+# X-Trace-Id + X-Duration-Ms en toda respuesta, también en 401/403/422/500 (H45).
+app.add_middleware(TraceIdMiddleware)
+
 # Dependencias de rol creadas una sola vez a nivel de módulo, no dentro del
 # default de cada endpoint (ruff B008, H45). Mismo comportamiento.
 REQUIRE_N2 = require_role("N2")
