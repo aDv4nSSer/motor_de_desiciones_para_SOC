@@ -45,7 +45,7 @@ Categorías: **ML** (dataset/modelo/features) · **Resp** (respuesta activa/FIM/
 | [H30](#h30) | Ops | `motor-soc.service` (Fast Path) se saturó dos veces durante la validación de H29 — proceso único sin `--workers`, IO síncrono (Redis sin timeout en `response/queue.py`) y CPU-bound (`model.predict()`) ejecutados directamente dentro de `async def decide()` | Alto | Mecanismo identificado y **mitigación estructural aplicada y validada**: `run_in_executor` + `retry=Retry(NoBackoff(), 0)` explícito en ambos clientes Redis del Fast Path (hallazgo adicional: redis-py 8.x reintenta 10x sobre timeout por defecto, invalidando el `socket_timeout` sin este fix). Desplegado a `.140` y confirmado con Redis de prueba pausado (degrada en 2s, no se cuelga) y 5 requests concurrentes reales. **Disparador inicial del 3-sep sigue no determinado** — la mitigación estructural es independiente de esa causa puntual |
 | [H31](#h31) | ML | `motor/model.py` real en `.140` usa nombres de columna `Column_0..3` y unwrap de modelo empaquetado en dict — no coincide con `model-contract.md` ni con el `model.py` versionado en el repo | Alto | Documentado como contraste textual puro, sin interpretar bug vs. diseño intencional (le corresponde a Joaquín). No se modifica ni se reconcilia — queda explícitamente excluido de la conversión a git checkout de H26 hasta su revisión |
 | [H32](#h32) | Ops | `redis_client.py` en producción tenía la password real de Redis hardcodeada como fallback (`"soc_ubo_2026"`) — `motor-soc.service` corría sin `REDIS_PASSWORD` en su entorno y dependía silenciosamente de ese hardcodeo para funcionar | Alto | **CERRADO** — password rotada en `/etc/redis/soc-motor.conf` (comando `CONFIG` renombrado por hardening existente), 3 consumidores de `.140` validados. Incidente propio en el camino: un intento fallido de `CONFIG SET` expuso una password intermedia nunca aplicada — descartada de inmediato, regenerada, nunca llegó a usarse |
-| [H33](#h33) | Ops | `vigilante/cases.py` en `.139` nunca pudo alcanzar Redis en `.140` — `REDIS_HOST` nunca configurado (fallback a IP pública obsoleta, mismo patrón de H25) y, corregido el host, conexión rechazada (Redis probablemente bind a loopback solamente) | Alto | El heartbeat del FIM (diseñado para detectar "el vigilante murió en silencio") nunca pudo escribirse — fallo silencioso por `try/except`. `REDIS_HOST` corregido; abrir Redis a la red es decisión de Antonio, no resuelto hoy |
+| [H33](#h33) | Ops | `vigilante/cases.py` en `.139` nunca pudo alcanzar Redis en `.140` — `REDIS_HOST` nunca configurado (fallback a IP pública obsoleta, mismo patrón de H25) y, corregido el host, conexión rechazada (Redis probablemente bind a loopback solamente) | Alto | El heartbeat del FIM (diseñado para detectar "el vigilante murió en silencio") nunca pudo escribirse — fallo silencioso por `try/except`. `REDIS_HOST` corregido; abrir Redis a la red es decisión de Antonio, no resuelto hoy. **Continuación 2026-10-04:** causa confirmada = Redis de `.140` escucha solo en `127.0.0.1` (no red, no credenciales, no proceso caído); el heartbeat sí funcionó hasta el 2026-08-18 19:12:47Z |
 
 ---
 
@@ -1151,6 +1151,28 @@ Adicionalmente, la carga del modelo difiere: producción hace `pkg = joblib.load
 
 **Evidencia:** journal de `motor-watcher-heartbeat.service` con ambos errores (`No route to host` antes del fix de host, `Connection refused` después); lectura de `vigilante/watcher.py` y `vigilante/cases.py` confirmando el manejo de excepciones; backup de `watcher.env` antes de cada cambio.
 
+### H33 (continuación, 2026-10-04) — diagnóstico de causa, sin fix
+
+**Contexto:** después de H44, la vista de nodos marca el estado general como `down` de forma permanente porque `motor-watcher` no tiene heartbeat. Se pidió separar las tres causas posibles (proceso caído, red o credenciales) antes de proponer un fix. Todo lo que sigue es de solo lectura, sin cambios en `.139` ni en `.140`.
+
+| Hipótesis | Evidencia (2026-10-04 ~01:07 -03) | Resultado |
+|---|---|---|
+| Proceso caído | `motor-watcher.service` activo, PID 1752406 (`aiayala`), vivo desde el 2026-09-05 21:42:44 -04 (28 días), `NRestarts=0`. El journal muestra que escribe cada ~30 s: `ERROR no se pudo escribir heartbeat (no fatal): Error 111 connecting to 10.10.10.3:6379. Connection refused.` El timer `motor-watcher-heartbeat.timer` corre cada 15 min; su servicio termina `failed` con el mismo `ConnectionError`. | **Descartada** |
+| Red | Desde `.139`: `ip route get 10.10.10.3` sale por `eno2.10` (src `10.10.10.1`); ping 2/2 (0% de pérdida); TCP a `10.10.10.3:2222` y `:8000` abiertos. Solo `:6379` responde **Connection refused** (RST activo, no timeout ni "no route"). | **Descartada:** hay enrutamiento y conectividad L3/L4 |
+| Credenciales (rotación de H32) | El entorno del proceso tiene `REDIS_HOST=10.10.10.3`. `sha256(REDIS_PASSWORD)[:10]` vale `01528e8299` en el entorno del proceso de `.139`, y lo mismo en `~/tesis/motor-runtime/.env` de `.140`. Los hashes se calcularon en cada host, sin transmitir ni imprimir la contraseña. Además, con `Connection refused` el cliente nunca llega a mandar `AUTH`. | **Descartada:** la contraseña coincide con la vigente |
+| **Bind de Redis** | En `.140`, `ss -tln` muestra un único listener `127.0.0.1:6379` y ninguno en `10.10.10.3`. El kernel responde RST a cualquier conexión a `10.10.10.3:6379`. | **Causa confirmada** |
+
+**Corrección a H33 original ("nunca pudo alcanzar Redis"):** la key `soc:watcher:heartbeat` en Redis de `.140` vale **`2026-08-18T19:12:47Z`**, a un minuto del inicio de la ventana de H25 (`2026-08-18 19:13Z`, cuando `.140` dejó la IP pública). Antes de esa fecha el heartbeat **sí** llegaba, por `200.54.12.140:6379`. Desde entonces no se escribió nunca más (~46 días, que es lo que muestra el panel). `soc:watcher:heartbeat_alert_sent` no existe: la alerta por correo de `heartbeat_check.py` **nunca se disparó**, porque el chequeo falla antes, al leer Redis.
+
+**Lo que no se pudo confirmar:** el contenido de la directiva `bind` en `/etc/redis/redis.conf` (`root`, sin lectura para `aiayala` ni en el sudoers de auditoría). La evidencia de que hoy solo hay loopback es el listener activo. No se sabe si antes del 18-ago la directiva incluía la IP pública, que dejó de existir en el host con la migración, o si cambió después (por ejemplo en el endurecimiento de H32). Para cerrarlo: `sudo grep -nE '^\s*(bind|protected-mode)' /etc/redis/redis.conf` en `.140`, lo corre Antonio.
+
+**Conclusión:** la causa es de **configuración de escucha de Redis en `.140`**, no de red, credenciales ni proceso. Corregido el host en H33, falta el destino: Redis no escucha en la interfaz VLAN. Opciones para decidir (no aplicadas):
+- (a) Agregar `bind 127.0.0.1 10.10.10.3`, con un firewall en `.140` que acepte 6379 solo desde `10.10.10.1` (`.139`).
+- (b) No exponer Redis: un endpoint HTTP autenticado del motor (`X-Internal-Key`) para que `.139` reporte el heartbeat y los casos.
+- (c) Túnel SSH persistente de `.139` a `.140`.
+
+Hoy Redis guarda la cola de R1/R2 y las sesiones, así que (a) aumenta la superficie de ataque y requiere decisión explícita.
+
 ---
 
 ## H23 (cierre) — validación de carga real de OTX, con honestidad sobre lo que quedó sin confirmar
@@ -1859,13 +1881,75 @@ Por decisión de Antonio, con cuentas de prueba `smoke-ciso`, `smoke-n1` y `smok
 
 ---
 
+## H45 — `X-Trace-Id` en toda respuesta, ruff integrado al pre-commit y verificación de la exclusión de los artefactos de H44
+
+**Fecha:** 2026-10-04. Cubre los hallazgos de H44 que no requerían una ventana especial. Commits `b5cdc59` (ruff), `cf3219b` (X-Trace-Id) y `75b73ef` (docs de H44). La credencial del enforcer y `/metrics` siguen fuera de alcance.
+
+### 1. `X-Trace-Id` en toda respuesta
+
+- **Servicios con HTTP:** hay dos apps FastAPI en el repo, `motor/main.py` (`motor-soc`, producción) y `main.py` + `api/` en la raíz (API de inferencia `/predict`, no desplegada: en `.140` no corre otro uvicorn además de `motor-soc`). `opensearch-indexer`, `response-audit-indexer` y `response-worker` son workers sin HTTP. `historical-context-svc` y `threat-intel-svc` no existen como servicios.
+- **Implementación** (`motor/trace_middleware.py`, con copia en `api/middleware/trace.py` porque los dos paquetes no se importan entre sí). Mismo contrato que `trace_middleware` de `observability.md`: usa el `X-Trace-Id` del request o genera un `uuid4`, lo devuelve junto con `X-Duration-Ms` y loguea `request_completed` (con `logging`; structlog no está instalado, ver H41). Dos diferencias deliberadas:
+  - **Middleware ASGI puro, no `@app.middleware("http")`.** Con `call_next`, una excepción no controlada sale como 500 armado por `ServerErrorMiddleware`, por fuera y sin el header. Acá el 500 se responde con el header y el error uniforme de CLAUDE.md (`INTERNAL_ERROR`, sin filtrar el detalle), y la excepción se re-lanza para que uvicorn la siga registrando con traceback.
+  - **El `X-Trace-Id` entrante es input externo.** Solo se acepta si cumple `^[A-Za-z0-9-]{8,64}$` (el formato que ya valida `/audit/trace`); si no, se genera uno nuevo. Nunca se refleja un valor arbitrario en headers ni en logs.
+- **Alcance en `/decide`:** el header identifica la request HTTP. Cada decisión del batch conserva su propio `trace_id` en el cuerpo, igual que antes; no se tocó el Fast Path.
+- **Tests:** `tests/unit/test_trace_middleware.py`, 19 casos.
+  - Motor: header en 401, 404 y 422; propagación del valor entrante; reemplazo de valores inválidos (inyección CRLF, comillas, largo); un solo header por respuesta.
+  - Un 500 no controlado lleva header y error uniforme, y la excepción se re-lanza.
+  - API de inferencia: `/health` y 404.
+  - Suite completa: **407 passed**.
+- **Sesiones antes del restart (confirmado, sin dudas):** un token se valida con `jwt.decode` (firma con `FASTAPI_SECRET_KEY`, que viene del `EnvironmentFile` `/etc/motor-soc/dashboard.env` de systemd, sin cambios; confirmado por nombre en el entorno del proceso) más `get_user_record` y `session_exists`, ambos en Redis. No hay estado de sesión en memoria del proceso: lo único cacheado es `AuthSettings` (`lru_cache`), que se relee igual. `redis-server` no se reinicia con `motor-soc` (activo desde el 02-oct 06:31, AOF activo). Al momento del restart había **0 sesiones** `soc:sessions:*`, así que nadie se deslogueó.
+- **Despliegue:** push, `git pull` en `.140` (`cf3219b`, `model.py` sigue con `skip-worktree`) y **`systemctl restart motor-soc` a las 2026-10-04 01:10:22 -03**. `/health` volvió a las 01:10:30. Verificado en producción:
+  - `/health` 200 trae `X-Trace-Id` (uuid) y `X-Duration-Ms`.
+  - `/auth/me` 401 con `X-Trace-Id: deploy-h45-check-0001` lo devuelve igual.
+  - Un `X-Trace-Id: x OR 1=1` se reemplaza por un uuid.
+  - `/operativo/` y `https://motor-soc-ubo.duckdns.org/health` también traen el header.
+  - El Fast Path no cambió, medido en `soc-decisions-*` sin llamar a `/decide`: 00:58-01:08 → 4.804 decisiones (~8,0/s), latencia promedio 61,4 ms, p95 92,5 ms; post-restart → ~8,8/s, promedio 60,4 ms, p95 91,9 ms.
+  - R2 siguió con `[ENFORCE]` después del restart.
+- **Volumen de log:** `request_completed` agrega una línea INFO por request al journal de `motor-soc`. Se suma al access log de uvicorn, que ya existía, a un ritmo de pocas requests por segundo (Vector manda en batch).
+
+### 2. ¿Están excluidos los artefactos de H44 de las métricas? **No.** No existe ningún mecanismo de exclusión por `trace_id`
+
+Revisado todo el código que calcula las métricas pedidas (`motor/compliance.py`, `motor/dashboard.py`, `frontend/operativo`; `grep` de `mttd|mttr|fatiga|fatigue` en todo el repo):
+
+- **Fatiga de alertas** (`compliance_report` → `fatiga_alertas_pct`): sale de `dashboard.get_stats()`, una agregación sobre `soc-decisions,soc-decisions-*` filtrada solo por rango de tiempo. **La decisión sintética entra.** Evidencia, misma consulta para 03:00-04:00Z del 04-oct: tal como corre hoy da `ALERT=5388`; con `must_not term trace_id=2fd49fff-…` da `ALERT=5387`. `trace_id` es `keyword` en el mapping, así que excluirla es factible.
+- **Tendencias** (`tier_trend`): la única exclusión implementada es la ventana **hardcodeada** de H25 (`H25_EXCLUDED_FROM/TO` en `compliance.py`, buckets marcados "excluded"). No hay exclusión por documento: la decisión cuenta en el bucket del 04-oct como 1 T2.
+- **Acciones** (`response_counts`/`action_trend`, `ACTION_FILTERS["rechazadas"]`): **la aprobación de prueba entra.** Hoy `rechazadas = 1`, y es `smoke-n2` (la de H44). Además, los 33 eventos de acceso de las cuentas `smoke-*` entran en `accesos` por tipo. El documento `approval_rejected` tiene `trace_id = smoke-h43-20261004035205` a nivel raíz (y `username` `smoke-n2`), así que también sería filtrable.
+- **MTTD / MTTR:** **no están implementados.** `mttr_humano` devuelve `available: false` ("el evento de resolución no registra cuándo se abrió la aprobación") y no hay MTTD en ninguna parte del repo. No hay nada que excluir todavía.
+- **Impacto:** 1 decisión sobre 27.697 en esa hora y 1 rechazo. Despreciable en porcentajes, pero el rechazo es hoy el **único** "rechazado" del sistema, así que el panel CISO muestra `rechazadas: 1` por una prueba. No se implementó la exclusión porque el pedido fue confirmar, no rediseñar.
+  - Propuesta: una lista hardcodeada `EXCLUDED_TRACE_IDS` junto a las constantes de H25 en `compliance.py`, aplicada como `must_not terms trace_id` en `get_stats`, `tier_trend`, `response_counts` y `action_trend`, más `must_not prefix username "smoke-"` para los accesos.
+
+**Hallazgo nuevo en la misma métrica: `fatiga_alertas_pct` puede superar 100%.** `get_stats()` usa `hits.total.value` sin `track_total_hits: true`, así que OpenSearch topea el total en **10.000**, mientras que `por_decision` (agregación) cuenta todo. Con más de 10.000 decisiones en la ventana, `total_decisiones` queda en 10.000 y la fatiga se calcula sobre un denominador falso. Evidencia (medida con y sin `track_total_hits`, 2026-10-04 ~01:15 -03):
+
+| Ventana | Total real | Total de `get_stats` | Fatiga real | Fatiga mostrada |
+|---|---|---|---|---|
+| 03:00-04:00Z | 27.697 | 10.000 | 75,9% | **210,1%** |
+| Últimas 24 h (default de la vista Cumplimiento) | 549.891 | 10.000 | 77,8% | **4.277,6%** |
+
+La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total_decisiones` del panel Operativo en ventanas con más de 10.000 decisiones. **No corregido** (fuera del pedido); el fix es agregar `"track_total_hits": True` a la consulta, con un test.
+
+### 3. ruff integrado al pre-commit
+
+- **Hook:** `astral-sh/ruff-pre-commit` en `rev: v0.16.10` (misma versión que `.venv`), id `ruff-check`, solo lint, sin `--fix`. El repo no tenía config de ruff: el set de reglas es el default de 0.16.10. Ahora está en `ruff.toml`.
+- **B008 (lo nuevo de H43):** había **35** B008: 19 previos y 16 de H43, todos `Depends(...)`/`Query(...)` de FastAPI o `require_role(...)` en defaults.
+  - Para el idiom de FastAPI se aplicó la corrección que documenta ruff: `lint.flake8-bugbear.extend-immutable-calls` con `fastapi.Depends`, `Query`, `Path` y `params.Depends`. **Esto también limpia los 19 B008 previos del mismo patrón, solo por config, sin tocar ninguna de esas líneas.**
+  - Los 6 `Depends(require_role("N2"))` y los 3 `require_role_session("N2")` de H43 se corrigieron en código: dependencias de módulo `REQUIRE_N2`/`REQUIRE_N2_SESSION`, mismo comportamiento.
+- **Los preexistentes no se tocaron:** sin un cambio de código en esas líneas, el hook bloquearía cualquier commit sobre archivos que ya tenían hallazgos (incluido `motor/main.py` en este mismo commit). Se resolvió con una **línea base por archivo** en `ruff.toml` (`[lint.per-file-ignores]`, 41 archivos, comentada como "NO agregar entradas; borrar al limpiar"): cada archivo ignora solo los códigos que ya tenía, y todo archivo nuevo o fuera de la lista se revisa con el set completo.
+  - Limitación explícita: dentro de un archivo de la línea base, un hallazgo nuevo de un código ya ignorado ahí no se detecta.
+  - `motor/main.py` suma `RUF100` porque su `# noqa: BLE001` existente queda redundante con la línea base.
+- **Verificado:** `pre-commit run ruff-check --all-files` pasa. Un archivo de prueba con `import os` sin usar y `def f(x=list())` falla con F401 y B006, y un `Depends(...)` en default ya no se marca. Los tres commits pasaron por el hook.
+
+**Estado: X-Trace-Id DESPLEGADO Y VERIFICADO (`cf3219b`, restart 2026-10-04 01:10:22 -03). ruff ACTIVO en pre-commit. Exclusión de artefactos: NO EXISTE (documentado, no implementado). Fatiga >100%: hallazgo nuevo, no corregido.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - **El enforcer de R2 usa la credencial `administrator` de Wazuh (H43):** reemplazar por un usuario con permiso mínimo (`active-response:command`) en una ventana coordinada.
-- **`X-Trace-Id` ausente en las respuestas de toda la API (H44):** agregar un middleware que propague el header de la request o genere uno nuevo, y que lo devuelva siempre, incluidas las respuestas de error.
-- **`ruff` no corre en pre-commit (H44):** CLAUDE.md lo da como obligatorio, pero `.pre-commit-config.yaml` solo tiene bandit y detect-secrets. Hay 179 hallazgos en `motor/ scripts/ tests/`; decidir qué reglas aplicar (por ejemplo, ignorar `B008` por ser el patrón de FastAPI) antes de activarlo, para no bloquear commits por deuda previa.
+- **`fatiga_alertas_pct` y `total_decisiones` topeados en 10.000 (H45):** `get_stats()` sin `track_total_hits` da fatiga de 4.277,6% en la ventana por defecto de Cumplimiento (la real es 77,8%). Fix de una línea más un test; afecta la cifra que muestra el panel CISO.
+- **Excluir de métricas los artefactos de H44 (H45):** hoy NO hay exclusión por `trace_id`. Propuesta: lista hardcodeada `EXCLUDED_TRACE_IDS` junto a las constantes de H25 en `compliance.py`, aplicada en `get_stats`, `tier_trend`, `response_counts` y `action_trend`, más `smoke-*` en los accesos.
+- **Deuda de ruff (H45):** 41 archivos en la línea base `[lint.per-file-ignores]` de `ruff.toml` (~140 hallazgos). Limpiar por archivo y borrar su entrada, en commits propios.
+- **H33, decidir el fix:** Redis de `.140` escucha solo en loopback (confirmado en la continuación de H33). Elegir entre bind a VLAN con firewall restringido a `.139`, un endpoint HTTP del motor o un túnel SSH. Antonio confirma la directiva `bind` en `redis.conf`.
 - **`journalctl -u <servicio>` en `.140` exige `sudo` interactivo (H44):** las auditorías no pueden leer los logs de `motor-soc` ni de los indexadores. Agregar `aiayala` al grupo `systemd-journal`, o sumar `journalctl -u motor-soc*|opensearch-indexer*|response-audit-indexer*` al sudoers de auditoría.
-- **Excluir de métricas los artefactos del deploy de H44:** decisión `2fd49fff-5e01-46bf-a0ab-da0160b463ad` y aprobación `smoke-h43-20261004035205`.
 - **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
 - **Avisar a Joaquín del corte de `soc-decisions` (H42):** notebooks de reentrenamiento y Grafana deben leer `soc-decisions,soc-decisions-*` para ver decisiones posteriores al corte. Lo comunica Antonio.
 - **Retención/compresión del índice legado `soc-decisions` (H42):** sin política ni cambio de codec hasta después de la defensa (30-oct-2026); decidir después.
