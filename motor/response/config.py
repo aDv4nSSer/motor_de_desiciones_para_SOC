@@ -126,6 +126,14 @@ class ResponseSettings(BaseSettings):
     wazuh_api_timeout: float = 6.0
     wazuh_verify_tls: bool = False       # cert self-signed en el lab
 
+    # ── Vista de estado de nodos (H43): usuario de SOLO LECTURA ────────
+    # Rol agents_readonly de la API de Wazuh (agent:read, group:read).
+    # Separado a propósito de wazuh_api_user (el del enforcer): la vista
+    # del dashboard nunca usa una credencial capaz de disparar Active
+    # Response. Vacío -> la vista muestra Wazuh como "no configurado".
+    wazuh_nodes_user: str = ""
+    wazuh_nodes_password: str = ""
+
     # ── Safelist extra (coma-separada) ─────────────────────────────────
     response_safelist_extra: str = ""
 

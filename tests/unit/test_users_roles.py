@@ -18,14 +18,20 @@ from users import (
 
 
 class FakeRedis:
-    """Redis mínimo en memoria — solo lo que users.py necesita (get/set/sadd/smembers)."""
+    """Redis mínimo en memoria — lo que users.py y sessions.py necesitan
+    (strings con NX, sets, hashes, TTL)."""
 
     def __init__(self):
         self._kv: dict[str, str] = {}
         self._sets: dict[str, set[str]] = {}
+        self._hashes: dict[str, dict[str, str]] = {}
+        self._ttl: dict[str, int] = {}
 
-    def set(self, key, value):
+    def set(self, key, value, nx=False):
+        if nx and key in self._kv:
+            return None
         self._kv[key] = value
+        return True
 
     def get(self, key):
         return self._kv.get(key)
@@ -35,6 +41,34 @@ class FakeRedis:
 
     def smembers(self, key):
         return self._sets.get(key, set())
+
+    def hset(self, key, field, value):
+        self._hashes.setdefault(key, {})[field] = value
+
+    def hexists(self, key, field):
+        return field in self._hashes.get(key, {})
+
+    def hgetall(self, key):
+        return dict(self._hashes.get(key, {}))
+
+    def hkeys(self, key):
+        return list(self._hashes.get(key, {}))
+
+    def hdel(self, key, *fields):
+        h = self._hashes.get(key, {})
+        return sum(1 for f in fields if h.pop(f, None) is not None)
+
+    def delete(self, *keys):
+        n = 0
+        for k in keys:
+            n += int(self._kv.pop(k, None) is not None) + int(self._hashes.pop(k, None) is not None)
+        return n
+
+    def ttl(self, key):
+        return self._ttl.get(key, -1)
+
+    def expire(self, key, seconds):
+        self._ttl[key] = seconds
 
 
 class TestCreateAndAuthenticate:

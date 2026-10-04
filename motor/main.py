@@ -9,16 +9,24 @@ import logging
 import multiprocessing
 import time
 import uuid
-from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
-from auth import get_current_user, log_access_event, require_ciso
-from auth import login as auth_login
-from dashboard import (
-    _get_redis as get_dashboard_redis,
+import audit_view
+import compliance
+import redis
+import user_admin
+from auth import (
+    get_current_session,
+    get_current_user,
+    log_access_event,
+    require_ciso,
+    require_role,
+    require_role_session,
 )
+from auth import login as auth_login
 from dashboard import (
     DECISIONS_MAX_LIMIT,
     get_active_blocks,
@@ -32,10 +40,14 @@ from dashboard import (
     list_cases,
     update_case_state,
 )
+from dashboard import (
+    _get_redis as get_dashboard_redis,
+)
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # H36: "from model import get_model" NO va a nivel de módulo a propósito —
 # ver _init_score_worker() más abajo para el porqué (contención de joblib/
@@ -52,7 +64,9 @@ from response.config import get_settings as get_response_settings
 from response.enforcer import build_enforcer, is_safelisted
 from response.queue import enqueue_response_task
 from schemas import FlowFeatures
-from users import ROLE_LEVEL, User, get_user_record
+from sessions import revoke_session
+from system_status import get_node_status
+from users import ROLE_LEVEL, Role, User, get_user_record
 
 logging.basicConfig(
     level=logging.INFO,
@@ -375,13 +389,20 @@ class LoginResponse(BaseModel):
 
 
 @app.post("/api/v1/auth/login", response_model=LoginResponse)
-def auth_login_endpoint(payload: LoginRequest):
+def auth_login_endpoint(payload: LoginRequest, request: Request):
     """Login del dashboard. Devuelve un JWT con el rol embebido (N1/N2/CISO).
 
-    No hay endpoint de registro a propósito — los usuarios se crean con
-    scripts/manage_users.py, corrido directamente en `.140`.
+    Desde H43 las cuentas también se gestionan desde el dashboard (N2+/CISO,
+    ver user_admin.py); scripts/manage_users.py sigue siendo la vía para el
+    primer CISO y para cambiar la propia contraseña. Cada login registra una
+    sesión revocable (sessions.py) con el User-Agent y la IP que informa el
+    proxy de .139 (X-Real-IP), solo como dato para "sesiones activas".
     """
-    token = auth_login(payload.username, payload.password)
+    token = auth_login(
+        payload.username, payload.password,
+        user_agent=request.headers.get("user-agent", ""),
+        client_ip=request.headers.get("x-real-ip", ""),
+    )
     # auth_login ya audita login_success/login_failed y lanza 401 si falla.
     record = get_user_record(payload.username)
     return LoginResponse(access_token=token, role=record.role if record else "N1")
@@ -390,6 +411,20 @@ def auth_login_endpoint(payload: LoginRequest):
 @app.get("/api/v1/auth/me")
 def auth_me(user: User = Depends(get_current_user)):
     return {"username": user.username, "role": user.role}
+
+
+@app.post("/api/v1/auth/logout")
+def auth_logout(current: tuple[User, str] = Depends(get_current_session)):
+    """Cierra la sesión del lado del servidor: el token deja de servir aunque
+    alguien lo haya copiado (antes de H43 solo se borraba en el navegador)."""
+    user, jti = current
+    try:
+        revoke_session(user.username, jti)
+    except redis.RedisError as e:
+        log.error(f"no se pudo revocar la sesión al cerrar sesión de {user.username!r}: {e}")
+        raise HTTPException(status_code=503, detail="No se pudo cerrar la sesión en el servidor, reintente")
+    log_access_event(user.username, "logout", {"jti": jti})
+    return {"status": "ok"}
 
 
 # ── Aprobaciones humanas (accion_recomendada con requires_approval=True) ──
@@ -511,25 +546,152 @@ def dashboard_resolve_approval(
     return resolved
 
 
-# ── Cumplimiento / CISO (pendiente #10 — backend inicial, dashboard visual pendiente) ──
+# ── Estado de nodos (H43, N1+) ───────────────────────────────────────────────
+@app.get("/api/v1/dashboard/nodes")
+def dashboard_nodes(user: User = Depends(get_current_user)):
+    """Salud de motor, Redis, OpenSearch, pipelines, vigilante y agentes Wazuh
+    (system_status.py). Cada chequeo degrada por separado."""
+    return get_node_status()
+
+
+# ── Historial / auditoría (H43): N2 parcial, CISO completo ─────────────────────
+@app.get("/api/v1/dashboard/audit/trace/{trace_id}")
+def dashboard_audit_trace(
+    trace_id: str = PathParam(..., max_length=64),
+    user: User = Depends(require_role("N2")),
+):
+    """Todo lo registrado para un trace_id, con el hash de cada documento
+    verificado. N2 no ve los eventos de acceso (vista parcial); CISO sí."""
+    if not audit_view.valid_trace_id(trace_id):
+        raise HTTPException(status_code=422, detail="trace_id inválido")
+    is_ciso = user.role == "CISO"
+    log_access_event(user.username, "audit_trace_viewed", {"trace_id": trace_id})
+    return {**audit_view.search_trace(trace_id, include_access=is_ciso), "scope": "full" if is_ciso else "partial"}
+
+
+@app.get("/api/v1/dashboard/audit/chain")
+def dashboard_audit_chain(user: User = Depends(require_role("N2"))):
+    """Verificación en vivo de la cola de las cadenas soc-responses-* y
+    soc-decisions-* (audit_view.chain_status, cache 60 s)."""
+    return audit_view.chain_status()
+
+
+@app.get("/api/v1/dashboard/audit/access")
+def dashboard_audit_access(
+    limit: int = Query(100, ge=1, le=audit_view.ACCESS_EVENTS_MAX),
+    username: str | None = Query(None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
+    user: User = Depends(require_ciso),
+):
+    """Eventos de acceso persistidos con hash-chain (solo CISO)."""
+    return audit_view.access_events(limit, username)
+
+
+# ── Gestión de usuarios y sesiones (H43, N2+; reglas en user_admin.py) ─────────
+class CreateUserRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=256)
+    role: Role
+
+
+class UpdateUserRequest(BaseModel):
+    role: Role | None = None
+    disabled: bool | None = None
+
+
+class PasswordRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=256)
+
+
+def _admin_call(fn, *args):
+    """Traduce AdminError a su HTTP y Redis caído a 503 (nunca a 200 vacío)."""
+    try:
+        return fn(*args)
+    except user_admin.AdminError as e:
+        raise HTTPException(status_code=e.status, detail=e.message)
+    except redis.RedisError as e:
+        log.error(f"gestión de usuarios sin Redis: {e}")
+        raise HTTPException(status_code=503, detail="No se pudo leer o escribir la tabla de usuarios, reintente")
+
+
+@app.get("/api/v1/dashboard/users")
+def dashboard_users(user: User = Depends(require_role("N2"))):
+    return {"items": _admin_call(user_admin.list_accounts, user),
+            "assignable_roles": user_admin.assignable_roles(user)}
+
+
+@app.post("/api/v1/dashboard/users", status_code=201)
+def dashboard_create_user(payload: CreateUserRequest, user: User = Depends(require_role("N2"))):
+    created = _admin_call(user_admin.create_account, user, payload.username, payload.password, payload.role)
+    return created.model_dump()
+
+
+@app.patch("/api/v1/dashboard/users/{username}")
+def dashboard_update_user(
+    payload: UpdateUserRequest,
+    username: str = PathParam(..., max_length=64),
+    user: User = Depends(require_role("N2")),
+):
+    return _admin_call(user_admin.update_account, user, username, payload.role, payload.disabled)
+
+
+@app.post("/api/v1/dashboard/users/{username}/password")
+def dashboard_reset_password(
+    payload: PasswordRequest,
+    username: str = PathParam(..., max_length=64),
+    user: User = Depends(require_role("N2")),
+):
+    return _admin_call(user_admin.reset_password, user, username, payload.password)
+
+
+@app.get("/api/v1/dashboard/sessions")
+def dashboard_sessions(current: tuple[User, str] = Depends(require_role_session("N2"))):
+    user, jti = current
+    items = _admin_call(user_admin.visible_sessions, user)
+    for item in items:
+        item["is_current"] = item["is_self"] and item["jti"] == jti
+    return {"items": items}
+
+
+@app.delete("/api/v1/dashboard/sessions/{username}/{jti}")
+def dashboard_revoke_session(
+    username: str = PathParam(..., max_length=64),
+    jti: str = PathParam(..., max_length=64, pattern=r"^[a-f0-9]+$"),
+    current: tuple[User, str] = Depends(require_role_session("N2")),
+):
+    user, current_jti = current
+    return _admin_call(user_admin.revoke, user, username, jti, current_jti)
+
+
+@app.delete("/api/v1/dashboard/users/{username}/sessions")
+def dashboard_revoke_all_sessions(
+    username: str = PathParam(..., max_length=64),
+    current: tuple[User, str] = Depends(require_role_session("N2")),
+):
+    user, current_jti = current
+    return _admin_call(user_admin.revoke, user, username, None, current_jti)
+
+
+# ── Cumplimiento y tendencias (pendiente #10, H43 — solo CISO) ───────────────
 @app.get("/api/v1/dashboard/compliance")
-def dashboard_compliance(window_minutes: int = 1440, user: User = Depends(require_ciso)):
-    """Métricas de valor para CISO (sección 7 de la especificación, Fase 1:
-    fatiga de alertas + MTTD/MTTR). Reutiliza get_stats/get_precision_stats
-    ya existentes -- no se inventa ninguna cifra nueva."""
-    stats = get_stats(window_minutes)
-    precision = get_precision_stats(window_minutes)
-    total = stats.get("total_decisiones") or 0
-    por_decision = stats.get("por_decision", {})
-    auto_resuelto = sum(v for k, v in por_decision.items() if k in ("ALLOW", "LOG"))
-    fatiga_pct = round(100 * auto_resuelto / total, 1) if total else None
-    return {
-        "window_minutes": window_minutes,
-        "fatiga_alertas_pct": fatiga_pct,
-        "latencia_avg_ms": stats.get("latencia_avg_ms"),
-        "latencia_p95_ms": stats.get("latencia_p95_ms"),
-        "precision_bloqueos": precision,
-    }
+def dashboard_compliance(
+    window_minutes: int = Query(1440, ge=60, le=43_200),
+    user: User = Depends(require_ciso),
+):
+    """Métricas de valor (sección 7, Fase 1) + checklist Ley 21.663 con la
+    evidencia real de cada obligación (compliance.py). Conserva los campos
+    del stub original (fatiga, latencias, precisión)."""
+    nodes = get_node_status()
+    return compliance.compliance_report(window_minutes, nodes["overall"])
+
+
+@app.get("/api/v1/dashboard/trends")
+def dashboard_trends(days: int = Query(7), user: User = Depends(require_ciso)):
+    """Tiers en el tiempo, acciones ejecutadas vs. pendientes y fuentes de
+    corroboración (compliance.get_trends). days: 1, 7 o 30."""
+    try:
+        return compliance.get_trends(days)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 # ── Dashboard Operativo (React/Vite, frontend/operativo) ────────────────────

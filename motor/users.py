@@ -157,3 +157,104 @@ def list_users(rdb: redis.Redis | None = None) -> list[User]:
 def role_at_least(role: Role, minimum: Role) -> bool:
     """True si `role` tiene privilegios >= `minimum` en la jerarquía N1<N2<CISO."""
     return ROLE_LEVEL[role] >= ROLE_LEVEL[minimum]
+
+
+# ── Gestión desde el dashboard (H43) ─────────────────────────────────────────
+# Las reglas de quién puede gestionar a quién viven en user_admin.py; acá
+# solo las escrituras. Mismo registro JSON que create_user().
+
+MIN_PASSWORD_LENGTH = 12  # mismo mínimo que scripts/manage_users.py
+
+
+class UserExistsError(Exception):
+    """Alta de un username que ya existe (el alta desde el dashboard nunca
+    reemplaza un usuario, a diferencia de create_user() del CLI)."""
+
+
+def add_user(
+    username: str, plain_password: str, role: Role, rdb: redis.Redis | None = None,
+) -> User:
+    """Alta de un usuario nuevo. No reemplaza uno existente (SET NX).
+
+    Args:
+        username: identificador único, case-sensitive.
+        plain_password: contraseña en texto plano — se hashea con bcrypt.
+        role: "N1" | "N2" | "CISO".
+        rdb: cliente Redis opcional (tests).
+
+    Returns:
+        El User creado (sin el hash).
+
+    Raises:
+        UserExistsError: si el username ya existe.
+        redis.RedisError: si Redis no responde.
+    """
+    r = _get_redis(rdb)
+    record = UserRecord(
+        username=username,
+        role=role,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        password_hash=hash_password(plain_password),
+    )
+    if not r.set(f"{USERS_KEY_PREFIX}{username}", record.model_dump_json(), nx=True):
+        raise UserExistsError(username)
+    r.sadd(USERS_INDEX_KEY, username)
+    log.info(f"usuario dado de alta desde el dashboard: {username} (rol={role})")
+    return User(**record.model_dump(exclude={"password_hash"}))
+
+
+def _save(record: UserRecord, r: redis.Redis) -> User:
+    r.set(f"{USERS_KEY_PREFIX}{record.username}", record.model_dump_json())
+    return User(**record.model_dump(exclude={"password_hash"}))
+
+
+def update_user(
+    username: str,
+    role: Role | None = None,
+    disabled: bool | None = None,
+    rdb: redis.Redis | None = None,
+) -> User | None:
+    """Cambia rol y/o estado. Un cambio de rol o una baja invalidan los JWT
+    vigentes del usuario (get_current_user compara rol y estado en cada request).
+
+    Returns:
+        El User actualizado, o None si no existe.
+
+    Raises:
+        redis.RedisError: si Redis no responde.
+    """
+    r = _get_redis(rdb)
+    record = get_user_record(username, r)
+    if record is None:
+        return None
+    if role is not None:
+        record.role = role
+    if disabled is not None:
+        record.disabled = disabled
+    return _save(record, r)
+
+
+def set_password(username: str, plain_password: str, rdb: redis.Redis | None = None) -> User | None:
+    """Reemplaza la contraseña (hash bcrypt nuevo).
+
+    Returns:
+        El User, o None si no existe.
+
+    Raises:
+        redis.RedisError: si Redis no responde.
+    """
+    r = _get_redis(rdb)
+    record = get_user_record(username, r)
+    if record is None:
+        return None
+    record.password_hash = hash_password(plain_password)
+    return _save(record, r)
+
+
+def count_active(role: Role, rdb: redis.Redis | None = None) -> int:
+    """Cantidad de usuarios habilitados con ese rol exacto.
+
+    Raises:
+        redis.RedisError: si Redis no responde.
+    """
+    return sum(1 for u in list_users(rdb) if u.role == role and not u.disabled)

@@ -2,9 +2,12 @@
 """
 manage_users.py — CLI para crear/listar usuarios del dashboard (Redis-backed).
 
-No hay endpoint HTTP para crear usuarios a propósito (evita exponer gestión
-de cuentas sobre la red del lab) — se administra desde este script, corrido
-directamente en `.140` con acceso a Redis.
+Desde H43 las cuentas también se gestionan desde el dashboard (vista
+"Usuarios y sesiones", N2+/CISO, reglas de mínimo privilegio en
+motor/user_admin.py). Este script sigue siendo la vía para crear el primer
+CISO (el panel exige estar autenticado) y para cambiar la propia contraseña;
+se corre directamente en `.140` con acceso a Redis. Ojo: `create` reemplaza
+un usuario existente y no revoca sus sesiones (el panel sí).
 
 Uso:
     python scripts/manage_users.py create <username> <role: N1|N2|CISO>

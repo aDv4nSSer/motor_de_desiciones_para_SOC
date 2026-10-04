@@ -55,6 +55,10 @@ Thumbs.db
 
 # --- Claude Code: contenido de terceros, no versionar ---
 .claude/skills/
+# taste-skill (github.com/Leonxlnx/taste-skill, instalado vía npx): andamiaje de
+# una herramienta de terceros, no código del proyecto (H43).
+.agents/
+skills-lock.json
 
 graphify-out/
 
