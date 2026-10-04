@@ -1938,14 +1938,33 @@ La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total
   - `motor/main.py` suma `RUF100` porque su `# noqa: BLE001` existente queda redundante con la línea base.
 - **Verificado:** `pre-commit run ruff-check --all-files` pasa. Un archivo de prueba con `import os` sin usar y `def f(x=list())` falla con F401 y B006, y un `Depends(...)` en default ya no se marca. Los tres commits pasaron por el hook.
 
-**Estado: X-Trace-Id DESPLEGADO Y VERIFICADO (`cf3219b`, restart 2026-10-04 01:10:22 -03). ruff ACTIVO en pre-commit. Exclusión de artefactos: NO EXISTE (documentado, no implementado). Fatiga >100%: hallazgo nuevo, no corregido.**
+**Estado: X-Trace-Id DESPLEGADO Y VERIFICADO (`cf3219b`, restart 2026-10-04 01:10:22 -03). ruff ACTIVO en pre-commit. Exclusión de artefactos: NO EXISTE (documentado, no implementado). Fatiga >100%: hallazgo nuevo, corregido en H46.**
+
+---
+
+## H46 — Fatiga de alertas: `get_stats()` con `track_total_hits` (corrige el hallazgo de H45)
+
+**Fecha:** 2026-10-04. Commits: `8c60b8f` (fix y test) y `272fbbe` (`observability.md` alineado con el `trace_middleware` ASGI puro de producción, con la nota de que cubre los 500 no controlados que `@app.middleware("http")` no cubre).
+
+- **Fix:** se agregó `"track_total_hits": True` a la consulta de `dashboard.get_stats()`. Es una corrección de lectura: no cambia nada de lo que se escribe, ni R2, ni el Fast Path.
+- **Test** (`tests/unit/test_fatigue_total_hits.py`, 4 casos): un OpenSearch falso que imita el tope real (sin `track_total_hits`, `total = 10.000` con `relation: gte`; las agregaciones siempre completas), cargado con los números reales de producción de las 24 h al 2026-10-04 ~01:15: LOG 287.157, ALLOW 140.602, ALERT 105.788, BLOCK 16.344, total **549.891**. `compliance_report(1440)` de punta a punta da `total = 549.891` y `fatiga_alertas_pct = 77,8`. **Sin el fix fallan 3 de los 4** (`assert 10000 == 549891`); con el fix pasan. Suite completa: 411 passed.
+- **Sesiones antes del restart** (mismo criterio que H45): 0 claves `soc:sessions:*`; `FASTAPI_SECRET_KEY` presente en el entorno de `motor-soc`, desde `/etc/motor-soc/dashboard.env` (mtime 2026-09-30, sin cambios); `redis-server` activo desde el 02-oct 06:31 con AOF. El restart no invalida ningún token.
+- **Despliegue:** `git pull` en `.140` (`272fbbe`, `model.py` sigue con `skip-worktree`) y **`systemctl restart motor-soc` a las 2026-10-04 01:19:31 -03** (activo a las 01:19:32, `NRestarts=0`). `/health` respondió 200 con `golden4_v7_1` y `X-Trace-Id`.
+- **Verificado en producción** con el código desplegado contra el OpenSearch real:
+  - `get_stats(1440)`: `total_decisiones = 550.977` (antes 10.000) y `fatiga_alertas_pct = 77,8%` (antes 4.277,6%).
+  - `get_stats(60)`: `total_decisiones = 27.898`, exactamente igual a la suma de `por_decision`.
+- **Mismo patrón, no corregido (fuera de lo pedido):** `compliance.response_counts()` → `total_eventos` también lee `hits.total` sin `track_total_hits`, así que se corta en 10.000 en ventanas con más eventos en `soc-responses-*`. No entra en la fatiga ni en el checklist.
+
+**Estado: CORREGIDO, DESPLEGADO Y VERIFICADO EN PRODUCCIÓN.**
 
 ---
 
 ## Pendientes detectados (no resueltos hoy)
 
+- **`total_eventos` de `response_counts()` topeado en 10.000 (H46):** mismo bug que `get_stats()`; agregar `track_total_hits` y un test.
+- **H33: leer la directiva `bind` real de Redis.** `sudo grep -nE '^\s*(bind|protected-mode)' /etc/redis/redis.conf` en `.140` pide contraseña interactiva: no está en el sudoers de auditoría. Lo corre Antonio antes de decidir el fix.
+
 - **El enforcer de R2 usa la credencial `administrator` de Wazuh (H43):** reemplazar por un usuario con permiso mínimo (`active-response:command`) en una ventana coordinada.
-- **`fatiga_alertas_pct` y `total_decisiones` topeados en 10.000 (H45):** `get_stats()` sin `track_total_hits` da fatiga de 4.277,6% en la ventana por defecto de Cumplimiento (la real es 77,8%). Fix de una línea más un test; afecta la cifra que muestra el panel CISO.
 - **Excluir de métricas los artefactos de H44 (H45):** hoy NO hay exclusión por `trace_id`. Propuesta: lista hardcodeada `EXCLUDED_TRACE_IDS` junto a las constantes de H25 en `compliance.py`, aplicada en `get_stats`, `tier_trend`, `response_counts` y `action_trend`, más `smoke-*` en los accesos.
 - **Deuda de ruff (H45):** 41 archivos en la línea base `[lint.per-file-ignores]` de `ruff.toml` (~140 hallazgos). Limpiar por archivo y borrar su entrada, en commits propios.
 - **H33, decidir el fix:** Redis de `.140` escucha solo en loopback (confirmado en la continuación de H33). Elegir entre bind a VLAN con firewall restringido a `.139`, un endpoint HTTP del motor o un túnel SSH. Antonio confirma la directiva `bind` en `redis.conf`.
