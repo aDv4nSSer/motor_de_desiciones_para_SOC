@@ -45,7 +45,7 @@ Categorías: **ML** (dataset/modelo/features) · **Resp** (respuesta activa/FIM/
 | [H30](#h30) | Ops | `motor-soc.service` (Fast Path) se saturó dos veces durante la validación de H29 — proceso único sin `--workers`, IO síncrono (Redis sin timeout en `response/queue.py`) y CPU-bound (`model.predict()`) ejecutados directamente dentro de `async def decide()` | Alto | Mecanismo identificado y **mitigación estructural aplicada y validada**: `run_in_executor` + `retry=Retry(NoBackoff(), 0)` explícito en ambos clientes Redis del Fast Path (hallazgo adicional: redis-py 8.x reintenta 10x sobre timeout por defecto, invalidando el `socket_timeout` sin este fix). Desplegado a `.140` y confirmado con Redis de prueba pausado (degrada en 2s, no se cuelga) y 5 requests concurrentes reales. **Disparador inicial del 3-sep sigue no determinado** — la mitigación estructural es independiente de esa causa puntual |
 | [H31](#h31) | ML | `motor/model.py` real en `.140` usa nombres de columna `Column_0..3` y unwrap de modelo empaquetado en dict — no coincide con `model-contract.md` ni con el `model.py` versionado en el repo | Alto | Documentado como contraste textual puro, sin interpretar bug vs. diseño intencional (le corresponde a Joaquín). No se modifica ni se reconcilia — queda explícitamente excluido de la conversión a git checkout de H26 hasta su revisión |
 | [H32](#h32) | Ops | `redis_client.py` en producción tenía la password real de Redis hardcodeada como fallback (`"soc_ubo_2026"`) — `motor-soc.service` corría sin `REDIS_PASSWORD` en su entorno y dependía silenciosamente de ese hardcodeo para funcionar | Alto | **CERRADO** — password rotada en `/etc/redis/soc-motor.conf` (comando `CONFIG` renombrado por hardening existente), 3 consumidores de `.140` validados. Incidente propio en el camino: un intento fallido de `CONFIG SET` expuso una password intermedia nunca aplicada — descartada de inmediato, regenerada, nunca llegó a usarse |
-| [H33](#h33) | Ops | `vigilante/cases.py` en `.139` nunca pudo alcanzar Redis en `.140` — `REDIS_HOST` nunca configurado (fallback a IP pública obsoleta, mismo patrón de H25) y, corregido el host, conexión rechazada (Redis probablemente bind a loopback solamente) | Alto | El heartbeat del FIM (diseñado para detectar "el vigilante murió en silencio") nunca pudo escribirse — fallo silencioso por `try/except`. `REDIS_HOST` corregido; abrir Redis a la red es decisión de Antonio, no resuelto hoy. **Continuación 2026-10-04:** causa confirmada = Redis de `.140` escucha solo en `127.0.0.1` (no red, no credenciales, no proceso caído); el heartbeat sí funcionó hasta el 2026-08-18 19:12:47Z |
+| [H33](#h33) | Ops | `vigilante/cases.py` en `.139` nunca pudo alcanzar Redis en `.140` — `REDIS_HOST` nunca configurado (fallback a IP pública obsoleta, mismo patrón de H25) y, corregido el host, conexión rechazada (Redis probablemente bind a loopback solamente) | Alto | El heartbeat del FIM (diseñado para detectar "el vigilante murió en silencio") nunca pudo escribirse — fallo silencioso por `try/except`. `REDIS_HOST` corregido; abrir Redis a la red es decisión de Antonio, no resuelto hoy. **Continuación 2026-10-04:** causa confirmada = Redis de `.140` escucha solo en `127.0.0.1` (no red, no credenciales, no proceso caído); el heartbeat sí funcionó hasta el 2026-08-18 19:12:47Z. **CERRADO 2026-10-04:** bind `127.0.0.1 -::1 10.10.10.3` + ufw allow `.139`/deny resto en 6379 + drop-in network-online; heartbeat restablecido |
 
 ---
 
@@ -1173,6 +1173,99 @@ Adicionalmente, la carga del modelo difiere: producción hace `pkg = joblib.load
 
 Hoy Redis guarda la cola de R1/R2 y las sesiones, así que (a) aumenta la superficie de ataque y requiere decisión explícita.
 
+### H33 (cierre, 2026-10-04) — Redis escuchando en VLAN 10 con firewall acotado a `.139`; heartbeat del vigilante restablecido
+
+**Opción elegida (Antonio): (a), bind explícito a la IP de VLAN más un firewall de host acotado al origen.** Es defensa en profundidad: la exposición queda limitada por tres capas independientes, la interfaz donde escucha Redis, el origen permitido por el firewall y la autenticación. (b) obligaba a rediseñar el vigilante; (c) agregaba un túnel que también hay que supervisar.
+
+**Falso positivo del prerequisito (error del script, no del servidor).** La primera versión de `h33_apply.sh` buscaba `requirepass` solo en `/etc/redis/redis.conf` y abortó con "requirepass no está activo". Pero H32 ya documentaba que vive en `/etc/redis/soc-motor.conf`, incluido como último `include`. Redis **nunca estuvo sin autenticación**:
+- Sin contraseña, `redis-cli -h 127.0.0.1 ping` respondía `NOAUTH Authentication required.`
+- Redis venía de un restart el 2026-10-02 06:31:08 cargando `/etc/redis/redis.conf` con sus `include`, y desde entonces exigía la contraseña. O sea, estaba guardada en la config, no solo en memoria.
+- **Salida exacta del abort (v1): PENDIENTE, la pega Antonio.**
+
+Corrección (v2 del script): expande los `include` en el orden de Redis (si una directiva aparece varias veces, gana la última), edita la línea `bind` efectiva (resultó estar en `soc-motor.conf`) y agrega el modo `--check` de solo lectura. Lección: antes de escribir un script de config, releer la bitácora del mismo componente.
+
+**Auditoría de consumidores (sin cambios):** un solo `REDIS_PASSWORD`, consistente en todos (`sha256[:10]=01528e8299`, calculado en cada host, sin transmitir la contraseña):
+- `.140`: `motor-soc`, `response-worker`, `response-audit-indexer` y `opensearch-indexer` lo leen de `~/tesis/motor-runtime/.env`, vía el symlink `repo/motor/.env`, con dotenv/pydantic. Ninguno lo recibe por el entorno de systemd y nadie usa `REDIS_URL`.
+- `.139`: `motor-watcher` y `motor-watcher-heartbeat` lo leen de `/etc/motor-soc/watcher.env`.
+- Vector (`vector.production.toml`) no usa Redis.
+- **No se cambió `requirepass`.**
+
+**Regla ufw vieja [1] `6379/tcp` desde `200.54.12.136/29`:**
+- Es anterior a la migración (`user.rules` modificado el 21-ago). `.140` ya no tiene ninguna IP `200.54.12.x`.
+- `ufw.log` está vacío desde el 2-sep y con `LOGLEVEL=low` no registra los `ALLOW`, así que la evidencia decisiva es el contador `pkts` de la regla: **PENDIENTE, la pega Antonio.**
+- Con `pkts=0` se borró a mano (`sudo ufw delete 1`).
+
+**Aplicado por Antonio con `sudo bash ~/h33/h33_apply.sh` (v2)** (backup `/etc/redis/soc-motor.conf.bak-H33-20261004-014245`):
+- Reglas `ufw` insertadas **antes** que todas las demás: (1) `allow proto tcp from 10.10.10.1 to 10.10.10.3 port 6379` ("H33 redis solo desde .139") y (2) `deny proto tcp from 0.0.0.0/0 to 10.10.10.3 port 6379` ("H33 redis resto bloqueado"). Se aplicaron antes del bind, así que el puerto nunca quedó expuesto sin filtro. **Salida de `ufw status numbered` después: PENDIENTE, la pega Antonio.**
+- `bind` efectivo en `soc-motor.conf`: `bind 127.0.0.1 -::1 10.10.10.3`; `protected-mode yes` sin tocar. **Diff del bind: PENDIENTE, la pega Antonio.**
+- Drop-in `/etc/systemd/system/redis-server.service.d/h33-network-online.conf` (leído del disco):
+  ```
+  # H33: redis.conf bindea 10.10.10.3, que asigna NetworkManager. Sin esto, al
+  # bootear Redis puede arrancar antes de que exista la IP, fallar el bind y
+  # agotar StartLimitBurst (5 en 10 s), dejando caído todo el motor.
+  [Unit]
+  Wants=network-online.target
+  After=network-online.target
+  ```
+  Efectivo: `systemctl show redis-server -p After,Wants` incluye `network-online.target`; `NetworkManager-wait-online.service` está `enabled`.
+
+**Snapshot ANTES** (`~/h33/snap_before.json` en `.140`, 01:45:33 -03):
+- BGSAVE completo, `lastsave` 01:45:39; AOF `on`, `aof_last_write_status ok`, `rdb_last_bgsave_status ok`.
+- 0 sesiones del dashboard.
+- Cabeza de `soc-decisions-*`: `chain_seq 523900`, `hash 46bba602b9adeb7bb4c8051734524d9e42695f93b4b19ca011fac33ee405543d`.
+
+| Stream | XLEN | entries-added | Grupo: entries-read / pending / lag |
+|---|---|---|---|
+| `soc:decisions` | 10.013 | 18.935.224 | `opensearch-indexer`: 18.935.215 / 1 / 9 |
+| `soc:flows` | 10.006 | 18.935.222 | (sin grupo) |
+| `soc:response:tasks` | 200.005 | 12.101.174 | `response-workers`: 12.101.170 / **100** / 4 |
+| `soc:response:audit` | 100.004 | 11.436.217 | `response-audit-indexer`: 11.436.217 / 1 / 0 |
+
+La PEL de `response-workers` se guardó completa (id, consumer, idle, deliveries): 100 entradas de `worker-1`, de `1786655183949-0` a `1791089139376-1`. 95 son viejas (idle de más de 1 h, la más antigua de hace ~51 días) y 5 estaban en proceso en ese instante.
+
+**Restart** (`sudo systemctl restart redis-server`, NOPASSWD):
+- **01:46:06 -03.** Journal: `Stopping` 01:46:06 → `Stopped` 01:46:10 (vuelca a disco) → `Starting` 01:46:10 → `Started` **01:46:15**. Cinco segundos de arranque, igual que el restart del 02-oct (4 s): el drop-in no lo demoró.
+- `ss -tlnp` después: `127.0.0.1:6379`, **`10.10.10.3:6379`** y `[::1]:6379`.
+- Cascada por `Requires=redis-server`: `motor-soc` (PID 1092045 → 1099727), `response-worker` (813150 → 1099730) y `response-audit-indexer` (911048 → 1099728) quedaron activos desde 01:46:15, con `NRestarts=0`. `opensearch-indexer` (sin `Requires`) siguió con el mismo PID 920096 y se reconectó solo.
+- Medición de `/health` cada 0,25 s: último 200 a las 01:46:06,59; caída a las 01:46:06,88; primer 200 a las **01:46:22,32**, estable desde ahí (40/40 sondeos 200 a las 01:46:41). **`motor-soc` tardó 15,4 s** en volver a estar sano: 4 s para que Redis vuelque y se detenga, 5 s para que cargue el AOF (278 MB) y ~7 s para que `motor-soc` cargue el modelo. `response-worker` y `response-audit-indexer` no tienen `/health`: su consumo se reanudó (lag 0 y 1 en el snapshot de 01:47).
+
+**Snapshot DESPUÉS** (`~/h33/snap_after.json`, ~01:47 -03). Criterio: XLEN puede bajar por el recorte de `MAXLEN ~`, así que la pérdida se mide con `entries-added` (solo crece y se guarda en disco) y con que el último ID de antes siga presente.
+
+| Stream | XLEN | entries-added | Último ID previo presente | Grupo: entries-read / pending / lag |
+|---|---|---|---|---|
+| `soc:decisions` | 10.013 → 10.026 | +609 | sí | +618 / 1 → 6 / 9 → 0 |
+| `soc:flows` | 10.006 → 10.045 | +609 | sí | — |
+| `soc:response:tasks` | 200.005 → 200.002 (recorte) | +465 | sí | +469 / 100 → 96 / 4 → 0 |
+| `soc:response:audit` | 100.004 → 100.000 (recorte) | +473 | sí | +472 / 1 → 4 / 0 → 1 |
+
+- **PEL:** las 95 tareas viejas **siguen, con los mismos IDs**. Salieron las 5 que estaban en proceso (`idle` de 20 ms), confirmadas por el worker: XACK es la única forma de que un ID salga de la PEL.
+- Entró una nueva, `1791089166499-0`, entregada a `worker-1` en el instante del restart. Como el worker solo lee mensajes nuevos (`>`), nunca la va a procesar. Se suma a las 95 viejas: es el mismo patrón ya anotado como pendiente en H28.
+- AOF/RDB `ok` después; 0 sesiones antes y después.
+
+**Hueco en `soc-decisions-*`:**
+- Último documento antes del corte: `chain_seq 524045`, 04:46:06,51Z. Primero después: `chain_seq 524046`, 04:46:22,16Z. **15,65 s sin decisiones**, de 04:46:07 a 04:46:21 (0 por segundo).
+- Después no aparece un pico de decisiones atrasadas (04:46:22 = 7, 04:46:23 = 9, 04:46:24 = 10, ritmo normal), así que el tráfico de esa ventana (~125 flujos a ~8/s) **no se recuperó**. Excluir esa ventana de cualquier métrica de cobertura.
+
+**Cadena `soc-decisions-*`:** recalculada desde el ancla del snapshot hasta la cabeza con `verify_chain()` (la misma función del panel). El primer documento (523900) tiene **el mismo hash que el ancla guardada**; se verificaron 809 documentos (523900..524708), **sin problemas** y con la secuencia continua en el corte (524045 → 524046).
+
+**Pruebas de conectividad** (2026-10-04 01:48 -03):
+
+| Prueba | Origen | Resultado |
+|---|---|---|
+| a) `redis-cli -h 10.10.10.3 ping`, contraseña por `REDISCLI_AUTH` tomada del entorno del vigilante (nunca `-a`) | `.139` `10.10.10.1` | `PONG` |
+| b) Mismo comando sin contraseña | `.139` `10.10.10.1` | `NOAUTH Authentication required.` |
+| c1) TCP a `10.10.10.3:6379` con socket atado a `10.30.30.1` | `.139` VLAN 30 | `TIMEOUT (4.0s)`, con ruta verificada: `ping -I 10.30.30.1` 2/2. Control desde `10.10.10.1`: `CONECTA` |
+| c2) `/dev/tcp/10.10.10.3/6379` | `.138` `10.30.30.2` | `FALLA rc=124 (5s)`, con ruta verificada: `ip route get` sale vía `10.30.30.1`; ping 2/2 |
+| d) Heartbeat del vigilante | `.139` → Redis | `soc:watcher:heartbeat = 2026-10-04T04:48:33Z`, antes congelado en `2026-08-18T19:12:47Z`. Conexión viva desde `10.10.10.1:58134` desde ~01:46:33. Cero errores en el journal de `motor-watcher` desde 01:46:10, cuando antes había `Connection refused` cada 30 s. Vista de nodos: `motor-watcher ok`, "Último heartbeat hace 0.3 min"; el estado general pasó de `down` a `degraded` (solo queda OpenSearch `yellow`, H41) |
+
+**Límite de la prueba c):** desde VLAN 30 también da timeout el puerto 8000. La política por defecto de `ufw` ya bloquea todo lo que viene de VLAN 30, así que c1 y c2 prueban que esos orígenes no llegan, pero **no aíslan** el efecto de la regla deny nueva. Esa regla es la que importa para los otros hosts de **VLAN 10**, porque la regla [9] (`10.10.10.0/24 → Anywhere`) abre todos los puertos. No hay otro host de VLAN 10 desde donde probarlo sin cambiar la red; la evidencia es el orden de las reglas (allow `.139` y deny 6379 en las posiciones 1 y 2, antes que la [9]).
+
+**Pendientes que deja el cierre:**
+- La regla [9] `10.10.10.0/24 → Anywhere`: anotada aparte, no se tocó.
+- El `motor-watcher-heartbeat.timer` (`heartbeat_check.py`) corre a las 02:00:17; su resultado se agrega en un seguimiento.
+
+**Estado: CERRADO (funcional).** Redis escucha en VLAN 10 solo para `.139`, el heartbeat volvió y no hubo pérdida en streams, PEL ni cadena. Faltan pegar 4 salidas del lado de Antonio (marcadas PENDIENTE).
+
 ---
 
 ## H23 (cierre) — validación de carga real de OTX, con honestidad sobre lo que quedó sin confirmar
@@ -1962,12 +2055,12 @@ La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total
 ## Pendientes detectados (no resueltos hoy)
 
 - **`total_eventos` de `response_counts()` topeado en 10.000 (H46):** mismo bug que `get_stats()`; agregar `track_total_hits` y un test.
-- **H33: leer la directiva `bind` real de Redis.** `sudo grep -nE '^\s*(bind|protected-mode)' /etc/redis/redis.conf` en `.140` pide contraseña interactiva: no está en el sudoers de auditoría. Lo corre Antonio antes de decidir el fix.
+- **ufw en `.140`, regla `10.10.10.0/24 → Anywhere` ([8] al verla; [9] después del cierre de H33) (todos los puertos) (H33):** la vio Antonio en `ufw status numbered` (2026-10-04) al preparar el cierre de H33. Cualquier host de la VLAN 10 llega a todos los puertos de `.140`, más de lo necesario (hoy el único cliente legítimo en la VLAN es `.139`, `10.10.10.1`). No bloquea el cierre de H33: las reglas específicas de 6379 (allow `.139` / deny resto) se insertan antes en el orden de evaluación. Acotarla es una decisión de alcance más amplio, no parte de H33; **no se tocó**.
 
 - **El enforcer de R2 usa la credencial `administrator` de Wazuh (H43):** reemplazar por un usuario con permiso mínimo (`active-response:command`) en una ventana coordinada.
+- **Ventana sin decisiones del cierre de H33 (2026-10-04 04:46:06,5Z–04:46:22,2Z, 15,65 s):** excluir de métricas de cobertura/latencia del Fast Path.
 - **Excluir de métricas los artefactos de H44 (H45):** hoy NO hay exclusión por `trace_id`. Propuesta: lista hardcodeada `EXCLUDED_TRACE_IDS` junto a las constantes de H25 en `compliance.py`, aplicada en `get_stats`, `tier_trend`, `response_counts` y `action_trend`, más `smoke-*` en los accesos.
 - **Deuda de ruff (H45):** 41 archivos en la línea base `[lint.per-file-ignores]` de `ruff.toml` (~140 hallazgos). Limpiar por archivo y borrar su entrada, en commits propios.
-- **H33, decidir el fix:** Redis de `.140` escucha solo en loopback (confirmado en la continuación de H33). Elegir entre bind a VLAN con firewall restringido a `.139`, un endpoint HTTP del motor o un túnel SSH. Antonio confirma la directiva `bind` en `redis.conf`.
 - **`journalctl -u <servicio>` en `.140` exige `sudo` interactivo (H44):** las auditorías no pueden leer los logs de `motor-soc` ni de los indexadores. Agregar `aiayala` al grupo `systemd-journal`, o sumar `journalctl -u motor-soc*|opensearch-indexer*|response-audit-indexer*` al sudoers de auditoría.
 - **`worker.log` de `response-worker` sin rotación (H38):** `~/tesis/motor/logs/worker.log` pesa **2.7 GB** (2026-10-02) y crece con cada tarea: el unit escribe con `StandardOutput=append:`/`StandardError=append:` y no hay entrada en `/etc/logrotate.d/`. No es urgente (disco de `.140` al 46%, 51 GB libres), pero leerlo completo ya es lento (un `grep` sobre el archivo superó 60 s). Propuesta: `logrotate` con `copytruncate` (rotación diaria, compresión, retención acotada), sin tocar el unit de systemd; `copytruncate` es necesario porque el proceso mantiene el archivo abierto en modo append.
 - **Avisar a Joaquín del corte de `soc-decisions` (H42):** notebooks de reentrenamiento y Grafana deben leer `soc-decisions,soc-decisions-*` para ver decisiones posteriores al corte. Lo comunica Antonio.
@@ -1979,7 +2072,7 @@ La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total
 
 
 - **`--workers 2` para `motor-soc.service`, evaluado pero no aplicado** (H30): el `run_in_executor` ya mitiga el bloqueo del event loop; un segundo worker de proceso completo daría paralelismo real adicional pero duplica el modelo en memoria por proceso — pendiente confirmar con Joaquín si el modelo tolera esa duplicación sin problema (RAM disponible en `.140` no parece ser el límite real, ver H30 original, pero no se asumió sin preguntar).
-- **Redis en `.140` probablemente solo acepta conexiones en `127.0.0.1`, sin política explícita de acceso cross-host** (H33): decidir con Antonio si `.139` necesita alcanzarlo de verdad (y con qué restricción de red) o si el diseño de `vigilante/cases.py` debería cambiar para no depender de eso. Mientras tanto, el heartbeat del FIM sigue sin poder escribirse.
+- ~~**Redis en `.140` solo aceptaba conexiones en `127.0.0.1`** (H33)~~ → **resuelto en el cierre de H33 (2026-10-04)**: bind a `10.10.10.3` + ufw acotado a `.139`; heartbeat del FIM restablecido.
 - **Comando `CONFIG` de Redis renombrado a `CONFIG_SOC_ADMIN_9x7k` quedó expuesto en esta sesión** (H32): no es una password, pero es un secreto que gatea comandos administrativos (junto con `FLUSHALL`/`FLUSHDB`/`DEBUG`/`SHUTDOWN`, deshabilitados). Evaluar si vale la pena rotarlo también, o si alcanza con que sea conocido solo por quienes ya tienen acceso SSH al host (mismo nivel de acceso que ya permitiría reiniciar Redis directamente).
 - **Confirmar la cuota real de OTX contra el panel de la cuenta** (H23): fuentes públicas contradictorias (10.000/hora vs 100/mes) nunca se resolvieron contra documentación oficial ni contra el dashboard real de la cuenta. Antonio puede confirmarlo con login directo — más rápido y confiable que seguir probando contra la API.
 - **Re-medir el volumen real de lookups de OTX una vez resuelto el bug de IP privada de H28**: la cifra de 0.267 IPs públicas distintas/hora medida hoy no representa carga de ataque real, representa casi ausencia de tráfico externo genuino llegando a R1. El pendiente de carga de H23 no puede considerarse completamente cerrado hasta tener una medición con tráfico externo real.
