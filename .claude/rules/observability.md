@@ -32,30 +32,64 @@ logger = structlog.get_logger()
 
 ## Middleware de tracing — trace_id en toda respuesta
 
+Implementación de referencia en producción: `motor/trace_middleware.py` (copia en
+`api/middleware/trace.py`), commit `cf3219b`, H45. **Middleware ASGI puro, no
+`@app.middleware("http")`:** con `call_next`, una excepción no controlada sale como
+500 armado por `ServerErrorMiddleware` por fuera del middleware, **sin** `X-Trace-Id`.
+El ASGI puro intercepta ese caso, responde el 500 con header y error uniforme, y
+re-lanza la excepción para que uvicorn la siga registrando.
+
 ```python
-import uuid
-import structlog
-from fastapi import Request
+import re, time, uuid
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-async def trace_middleware(request: Request, call_next):
-    trace_id = request.headers.get("X-Trace-Id") or str(uuid.uuid4())
-    structlog.contextvars.bind_contextvars(trace_id=trace_id)
+TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,64}$")  # input externo: validar
 
-    import time
-    t0 = time.monotonic()
-    response = await call_next(request)
-    duration_ms = round((time.monotonic() - t0) * 1000, 2)
+def resolve_trace_id(incoming: str | None) -> str:
+    if incoming and TRACE_ID_PATTERN.fullmatch(incoming):
+        return incoming
+    return str(uuid.uuid4())        # nunca reflejar un valor arbitrario
 
-    response.headers["X-Trace-Id"] = trace_id
-    response.headers["X-Duration-Ms"] = str(duration_ms)
+class TraceIdMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
 
-    logger.info("request_completed",
-        method=request.method, path=request.url.path,
-        status=response.status_code, duration_ms=duration_ms)
-    return response
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        raw = next((v.decode("latin-1") for k, v in scope.get("headers", [])
+                    if k == b"x-trace-id"), None)
+        trace_id = resolve_trace_id(raw)
+        scope.setdefault("state", {})["trace_id"] = trace_id   # request.state.trace_id
+        t0, status, started = time.monotonic(), 500, False
+
+        async def send_with_trace(message: Message) -> None:
+            nonlocal status, started
+            if message["type"] == "http.response.start":
+                started, status = True, message["status"]
+                ms = round((time.monotonic() - t0) * 1000, 2)
+                headers = [(k, v) for k, v in message.get("headers", [])
+                           if k.lower() not in (b"x-trace-id", b"x-duration-ms")]
+                headers += [(b"X-Trace-Id", trace_id.encode()),
+                            (b"X-Duration-Ms", str(ms).encode())]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_trace)
+        except Exception:
+            if not started:             # 500 con header + error uniforme de CLAUDE.md
+                ...                     # ver motor/trace_middleware.py
+            raise                       # uvicorn sigue logueando el traceback
+        finally:
+            logger.info("request_completed", trace_id=trace_id, method=scope.get("method"),
+                        path=scope.get("path"), status=status,
+                        duration_ms=round((time.monotonic() - t0) * 1000, 2))
 ```
 
-Registrar middleware en `app.middleware("http")` en todos los servicios FastAPI.
+Registrar con `app.add_middleware(TraceIdMiddleware)` en todos los servicios FastAPI.
+(En producción el log usa `logging` de la stdlib: structlog aún no está instalado, H41.)
 
 ## Propagación del trace_id en el pipeline
 
