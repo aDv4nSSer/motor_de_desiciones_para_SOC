@@ -1,28 +1,39 @@
-import { Fragment, useCallback, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CaretDown, CaretRight } from '@phosphor-icons/react'
 import { apiFetch } from '../api/client'
 import type { Decision, ResponseRecord, Stats } from '../api/types'
 import { EmptyState, ErrorNotice, Freshness, TableSkeleton, TierBadge } from '../components/common'
 import { accionLabel, formatScore, formatTime, shortId } from '../lib/format'
-import { indexResponses } from '../lib/responses'
+import {
+  LOOKUP_MAX_IDS, lookupResponses, mergeLookups, responseState,
+  type ResponseState, type RowLookup,
+} from '../lib/responses'
 import { usePolling } from '../lib/usePolling'
 
 const PAGE = 50
-const RESPONSES_WINDOW = 200 // tope del endpoint /blocks/recent
 
 interface AlertsData {
   decisions: Decision[]
-  responses: Map<string, ResponseRecord>
   stats: Stats | null
 }
 
-async function fetchAlerts(): Promise<AlertsData> {
-  const [decisions, responses, stats] = await Promise.all([
-    apiFetch<Decision[]>(`/api/v1/dashboard/decisions?tier_min=2&limit=${PAGE}`),
-    apiFetch<ResponseRecord[]>(`/api/v1/dashboard/blocks/recent?limit=${RESPONSES_WINDOW}`),
-    apiFetch<Stats>('/api/v1/dashboard/stats?window_minutes=60').catch(() => null),
-  ])
-  return { decisions, responses: indexResponses(responses), stats }
+const STATUS_TEXT: Record<Exclude<ResponseState['kind'], 'ok'>, { text: string; hint: string; danger: boolean }> = {
+  checking: { text: 'Consultando…', hint: 'Buscando el registro de respuesta de esta decisión.', danger: false },
+  processing: {
+    text: 'En proceso',
+    hint: 'La tarea sigue en la cola del worker de respuesta o en el lote que está procesando.',
+    danger: false,
+  },
+  missing: {
+    text: 'Sin registro de respuesta',
+    hint: 'El worker de respuesta ya pasó por esta decisión y no dejó registro R1/R2. No es normal en T2/T3: revisar el encolado.',
+    danger: true,
+  },
+  error: {
+    text: 'No se pudo verificar',
+    hint: 'La consulta falló o una fuente (OpenSearch o Redis) no respondió: no se puede afirmar si hay respuesta.',
+    danger: true,
+  },
 }
 
 function tierCount(stats: Stats | null, prefix: string): string {
@@ -32,8 +43,30 @@ function tierCount(stats: Stats | null, prefix: string): string {
 }
 
 export function AlertsView() {
-  const poll = usePolling(fetchAlerts)
   const [older, setOlder] = useState<Decision[]>([])
+  const [lookups, setLookups] = useState<Map<string, RowLookup>>(() => new Map())
+  const olderRef = useRef(older)
+  const lookupsRef = useRef(lookups)
+  useEffect(() => {
+    olderRef.current = older
+    lookupsRef.current = lookups
+  }, [older, lookups])
+
+  // Cada ciclo resuelve la respuesta de la página 1 y vuelve a consultar las
+  // filas anteriores que todavía no la tienen (en proceso o con error).
+  const fetchAlerts = useCallback(async (): Promise<AlertsData> => {
+    const [decisions, stats] = await Promise.all([
+      apiFetch<Decision[]>(`/api/v1/dashboard/decisions?tier_min=2&limit=${PAGE}`),
+      apiFetch<Stats>('/api/v1/dashboard/stats?window_minutes=60').catch(() => null),
+    ])
+    const unresolved = (ds: Decision[]) => ds.map((d) => d.trace_id).filter((id) => !lookupsRef.current.get(id)?.record)
+    const ids = [...unresolved(decisions), ...unresolved(olderRef.current).slice(0, LOOKUP_MAX_IDS)]
+    const fresh = await lookupResponses(ids)
+    setLookups((prev) => mergeLookups(prev, fresh))
+    return { decisions, stats }
+  }, [])
+
+  const poll = usePolling(fetchAlerts)
   const [loadingMore, setLoadingMore] = useState(false)
   const [moreError, setMoreError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
@@ -56,6 +89,8 @@ export function AlertsView() {
       const page = await apiFetch<Decision[]>(
         `/api/v1/dashboard/decisions?tier_min=2&limit=${PAGE}&before=${encodeURIComponent(last.timestamp)}`,
       )
+      const fresh = await lookupResponses(page.map((d) => d.trace_id))
+      setLookups((prev) => mergeLookups(prev, fresh))
       setOlder((prev) => [...prev, ...page])
     } catch (e) {
       setMoreError(e instanceof Error ? e.message : 'No se pudo cargar más')
@@ -64,7 +99,6 @@ export function AlertsView() {
     }
   }, [rows])
 
-  const responses = poll.data?.responses ?? new Map<string, ResponseRecord>()
   const stats = poll.data?.stats ?? null
 
   return (
@@ -109,7 +143,8 @@ export function AlertsView() {
             </thead>
             <tbody>
               {rows.map((d) => {
-                const r = responses.get(d.trace_id)
+                const st = responseState(d, lookups.get(d.trace_id))
+                const r = st.kind === 'ok' ? st.record : undefined
                 const open = expanded === d.trace_id
                 const e = r?.enrichment
                 return (
@@ -129,7 +164,7 @@ export function AlertsView() {
                       <td className="num mono">{formatScore(d.risk_score)}</td>
                       <td className="mono">{r?.src_ip ?? e?.src_ip ?? <span className="muted">sin dato</span>}</td>
                       <td className="num mono">{d.L4_DST_PORT ?? 'sin dato'}</td>
-                      <td>{r ? accionLabel(r.accion_recomendada) : <span className="muted">Sin respuesta en ventana</span>}</td>
+                      <td>{r ? accionLabel(r.accion_recomendada) : <ResponseStatus st={st} />}</td>
                       <td>{e ? <TiSummary e={e} /> : <span className="muted">No disponible</span>}</td>
                       <td className="mono" title={d.trace_id}>{shortId(d.trace_id)}</td>
                     </tr>
@@ -153,13 +188,20 @@ export function AlertsView() {
             {loadingMore ? 'Cargando…' : 'Cargar alertas anteriores'}
           </button>
           <p className="muted small">
-            La acción recomendada y la inteligencia de amenazas vienen del worker de respuesta (últimas {RESPONSES_WINDOW} respuestas).
-            Las alertas fuera de esa ventana o aún no procesadas aparecen sin esos datos.
+            Origen, acción recomendada e inteligencia de amenazas vienen del registro del worker de respuesta, buscado por el
+            trace_id de cada alerta. «En proceso»: el worker todavía no la procesa. «Sin registro de respuesta»: ya pasó y
+            no dejó registro. «No se pudo verificar»: la consulta falló.
           </p>
         </div>
       )}
     </section>
   )
+}
+
+function ResponseStatus({ st }: { st: ResponseState }) {
+  if (st.kind === 'ok') return null
+  const s = STATUS_TEXT[st.kind]
+  return <span className={s.danger ? 'text-danger' : 'muted'} title={s.hint}>{s.text}</span>
 }
 
 function TiSummary({ e }: { e: NonNullable<ResponseRecord['enrichment']> }) {

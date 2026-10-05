@@ -180,6 +180,122 @@ def get_recent_responses(limit: int = 50) -> list[dict]:
     return records
 
 
+# ── Respuestas R1/R2 por trace_id (vista de alertas, H49) ───────────────────
+# La vista cruzaba sus 50 decisiones con las últimas 200 entradas del stream
+# (~25 s de tráfico): fuera de esa ventana no encontraba nada aunque el registro
+# existiera. Ahora se busca exactamente por los trace_id de la página.
+RESPONSES_INDEX = "soc-responses-*"
+RESPONSE_AUDIT_INDEXER_GROUP = "response-audit-indexer"
+RESPONSE_LOOKUP_MAX_IDS = 100
+# Cola del stream que se revisa siempre, además de lo que el indexador aún no
+# persistió: cubre el refresh de OpenSearch (~1 s) después del XACK.
+RESPONSE_TAIL_MARGIN = 500
+# Tope de la cola: si el atraso del indexador lo supera, un trace_id ausente
+# ya no prueba que no haya registro (complete=False).
+RESPONSE_TAIL_MAX = 20_000
+
+
+def _is_response_record(rec: dict) -> bool:
+    """Entrada R1/R2 del worker (mismo criterio que el indexador): descarta
+    accesos, aprobaciones manuales y expiraciones."""
+    return (bool(rec.get("trace_id")) and not rec.get("access_event")
+            and not rec.get("manual_approval") and not rec.get("approval_expired")
+            and ("accion_recomendada" in rec or "enrichment" in rec))
+
+
+def _group_info(r: redis.Redis, stream: str, group: str) -> dict | None:
+    for g in r.xinfo_groups(stream):
+        if g.get("name") == group:
+            return g
+    return None
+
+
+def _stream_id_iso(msg_id: str | None) -> str | None:
+    if not msg_id or msg_id == "0-0":
+        return None
+    ms = int(msg_id.split("-")[0])
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def lookup_responses(trace_ids: list[str]) -> dict:
+    """Registros R1/R2 de trace_id concretos.
+
+    Busca en soc-responses-* (consulta `terms`, el historial persistido) y,
+    para lo que no esté, en la cola de soc:response:audit que el indexador aún
+    no persistió. Además informa hasta dónde llegó el response-worker, para que
+    la vista distinga "en proceso" de "sin registro".
+
+    Args:
+        trace_ids: ids a resolver (se acota a RESPONSE_LOOKUP_MAX_IDS).
+
+    Returns:
+        {"responses": {trace_id: registro}, "complete": bool,
+         "sources": {"opensearch": bool, "redis": bool},
+         "worker_frontier": ISO de la última tarea entregada al worker | None}.
+        complete=True garantiza que un trace_id ausente no tiene registro;
+        False si alguna fuente falló o el atraso del indexador excede la cola
+        revisada (entonces la vista no debe afirmar que falta).
+    """
+    wanted = list(dict.fromkeys(trace_ids))[:RESPONSE_LOOKUP_MAX_IDS]
+    found: dict[str, dict] = {}
+    sources = {"opensearch": True, "redis": True}
+    complete = True
+
+    result = _os_request("POST", f"/{RESPONSES_INDEX}/_search", {
+        "size": len(wanted) * 2,
+        "_source": ["payload"],
+        "query": {"bool": {"filter": [
+            {"terms": {"trace_id": wanted}},
+            {"term": {"event_type": "response"}},
+        ]}},
+    })
+    if result is None:
+        sources["opensearch"] = False
+        complete = False
+    else:
+        for h in result.get("hits", {}).get("hits", []):
+            rec = h.get("_source", {}).get("payload") or {}
+            if _is_response_record(rec) and rec["trace_id"] in wanted:
+                found.setdefault(rec["trace_id"], rec)
+
+    worker_frontier = None
+    r = _get_redis()
+    missing = {t for t in wanted if t not in found}
+    try:
+        if missing:
+            indexer = _group_info(r, RESPONSE_AUDIT_STREAM, RESPONSE_AUDIT_INDEXER_GROUP)
+            lag = indexer.get("lag") if indexer else None
+            if lag is None:  # sin grupo o lag desconocido: no se sabe qué falta persistir
+                tail, covered = RESPONSE_TAIL_MAX, False
+            else:
+                backlog = lag + (indexer.get("pending") or 0)
+                tail = min(backlog + RESPONSE_TAIL_MARGIN, RESPONSE_TAIL_MAX)
+                covered = backlog + RESPONSE_TAIL_MARGIN <= RESPONSE_TAIL_MAX
+            for _msg_id, fields in r.xrevrange(RESPONSE_AUDIT_STREAM, count=tail):
+                try:
+                    rec = json.loads(fields.get("data", "{}"))
+                except json.JSONDecodeError:
+                    continue
+                if _is_response_record(rec) and rec["trace_id"] in missing:
+                    found[rec["trace_id"]] = rec
+                    missing.discard(rec["trace_id"])
+                    if not missing:
+                        break
+            if missing and not covered:
+                complete = False
+        s = get_settings()
+        worker = _group_info(r, s.response_stream, s.response_group)
+        worker_frontier = _stream_id_iso(worker.get("last-delivered-id") if worker else None)
+    except redis.RedisError as e:
+        log.error(f"error resolviendo respuestas por trace_id: {e}")
+        sources["redis"] = False
+        if missing:
+            complete = False
+
+    return {"responses": found, "complete": complete, "sources": sources,
+            "worker_frontier": worker_frontier}
+
+
 # ── Categorización de puertos (verificado 2026-07-07, ver bitácora) ────────
 INFRA_PORTS = {2222, 8000, 55000, 443}
 HONEYPOT_PORTS = {22}

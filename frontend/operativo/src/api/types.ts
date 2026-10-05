@@ -57,9 +57,9 @@ export interface BlockResult {
   approval_level?: string
 }
 
-/** Entrada de soc:response:audit (GET /api/v1/dashboard/blocks/recent).
- *  El stream también lleva eventos de acceso y aprobaciones manuales: solo
- *  las que traen accion_recomendada o enrichment son respuestas R1/R2. */
+/** Registro R1/R2 del worker (soc:response:audit / soc-responses-*). El stream
+ *  también lleva eventos de acceso y aprobaciones manuales: solo las que traen
+ *  accion_recomendada o enrichment son respuestas R1/R2. */
 export interface ResponseRecord {
   trace_id?: string
   tier?: number
@@ -72,6 +72,16 @@ export interface ResponseRecord {
   case_id?: string | null
   access_event?: string
   manual_approval?: boolean
+}
+
+/** POST /api/v1/dashboard/responses/lookup (dashboard.lookup_responses, H49). */
+export interface ResponseLookup {
+  responses: Record<string, ResponseRecord>
+  /** true: un trace_id ausente de `responses` de verdad no tiene registro. */
+  complete: boolean
+  sources: { opensearch: boolean; redis: boolean }
+  /** Última tarea entregada al response-worker (ISO); null si no se pudo leer. */
+  worker_frontier: string | null
 }
 
 export interface Approval {

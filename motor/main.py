@@ -29,6 +29,7 @@ from auth import (
 from auth import login as auth_login
 from dashboard import (
     DECISIONS_MAX_LIMIT,
+    RESPONSE_LOOKUP_MAX_IDS,
     get_active_blocks,
     get_experimental_detections,
     get_port_stats,
@@ -38,6 +39,7 @@ from dashboard import (
     get_stats,
     get_watcher_heartbeat,
     list_cases,
+    lookup_responses,
     update_case_state,
 )
 from dashboard import (
@@ -47,7 +49,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # H36: "from model import get_model" NO va a nivel de módulo a propósito —
 # ver _init_score_worker() más abajo para el porqué (contención de joblib/
@@ -66,7 +68,7 @@ from response.queue import enqueue_response_task
 from schemas import FlowFeatures
 from sessions import revoke_session
 from system_status import get_node_status
-from trace_middleware import TraceIdMiddleware
+from trace_middleware import TRACE_ID_PATTERN, TraceIdMiddleware
 from users import ROLE_LEVEL, Role, User, get_user_record
 
 logging.basicConfig(
@@ -338,6 +340,25 @@ def dashboard_blocks_active(user: User = Depends(get_current_user)):
 @app.get("/api/v1/dashboard/blocks/recent")
 def dashboard_blocks_recent(limit: int = 50, user: User = Depends(get_current_user)):
     return get_recent_responses(min(limit, 200))
+
+
+class ResponseLookupRequest(BaseModel):
+    """trace_id de una página de la vista de alertas (input externo: se valida)."""
+    trace_ids: list[str] = Field(..., min_length=1, max_length=RESPONSE_LOOKUP_MAX_IDS)
+
+    @field_validator("trace_ids")
+    @classmethod
+    def _formato(cls, v: list[str]) -> list[str]:
+        malos = [t for t in v if not TRACE_ID_PATTERN.fullmatch(t)]
+        if malos:
+            raise ValueError(f"{len(malos)} trace_id con formato inválido")
+        return v
+
+
+@app.post("/api/v1/dashboard/responses/lookup")
+def dashboard_responses_lookup(payload: ResponseLookupRequest, user: User = Depends(get_current_user)):
+    """Respuestas R1/R2 de trace_id concretos (H49). Ver dashboard.lookup_responses."""
+    return lookup_responses(payload.trace_ids)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page(user: User = Depends(get_current_user)):
