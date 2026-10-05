@@ -8,9 +8,11 @@ Proceso SEPARADO del Fast Path. Consume la stream Redis `soc:response:tasks`
     tier >= r2_min_tier  ->  R2 block   (activo, con salvaguardas)
 
 Cada respuesta se publica como ResponseRecord en el stream Redis
-soc:response:audit y se loguea de forma estructurada. OJO (H39): ese stream
-hoy NO llega a OpenSearch ni a ningún hash-chain (sin consumidor, capado en
-100k entradas); solo soc:decisions se indexa en soc-decisions.
+soc:response:audit y se loguea de forma estructurada. Ese stream lo consume
+`response-audit-indexer` (lag 0 verificado en producción, corrige la nota
+H39 original que lo daba por sin consumidor) y lo persiste con hash-chain
+en soc-responses-* -- independiente de soc:decisions/soc-decisions, que
+sigue siendo el audit trail del Fast Path.
 
 Ejecutar como servicio systemd independiente del FastAPI:
     python -m response.worker
@@ -34,9 +36,11 @@ from response.schemas import (
     ACCION_NINGUNA,
     ActionType,
     BlockResult,
+    EnrichmentResult,
     ResponseRecord,
     ResponseTask,
 )
+from rules.engine import evaluate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +56,44 @@ def _audit(record: ResponseRecord, rdb: redis.Redis):
                  maxlen=100_000, approximate=True)
     except redis.RedisError as e:
         log.warning(f"no se pudo auditar {record.trace_id}: {e}")
+
+
+def _rule_context(
+    task: ResponseTask, record: ResponseRecord, stale: bool, safelisted: bool,
+) -> dict:
+    """Construye el contexto de hechos para rules.engine.evaluate().
+
+    Nombres de campo exactos esperados por rules.yaml (ver
+    motor/rules/rules.yaml y motor/rules/schemas.py). Reutiliza señales ya
+    calculadas en process_task -- nunca recalcula nada ni golpea Redis/IO
+    de nuevo: el motor de reglas EXPLICA la decisión que ya se tomó arriba,
+    no es una segunda fuente de verdad.
+
+    Args:
+        task: tarea de respuesta original.
+        record: registro en construcción (record.enrichment ya poblado si
+            task.tier >= settings.r1_min_tier; None si no).
+        stale: True si el evento llegó al worker más viejo que el umbral de
+            frescura configurado (ver stale_reason/event_age_seconds).
+        safelisted: True si task.src_ip pertenece a la safelist de infra
+            propia del laboratorio.
+
+    Returns:
+        Diccionario plano de hechos, listo para pasar a
+        rules.engine.evaluate().
+    """
+    e: EnrichmentResult | None = record.enrichment
+    return {
+        "tier": task.tier,
+        "classtype_override": task.classtype_override,
+        "corroboration_count": e.corroboration_count if e else 0,
+        "corroborating_sources": e.corroborating_sources if e else [],
+        "crowdsec_observado": e.crowdsec_observado if e else False,
+        "is_safelisted": safelisted,
+        "is_stale": stale,
+        "otx_available": e.otx_available if e else True,
+        "abuseipdb_available": e.abuseipdb_available if e else True,
+    }
 
 
 def stale_reason(max_age_seconds: int) -> str:
@@ -206,6 +248,23 @@ def process_task(
             f"enforced={b.enforced} reason='{b.reason}' via={b.enforcer} "
             f"corroboration={corroboration_count}"
         )
+
+    # ── Motor de reglas declarativo (rules.yaml) ────────────────────────
+    # EXPLICA la decisión de arriba con las mismas señales ya calculadas
+    # (tier, corroboración, safelist, stale) -- no la cambia. Solo T2+:
+    # T0/T1 ni pasan por R1 (tier < r1_min_tier), no hay nada que explicar.
+    # Degradación con gracia: si rules.yaml no cargó o evaluate() falla por
+    # cualquier motivo, se loguea el error y la decisión real de arriba
+    # sigue firme -- se pierde la explicación, nunca la acción ni el audit.
+    if task.tier >= 2:
+        safelisted = bool(task.src_ip and is_safelisted(task.src_ip, settings))
+        try:
+            result = evaluate(_rule_context(task, record, stale, safelisted))
+            record.rules_fired = result.rules_fired
+            record.reasoning = result.reasoning
+            record.rules_total_weight = result.total_weight
+        except Exception as e:  # noqa: BLE001 — explicar nunca debe tumbar la decisión
+            log.error(f"[{task.trace_id[:8]}] rules.yaml / evaluate() falló, sin explicación: {e}")
 
     _audit(record, rdb)
     return record

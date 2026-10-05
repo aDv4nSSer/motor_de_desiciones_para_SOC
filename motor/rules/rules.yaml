@@ -1,0 +1,127 @@
+# rules.yaml — Motor de reglas declarativo (rules_fired[]/reasoning[] en
+# soc-decisions). Ver motor/rules/engine.py para el evaluador y
+# motor/response/worker.py:_rule_context() para qué hechos recibe cada regla.
+#
+# IMPORTANTE: estas reglas EXPLICAN una decisión que el worker ya tomó con
+# su propia lógica (tier, corroboración, safelist, stale) -- no la cambian.
+# `weight` queda calculado como rules_total_weight pero no alimenta ninguna
+# acción de R2 todavía (ver nota en engine.py:evaluate). Cada regla acá
+# corresponde a una rama real y ya probada de worker.py:process_task -- no
+# se inventó ninguna condición sin una rama de código detrás.
+#
+# Formato de `when`: árbol de condiciones estructuradas, nunca un string
+# evaluado. Hoja: {field, op, value}. Combinador: {all: [...]} / {any: [...]}
+# / {not: [...]}. Operadores: eq, ne, gt, gte, lt, lte, in, not_in, contains,
+# exists. Ver motor/rules/schemas.py para el contrato completo.
+
+version: "1.0"
+
+rules:
+  - id: R001_classtype_override_t3
+    text: >-
+      Suricata clasificó el evento con un classtype de severidad crítica,
+      forzando T3 sin importar el score del modelo ML (override documentado
+      en CLAUDE.md, tabla de Tiers de Decisión).
+    weight: 3.0
+    when:
+      all:
+        - {field: tier, op: eq, value: 3}
+        - {field: classtype_override, op: eq, value: true}
+
+  - id: R002_t3_score_ml
+    text: >-
+      El score de riesgo calibrado del modelo (LightGBM Golden4 v7.1 +
+      Isolation Forest) superó el umbral operacional de T3.
+    weight: 2.0
+    when:
+      all:
+        - {field: tier, op: eq, value: 3}
+        - {field: classtype_override, op: eq, value: false}
+
+  - id: R003_t2_score_medio
+    text: >-
+      Score de riesgo en zona T2: señal media, se abre caso automático para
+      revisión en vez de actuar directo.
+    weight: 1.0
+    when:
+      {field: tier, op: eq, value: 2}
+
+  - id: R004_corroborado_otx
+    text: >-
+      Corroborado por OTX/AlienVault (reputación comunitaria de amenazas,
+      threat-intel-svc).
+    weight: 1.0
+    when:
+      {field: corroborating_sources, op: contains, value: otx}
+
+  - id: R005_corroborado_abuseipdb
+    text: >-
+      Corroborado por AbuseIPDB (reportes de abuso de la comunidad,
+      threat-intel-svc).
+    weight: 1.0
+    when:
+      {field: corroborating_sources, op: contains, value: abuseipdb}
+
+  - id: R006_observado_crowdsec
+    text: >-
+      Observado en la blocklist comunitaria de CrowdSec. Señal SOLO
+      observacional (H37 Fase 3): no cuenta para el gate de corroboración
+      de R2, se deja registrada para trazabilidad y para acumular evidencia
+      de cuánta señal nueva aporta en este entorno.
+    weight: 0.0
+    when:
+      {field: crowdsec_observado, op: eq, value: true}
+
+  - id: R007_corroboracion_insuficiente_t3
+    text: >-
+      T3 con menos de 2 fuentes de corroboración independientes: no se
+      ejecuta bloqueo automático (evita el falso positivo tipo
+      crawler Bing/msnbot, ver ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md
+      sección 4) -- queda pendiente de aprobación humana N1.
+    weight: 0.0
+    when:
+      all:
+        - {field: tier, op: eq, value: 3}
+        - {field: corroboration_count, op: lt, value: 2}
+        - {field: is_stale, op: eq, value: false}
+        - {field: is_safelisted, op: eq, value: false}
+
+  - id: R008_corroboracion_suficiente_t3
+    text: >-
+      T3 con 2 o más fuentes de corroboración independientes: elegible para
+      bloqueo automático de IP (Wazuh Active Response).
+    weight: 2.0
+    when:
+      all:
+        - {field: tier, op: eq, value: 3}
+        - {field: corroboration_count, op: gte, value: 2}
+
+  - id: R009_safelisted
+    text: >-
+      La IP de origen es infraestructura propia del laboratorio (safelist):
+      nunca se bloquea automáticamente, sin importar el score o la
+      corroboración.
+    weight: 0.0
+    when:
+      {field: is_safelisted, op: eq, value: true}
+
+  - id: R010_evento_stale
+    text: >-
+      El evento llegó al worker más viejo que el umbral de frescura
+      configurado (stale backlog): se audita con la acción que se habría
+      recomendado, pero no se ejecuta ninguna acción activa -- actuar horas
+      después no es respuesta en tiempo real.
+    weight: 0.0
+    when:
+      {field: is_stale, op: eq, value: true}
+
+  - id: R011_ti_no_disponible
+    text: >-
+      Una o más fuentes de threat intelligence no respondieron (circuito
+      abierto, timeout o no configurada): la decisión continúa con
+      degradación con gracia, el campo correspondiente queda "unavailable".
+    weight: 0.0
+    when:
+      any:
+        - {field: otx_available, op: eq, value: false}
+        - {field: abuseipdb_available, op: eq, value: false}

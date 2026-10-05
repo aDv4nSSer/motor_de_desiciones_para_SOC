@@ -8,6 +8,7 @@ scikit-learn>=1.4.0
 redis>=4.6.0
 requests>=2.31.0
 lightgbm>=4.0.0
+pyyaml>=6.0.0  # rules/engine.py -- carga rules.yaml (motor de reglas rules_fired[]/reasoning[])
 python-dotenv>=1.0.0  # opensearch_indexer.py, dashboard.py, shadow_detect.py, redis_client.py -- load_dotenv()
 
 # Auth dashboard (JWT + roles, ver motor/auth.py y motor/users.py)

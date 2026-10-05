@@ -137,6 +137,15 @@ class ResponseRecord(BaseModel):
     # referencia al caso abierto en soc:cases: (mismo esquema que
     # vigilante/cases.py, ver response/cases.py).
     case_id: str | None = None
+    # rules_fired[]/reasoning[]/rules_total_weight: motor de reglas
+    # declarativo (rules/engine.py sobre rules.yaml) -- EXPLICA la decisión
+    # de arriba (tier, block, accion_recomendada) con las mismas señales ya
+    # calculadas, no la cambia. Listas vacías si tier < 2 (no se evalúa,
+    # ver worker.py:_rule_context) o si rules.yaml no cargó (degradación
+    # con gracia: la decisión real sigue firme aunque falte la explicación).
+    rules_fired: list[str] = Field(default_factory=list)
+    reasoning: list[str] = Field(default_factory=list)
+    rules_total_weight: float = 0.0
     processed_at: float = 0.0
     # Segundos entre la detección (task.ts) y el inicio del procesamiento.
     # None si la tarea no trae marca de tiempo (ver worker.process_task).
