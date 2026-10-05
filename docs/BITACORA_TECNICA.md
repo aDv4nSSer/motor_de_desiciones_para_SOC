@@ -1456,7 +1456,7 @@ Dato honesto, no concluyente: el `lag` de `soc:response:tasks` bajó durante la 
 
 **Fecha:** 2026-09-08
 
-**Nota de alcance:** esto NO incluye ningún cambio de versión de modelo — el modelo (`golden4_v7_1`), el contrato de features (Golden 4) y la lógica de decisión (`rules.yaml`, tiers) son exactamente los mismos que antes. El cambio es puramente de mecanismo de ejecución del scoring: de threads a procesos.
+**Nota de alcance:** esto NO incluye ningún cambio de versión de modelo — el modelo (`golden4_v7_1`), el contrato de features (Golden 4) y la lógica de decisión (umbrales de `risk_score` por tier + override por classtype; *corrección 2026-10-05: `rules.yaml` nunca existió, ver H47*) son exactamente los mismos que antes. El cambio es puramente de mecanismo de ejecución del scoring: de threads a procesos.
 
 **Decisión (Antonio):** reemplazar el `ThreadPoolExecutor` (confirmado GIL-bound en H35 con evidencia empírica — duplicar threads de 20 a 40 no subió el `%CPU` proporcionalmente) por un `ProcessPoolExecutor` para el paso de scoring (Isolation Forest + LightGBM), por fases con checkpoint antes de cada paso riesgoso.
 
@@ -2052,7 +2052,36 @@ La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total
 
 ---
 
+## H47 — `rules.yaml` no existe: el motor de reglas, `rules_fired`/`reasoning`, ATT&CK y SHAP están documentados como si corrieran
+
+**Fecha:** 2026-10-05. Solo documentación: no se tocó código.
+
+**Qué afirmaba la documentación:** CLAUDE.md decía "Toda decisión T2+ genera `rules_fired[]` y `reasoning[]` desde `rules.yaml`" y que "los 38 classtypes de Suricata se mapean a técnicas MITRE ATT&CK"; H36 (nota de alcance) hablaba de "la lógica de decisión (`rules.yaml`, tiers)" como algo existente.
+
+**Qué hay en el código (búsqueda en todo el repo, excluyendo `node_modules`/`graphify-out`/`.git`):**
+- No existe ningún `rules*.yaml`. `rules_fired`, `reasoning`, `shap` y `mitre`/`att&ck` no aparecen en ningún `.py` de `motor/`.
+- `motor/rules/` y `motor/scoring/` contienen solo un `__init__.py` de **0 bytes** (creados el 2026-08-11). No hay esqueleto, ni esquema, ni ejemplo.
+- El tier sale de `motor/model.py:tier()` (umbrales `T0_max`/`T1_max`/`T2_max`, defaults 0,25/0,55/0,80, sobre `risk_score = 0.70·ml + 0.30·anomaly`) y de un override a T3 si el header `X-Suricata-Classtype` está en `T3_CLASSTYPES` (`motor/main.py:78-81`, aplicado en `146-148`): **7 classtypes**, no 38. El tier no se re-evalúa en el Enrichment Path: `worker.process_task` copia `task.tier` al registro.
+
+**Impacto en el dashboard:** en `AlertsView`, el detalle de **toda** alerta T2/T3 muestra la fila "Reglas y razonamiento" con el texto fijo "No disponible todavía: el motor de reglas (rules.yaml) no está implementado" (`frontend/operativo/src/views/AlertsView.tsx:200`). La UI ya decía la verdad; la documentación no.
+
+**Dimensión del trabajo (estimación, no medida): 6-10 días para un MVP.**
+- 3-5 días: esquema de `rules.yaml` (`{id, when, text, weight}`), cargador validado con Pydantic, evaluador de `when` **sin `eval`** (mini-DSL acotado sobre señales que ya existen: banda de `risk_score`, `corroboration_count`, disponibilidad de TI, puerto, classtype) y tests (90% de cobertura P0 según `testing.md`).
+- 3-5 días: tabla classtype → ATT&CK, SHAP TreeExplainer solo sobre `SHAP_THRESHOLD`, y persistencia de la explicación. Como `soc-decisions` es append-only, la explicación tiene que ser un documento nuevo ligado por `trace_id` (no un UPDATE), lo que toca el indexador y la vista.
+- Diseño desde cero contra la tabla de tiers de CLAUDE.md y la sección 4 de la especificación ampliada; no hay nada que reutilizar.
+
+**Decisión de alcance pendiente (Antonio), no deuda olvidada:** hasta que se decida, `rules.yaml` queda como trabajo futuro con el mismo tratamiento que el Isolation Forest de comportamiento de host (CLAUDE.md, PROHIBICIONES #15). Compite con el cierre del documento (16-oct).
+
+**Hallazgo lateral, pendiente de investigar (no resuelto):** en una muestra de `soc:response:tasks` del 2026-10-05 ~11:45 -03 (últimas 20.000 tareas, ~45 min), las **1.608 tareas T3 tenían `classtype` vacío y `classtype_override = false`**. Todos los T3 vienen del score de ML; el override por classtype no se está disparando. Hipótesis sin verificar: el Fast Path recibe flows (que no traen classtype) y no alertas, así que el header nunca llega con valor; o Vector en `.139` no lo envía. Si es lo primero, el override por classtype no opera en este camino por diseño, y hay que decir en la tesis por dónde sí operaría.
+
+**Estado: DOCUMENTACIÓN CORREGIDA. Implementación: decisión de alcance pendiente.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
+
+- **Decidir el alcance de `rules.yaml` (H47):** MVP estimado en 6-10 días (motor de reglas, ATT&CK, SHAP). Mientras no se decida, se declara como trabajo futuro.
+- **T3 con `classtype` vacío: el override por classtype no se dispara (H47):** confirmar si el Fast Path recibe solo flows (sin classtype) o si Vector no envía el header.
 
 - **`total_eventos` de `response_counts()` topeado en 10.000 (H46):** mismo bug que `get_stats()`; agregar `track_total_hits` y un test.
 - **ufw en `.140`, regla `10.10.10.0/24 → Anywhere` ([8] al verla; [9] después del cierre de H33) (todos los puertos) (H33):** la vio Antonio en `ufw status numbered` (2026-10-04) al preparar el cierre de H33. Cualquier host de la VLAN 10 llega a todos los puertos de `.140`, más de lo necesario (hoy el único cliente legítimo en la VLAN es `.139`, `10.10.10.1`). No bloquea el cierre de H33: las reglas específicas de 6379 (allow `.139` / deny resto) se insertan antes en el orden de evaluación. Acotarla es una decisión de alcance más amplio, no parte de H33; **no se tocó**.

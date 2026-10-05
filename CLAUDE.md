@@ -113,9 +113,14 @@ Threat Intel Svc ────────┼─→ Decision Engine re-scoring + 
 | T2 | Score medio + señal adicional (TI o contexto) | — |
 | T3 | Score alto + señal adicional O classtype crítico | Suricata classtype → T3 sin importar ML |
 
-Toda decisión T2+ genera `rules_fired[]` y `reasoning[]` desde `rules.yaml`.
-Los 38 classtypes de Suricata se mapean a técnicas MITRE ATT&CK — propagar el tag ATT&CK
-desde el classtype hasta la evidencia en `soc-decisions` y hasta Wazuh.
+**Estado real (verificado 2026-10-05, H47):** la tabla de arriba es el diseño, no lo que corre.
+Hoy el tier sale de umbrales sobre `risk_score = 0.70·ml_score + 0.30·anomaly_score`
+(`T0_max`/`T1_max`/`T2_max` en `motor/model.py:tier()`) más un override a T3 por **7 classtypes**
+(`T3_CLASSTYPES` en `motor/main.py:78`), no 38. No hay motor de reglas: no existe `rules.yaml`,
+ninguna decisión trae `rules_fired[]` ni `reasoning[]`, y no hay mapeo classtype → MITRE ATT&CK
+en `motor/`. `rules.yaml` + ATT&CK + SHAP son **trabajo futuro**, con el mismo tratamiento que el
+Isolation Forest de comportamiento de host: decisión de alcance pendiente de Antonio (ver
+PROHIBICIONES #15 y H47 en `docs/BITACORA_TECNICA.md`).
 **No usar threshold global 0.5.** Ver `.claude/rules/model-contract.md` para thresholds por dataset.
 
 ---
@@ -126,6 +131,7 @@ desde el classtype hasta la evidencia en `soc-decisions` y hasta Wazuh.
 - Fast Path: `POST /api/v1/decide` → decisión provisional en ms.
 - Worker: consume Redis Stream → re-scoring con contexto + TI.
 - `rules.yaml`: cada regla `{id, when, text, weight}` → `rules_fired[]` + `reasoning[]`.
+  **No implementado** (trabajo futuro, H47) — no asumir que existe.
 - SHAP TreeExplainer: instancia única en memoria; calcular solo para score > `SHAP_THRESHOLD`.
 - Acumular riesgo: `risk:{entity_type}:{entity_id}` sorted set Redis con decaimiento TTL.
 - Hash chain audit: `hash = sha256(contenido + prev_hash)` en cada doc de `soc-decisions`.
@@ -289,6 +295,7 @@ Cambio de arquitectura → actualizar `ROADMAP.md` en el mismo commit.
 12. **No tocar la red TI universitaria (25 PCs)** — fuera de alcance absoluto.
 13. **No entrenar Isolation Forest de comportamiento de host en este ciclo** — no hay dataset de comportamientos anómalos de host realista todavía; queda como trabajo futuro (ver `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 2). No modificar el Isolation Forest de red ya validado para intentarlo.
 14. **No implementar Shuffle SOAR** — duplicaría R1/R2 del motor propio (escucha Redis Stream, consulta TI, pide inferencia, ejecuta bloqueo: es lo que ya hace `decision-engine`). Documentado como trabajo futuro/productización post-tesis.
+15. **No implementar `rules.yaml` (ni `rules_fired`/`reasoning`, mapeo ATT&CK o SHAP) sin decisión explícita de alcance de Antonio** — no existe ningún esqueleto (`motor/rules/` y `motor/scoring/` son `__init__.py` vacíos); el MVP se estimó en 6-10 días y compite con el cierre del documento (16-oct). Hasta que se decida, es trabajo futuro y así se declara en la tesis. Ver H47 en `docs/BITACORA_TECNICA.md`.
 
 ## graphify
 
