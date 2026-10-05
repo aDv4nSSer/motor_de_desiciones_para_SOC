@@ -117,10 +117,14 @@ Threat Intel Svc ────────┼─→ Decision Engine re-scoring + 
 Hoy el tier sale de umbrales sobre `risk_score = 0.70·ml_score + 0.30·anomaly_score`
 (`T0_max`/`T1_max`/`T2_max` en `motor/model.py:tier()`) más un override a T3 por **7 classtypes**
 (`T3_CLASSTYPES` en `motor/main.py:78`), no 38. No hay motor de reglas: no existe `rules.yaml`,
-ninguna decisión trae `rules_fired[]` ni `reasoning[]`, y no hay mapeo classtype → MITRE ATT&CK
-en `motor/`. `rules.yaml` + ATT&CK + SHAP son **trabajo futuro**, con el mismo tratamiento que el
-Isolation Forest de comportamiento de host: decisión de alcance pendiente de Antonio (ver
-PROHIBICIONES #15 y H47 en `docs/BITACORA_TECNICA.md`).
+ninguna decisión trae `rules_fired[]` ni `reasoning[]`.
+
+**Decisión de alcance (Antonio, 5-oct-2026):** ATT&CK y SHAP salen de "trabajo futuro" y
+entran a alcance de este ciclo — ver PROHIBICIONES #15 (actualizada). `rules.yaml` +
+`rules_fired[]`/`reasoning[]` siguen sin decisión — confirmar alcance exacto antes de
+tocarlos. Punto de partida de ATT&CK: `motor/classtype_attack.yaml` (mapeo de referencia
+classtype → técnica, confirmado contra el `classification.config` real de `.139`), **sin
+wirear todavía** a `soc-decisions` ni a Wazuh.
 **No usar threshold global 0.5.** Ver `.claude/rules/model-contract.md` para thresholds por dataset.
 
 ---
@@ -295,7 +299,16 @@ Cambio de arquitectura → actualizar `ROADMAP.md` en el mismo commit.
 12. **No tocar la red TI universitaria (25 PCs)** — fuera de alcance absoluto.
 13. **No entrenar Isolation Forest de comportamiento de host en este ciclo** — no hay dataset de comportamientos anómalos de host realista todavía; queda como trabajo futuro (ver `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 2). No modificar el Isolation Forest de red ya validado para intentarlo.
 14. **No implementar Shuffle SOAR** — duplicaría R1/R2 del motor propio (escucha Redis Stream, consulta TI, pide inferencia, ejecuta bloqueo: es lo que ya hace `decision-engine`). Documentado como trabajo futuro/productización post-tesis.
-15. **No implementar `rules.yaml` (ni `rules_fired`/`reasoning`, mapeo ATT&CK o SHAP) sin decisión explícita de alcance de Antonio** — no existe ningún esqueleto (`motor/rules/` y `motor/scoring/` son `__init__.py` vacíos); el MVP se estimó en 6-10 días y compite con el cierre del documento (16-oct). Hasta que se decida, es trabajo futuro y así se declara en la tesis. Ver H47 en `docs/BITACORA_TECNICA.md`.
+15. **Mapeo ATT&CK y SHAP: EN ALCANCE (decisión de Antonio, 5-oct-2026)** — dejan de ser
+    trabajo futuro. Punto de partida: `motor/classtype_attack.yaml` (mapeo classtype →
+    técnica, confirmado contra `.139`), todavía sin wirear a `soc-decisions`/Wazuh; SHAP sin
+    empezar (`motor/scoring/` sigue `__init__.py` vacío). **`rules.yaml` + `rules_fired`/
+    `reasoning` siguen fuera de alcance** hasta una decisión explícita aparte — no asumir
+    que entraron solo porque ATT&CK/SHAP entraron, son piezas independientes (ATT&CK no
+    necesita motor de reglas, SHAP tampoco). El MVP completo de las cuatro juntas se había
+    estimado en 6-10 días contra el cierre del documento (16-oct) — con el alcance recortado
+    a ATT&CK+SHAP, confirmar esfuerzo real antes de comprometer fecha. Ver H47 en
+    `docs/BITACORA_TECNICA.md`.
 
 ## graphify
 
