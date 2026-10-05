@@ -489,9 +489,9 @@ def dashboard_approvals(
     # ocultar que ahí hay infra propia mezclada con IPs de verdad hostiles.
     for item in page["items"]:
         if item.get("is_group"):
-            item["safelisted"] = any(
-                is_safelisted(m.get("src_ip") or "", settings) for m in item.get("members", [])
-            )
+            for member in item.get("members", []):
+                member["safelisted"] = is_safelisted(member.get("src_ip") or "", settings)
+            item["safelisted"] = any(m["safelisted"] for m in item["members"])
         else:
             item["safelisted"] = is_safelisted(item.get("src_ip") or "", settings)
     return page

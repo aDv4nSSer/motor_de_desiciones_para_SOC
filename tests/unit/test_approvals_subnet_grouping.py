@@ -24,13 +24,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "motor"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from response.approvals import (  # noqa: E402
+from response.approvals import (
     create_pending_approval,
+    get_approval,
     group_by_subnet,
     pending_approvals_page,
+    resolve_approval,
     resolve_approval_group,
 )
-from test_approvals import FakeRedis, _record  # noqa: E402
+from test_approvals import FakeRedis, _record
 
 RED_RUIDOSA = "91.92.42"  # /24 de la medición real
 
@@ -97,6 +99,21 @@ class TestGroupBySubnet:
         assert len(grouped) == 2
         assert {g["network"] for g in grouped} == {"91.92.42.0/24", "100.29.192.0/24"}
 
+    def test_no_fabrica_n1_para_approval_level_vacio(self) -> None:
+        """Hallazgo (c) de la revisión 6-oct: group_by_subnet NO debe
+        default-ear a "N1" un approval_level vacío -- main.py trata un
+        nivel vacío/desconocido como CISO (fail-closed), así que mostrar
+        "N1" ahí sería subestimar el nivel real requerido."""
+        rdb = FakeRedis()
+        for i in range(3):
+            create_pending_approval(_record(f"t-{i}", approval_level="", src_ip=_ip(i)), rdb)
+        items = pending_approvals_page(rdb, group=False)["items"]
+
+        grouped = [r for r in group_by_subnet(items, 24, 3) if r.get("is_group")]
+
+        assert len(grouped) == 1
+        assert grouped[0]["approval_level"] == ""  # no "N1"
+
     def test_ip_no_parseable_pasa_sin_agrupar(self) -> None:
         rdb = FakeRedis()
         for i in range(3):
@@ -136,7 +153,8 @@ class TestResolveApprovalGroup:
 
         assert out["resolved"] == ["t-0", "t-1", "t-2"]
         assert out["already_resolved"] == []
-        assert out["missing"] == []
+        assert out["not_found"] == []
+        assert out["failed"] == []
         items = pending_approvals_page(rdb, group=False)["items"]
         assert items == []
 
@@ -150,7 +168,27 @@ class TestResolveApprovalGroup:
 
         assert out["resolved"] == ["t-1"]
         assert out["already_resolved"] == ["t-0"]
-        assert out["missing"] == ["t-no-existe"]
+        assert out["not_found"] == ["t-no-existe"]
+        assert out["failed"] == []
+
+    def test_no_pisa_una_resolucion_concurrente_de_otro_operador(self) -> None:
+        """Reproduce el hallazgo (a) de la revisión 6-oct: con el patrón viejo
+        (leer con get_approval, después resolve_approval), una resolución
+        concurrente entre la lectura y la escritura se contaba como propia.
+        _transition es atómico (CAS) -- no hay lectura separada que pueda
+        quedar vieja."""
+        rdb = FakeRedis()
+        create_pending_approval(_record("t-0", approval_level="N1", src_ip=_ip(0)), rdb)
+        # "Otro operador" resuelve t-0 ANTES de que el lote llegue a esa IP.
+        resolve_approval("t-0", "otro-operador", "rejected", rdb)
+
+        out = resolve_approval_group(["t-0"], "n1-op", "approved", rdb)
+
+        assert out["resolved"] == []
+        assert out["already_resolved"] == ["t-0"]
+        stored = get_approval("t-0", rdb)
+        assert stored["resolved_by"] == "otro-operador"
+        assert stored["status"] == "rejected"
 
 
 class TestPendingApprovalsPageConGrupo:

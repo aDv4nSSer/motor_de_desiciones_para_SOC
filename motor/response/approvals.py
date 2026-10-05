@@ -55,6 +55,7 @@ CAS_RETRIES = 3
 # eso implique confiar a ciegas en IPs nuevas que aparezcan después en el
 # mismo /24 (esas arman su propio grupo nuevo, con su propia aprobación).
 GROUP_PREFIX_LEN = 24       # IPv4 /24 -- ver nota arriba, ajustable por llamador
+GROUP_PREFIX_LEN_V6 = 64    # IPv6: un /24 no tiene sentido de tamaño: agrupar a /64 fijo
 GROUP_MIN_SIZE = 3          # bajo este tamaño no vale la pena agrupar
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
@@ -284,19 +285,29 @@ def pending_approvals_page(
 
 
 def _network_key(src_ip: str | None, prefix_len: int) -> str | None:
-    """Red /prefix_len de src_ip, o None si no es una IPv4/IPv6 válida (no
-    agrupar lo que no se puede parsear -- mejor un ítem suelto que un error)."""
+    """Red /prefix_len (IPv4) o /GROUP_PREFIX_LEN_V6 fijo (IPv6) de src_ip.
+
+    Args:
+        src_ip: IP de origen, o None/"" (no agrupable).
+        prefix_len: largo de prefijo pedido por el llamador. Se usa tal
+            cual en IPv4 (acotado a /32); en IPv6 un prefijo del mismo
+            largo no tiene sentido de tamaño de bloque, así que se ignora
+            a propósito y se usa GROUP_PREFIX_LEN_V6 -- no mezclar ambos
+            casos bajo el mismo número.
+
+    Returns:
+        La red en notación CIDR (str), o None si src_ip no es una IPv4/IPv6
+        válida (no agrupar lo que no se puede parsear -- mejor un ítem
+        suelto que un error).
+    """
     if not src_ip:
         return None
     try:
         addr = ipaddress.ip_address(src_ip)
     except ValueError:
         return None
-    if addr.version == 4:
-        prefix_len = min(prefix_len, 32)
-    else:
-        prefix_len = 64  # agrupación IPv6: a nivel de /64, no mezclar con el caso v4
-    network = ipaddress.ip_network(f"{src_ip}/{prefix_len}", strict=False)
+    effective_prefix = min(prefix_len, 32) if addr.version == 4 else GROUP_PREFIX_LEN_V6
+    network = ipaddress.ip_network(f"{src_ip}/{effective_prefix}", strict=False)
     return str(network)
 
 
@@ -309,14 +320,30 @@ def group_by_subnet(
 
     Solo agrupa cuando hay >= min_group_size IPs distintas en la misma red Y
     todas requieren el mismo approval_level -- mezclar niveles ocultaría que
-    algunas IPs necesitan un nivel más alto. Las que quedan bajo el umbral,
-    o cuya IP no se pudo parsear, pasan sin modificar (is_group=False).
+    algunas IPs necesitan un nivel más alto. El nivel NO se normaliza acá
+    (no se asume "N1" si viene vacío/ausente): main.py es quien aplica el
+    fail-closed a CISO sobre un nivel vacío/desconocido (ver
+    dashboard_resolve_approval), y agrupar con un default distinto
+    mostraría un nivel requerido más bajo del real. Las que quedan bajo el
+    umbral, o cuya IP no se pudo parsear, pasan sin modificar
+    (is_group=False).
 
-    No muta `items`; cada grupo es un dict nuevo con:
-        is_group=True, network, approval_level, member_trace_ids,
-        members (los items originales), occurrences (suma), tier (máximo),
-        risk_score (máximo), created_at (más antigua), last_seen_at (más
-        reciente). Los no agrupados se devuelven con is_group=False.
+    Args:
+        items: aprobaciones pendientes, como las devuelve _load_pending/
+            _with_meta (necesitan al menos trace_id y src_ip).
+        prefix_len: largo de prefijo IPv4 para agrupar (ver _network_key
+            para el caso IPv6).
+        min_group_size: mínimo de IPs distintas en la misma red+nivel para
+            formar un grupo.
+
+    Returns:
+        Lista nueva (no muta `items` ni sus elementos) ordenada por
+        last_seen_at descendente. Cada grupo es un dict con: is_group=True,
+        network, approval_level, member_trace_ids, member_count, members
+        (copias de los items originales), occurrences (suma), tier
+        (máximo), risk_score (máximo), created_at (más antigua),
+        last_seen_at (más reciente). Los no agrupados son copias de los
+        items originales con is_group=False agregado.
     """
     buckets: dict[tuple[str, str], list[dict]] = {}
     passthrough: list[dict] = []
@@ -325,7 +352,7 @@ def group_by_subnet(
         if network is None:
             passthrough.append(item)
             continue
-        key = (network, item.get("approval_level") or "N1")
+        key = (network, item.get("approval_level") or "")
         buckets.setdefault(key, []).append(item)
 
     grouped: list[dict] = []
@@ -337,20 +364,17 @@ def group_by_subnet(
             "is_group": True,
             "network": network,
             "approval_level": approval_level,
-            "tier": max(m.get("tier", 0) for m in members),
-            "risk_score": max(m.get("risk_score", 0.0) for m in members),
+            "tier": max((m.get("tier") or 0) for m in members),
+            "risk_score": max((m.get("risk_score") or 0.0) for m in members),
             "occurrences": sum(int(m.get("occurrences", 1)) for m in members),
             "member_trace_ids": [m["trace_id"] for m in members],
             "member_count": len(members),
-            "created_at": min(m.get("created_at", "") for m in members),
-            "last_seen_at": max(m.get("last_seen_at", "") for m in members),
+            "created_at": min((m.get("created_at") or "") for m in members),
+            "last_seen_at": max((m.get("last_seen_at") or "") for m in members),
             "members": members,
         })
 
-    for item in passthrough:
-        item.setdefault("is_group", False)
-
-    result = grouped + passthrough
+    result = grouped + [{**item, "is_group": False} for item in passthrough]
     result.sort(key=lambda a: a.get("last_seen_at") or "", reverse=True)
     return result
 
@@ -359,25 +383,52 @@ def resolve_approval_group(
     trace_ids: list[str], resolved_by: str, decision: ApprovalStatus, rdb: redis.Redis,
 ) -> dict:
     """Resuelve varias aprobaciones (un grupo de group_by_subnet) con la
-    misma decisión. Reutiliza resolve_approval por trace_id -- mismo CAS,
-    misma idempotencia -- así que un trace_id que otro operador ya resolvió
-    en paralelo simplemente no se pisa, no rompe el resto del lote.
+    misma decisión.
+
+    Llama a _transition() directo por cada trace_id -- NO por una lectura
+    previa (get_approval) seguida de resolve_approval(): ese patrón tiene
+    una carrera real (reproducida en revisión, 6-oct): si otro operador
+    resuelve el mismo trace_id entre la lectura y la escritura, resolve_
+    approval devuelve igual un dict (el ya resuelto) y el lote lo contaba
+    como "resolved" propio -- si el llamador dispara el enforcer sobre todo
+    lo "resolved", podía bloquear una IP que otro operador acababa de
+    rechazar. _transition ya hace compare-and-set atómico y devuelve "done"
+    solo si ESTA llamada hizo la transición -- no hay ventana de carrera
+    posible entre leer y escribir porque no hay una lectura separada.
+
+    Args:
+        trace_ids: IDs a resolver (ej. member_trace_ids de un grupo).
+        resolved_by: actor que resuelve (username del operador).
+        decision: "approved" o "rejected".
+        rdb: cliente Redis.
 
     Returns:
-        {"resolved": [trace_id...], "already_resolved": [trace_id...],
-         "missing": [trace_id...]} -- nunca lanza por un ítem individual.
+        {"resolved": [...], "already_resolved": [...], "not_found": [...],
+         "failed": [...]}. "not_found" = el trace_id no existe o el
+        registro está corrupto. "failed" = Redis falló o se agotaron los
+        reintentos de CAS (conflicto sostenido) -- en ningún caso se
+        asume resuelto. Nunca lanza por un ítem individual.
     """
-    out: dict[str, list[str]] = {"resolved": [], "already_resolved": [], "missing": []}
+    out: dict[str, list[str]] = {
+        "resolved": [], "already_resolved": [], "not_found": [], "failed": [],
+    }
+    now = _now()
     for trace_id in trace_ids:
-        before = get_approval(trace_id, rdb)
-        was_pending = before is not None and before.get("status") == "pending"
-        result = resolve_approval(trace_id, resolved_by, decision, rdb)
-        if result is None:
-            out["missing"].append(trace_id)
-        elif was_pending:
+        try:
+            kind, _ = _transition(trace_id, decision, resolved_by, rdb, now)
+        except redis.RedisError as e:
+            log.error(f"no se pudo resolver aprobacion {trace_id} (lote): {e}")
+            out["failed"].append(trace_id)
+            continue
+        if kind == "done":
+            log.info(f"aprobacion {trace_id} -> {decision} por {resolved_by} (lote)")
             out["resolved"].append(trace_id)
-        else:
+        elif kind == "not_pending":
             out["already_resolved"].append(trace_id)
+        elif kind == "missing":
+            out["not_found"].append(trace_id)
+        else:  # "conflict" -- CAS_RETRIES agotados, no se puede asumir ningún estado
+            out["failed"].append(trace_id)
     return out
 
 
