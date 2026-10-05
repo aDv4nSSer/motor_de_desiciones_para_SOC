@@ -1,312 +1,423 @@
 # classtype_attack.yaml — Mapeo Suricata classtype → MITRE ATT&CK (Enterprise)
 #
-# Fuente de los classtypes: etc/classification.config oficial de Suricata/OISF
-# (github.com/OISF/suricata, rama master), descargado y verificado el 2026-10-05.
-# Son 43 classtypes en upstream actual, NO 38 como dice CLAUDE.md — esa cifra
-# viene de una versión o config distinta. PENDIENTE: confirmar contra el
-# classification.config real desplegado en .139 (probablemente
-# /etc/suricata/classification.config) antes de dar esta lista por cerrada,
-# porque puede estar recortada o tener entradas propias de ET Open. No
-# toqué producción para este archivo — es solo referencia, construida leyendo
-# el repo y la documentación pública de ATT&CK.
+# v1.1 (6-oct-2026): confirmado contra el classification.config REAL de .139
+# (/etc/suricata/classification.config, vía suricata.yaml:2331) por la sesión
+# con acceso SSH al laboratorio -- son los mismos 43 classtypes de OISF
+# upstream, sin agregados de ET Open, 1 sola diferencia de mayúscula en la
+# descripción de web-application-activity ("Access…" acá, "access…" en
+# .139 -- no afecta el mapeo). De los 43, 39 tienen al menos una regla
+# cargada en suricata.rules; icmp-event, inappropriate-content,
+# successful-dos y tcp-connection están definidos pero sin regla activa hoy.
+# El "38" de CLAUDE.md no corresponde a esto -- ver la sección "Tiers de
+# Decisión y ATT&CK" del propio CLAUDE.md, se refiere a otra cosa (T3_CLASSTYPES
+# tiene 7, no 38, y tampoco es esta lista).
+#
+# Correcciones v1.1 sobre la v1.0 (revisión de código 6-oct):
+#   - T1571 Non-Standard Port pertenece a TA0011 Command and Control, no a
+#     TA0005 Defense Evasion -- corregido en unusual-client-port-connection
+#     y non-standard-protocol.
+#   - T1018 Remote System Discovery pertenece a TA0007 Discovery, no a
+#     TA0043 Reconnaissance -- corregido en icmp-event.
+#   - tactic/technique se separan en *_id/*_name (antes un solo string tipo
+#     "T1595 Active Scanning"): Wazuh expone rule.mitre.id como lista de IDs
+#     sueltos ("T1110.001"), y cruzar contra eso es más simple con el ID
+#     separado del nombre.
 #
 # Cómo leer cada entrada:
-#   classtype:    shortname tal como lo emite Suricata (header X-Suricata-Classtype)
-#   description:  descripción oficial de classification.config
-#   tactic:       táctica ATT&CK Enterprise (ID + nombre), o null si no aplica
-#   technique:    técnica/subtécnica más representativa, o null
-#   confidence:   "alta" | "media" | "baja" — qué tan bien un classtype por sí
-#                 solo predice la técnica. Un classtype es una categoría amplia
-#                 de severidad/comportamiento, no una firma 1:1 con una técnica
-#                 ATT&CK — varias de estas son multi-técnica por diseño y
-#                 quedan en "media" o "baja" a propósito. No tratar esto como
-#                 una tabla de verdad absoluta: es el mejor mapeo por defecto,
-#                 a usar cuando no hay señal más específica (p. ej. el SID de
-#                 la regla, que si trae metadata attack_target/mitre en el
-#                 .rules de ET Pro/Open, pesa más que este fallback).
-#   notes:        aclaración de por qué el mapeo es ambiguo o no aplica
+#   classtype:     shortname tal como lo emite Suricata (header X-Suricata-Classtype)
+#   description:   descripción oficial de classification.config
+#   tactic_id / tactic_name:       táctica ATT&CK Enterprise, o null si no aplica
+#   technique_id / technique_name: técnica/subtécnica más representativa, o null
+#   confidence:    "alta" | "media" | "baja" — qué tan bien un classtype por sí
+#                  solo predice la técnica. Un classtype es una categoría amplia
+#                  de severidad/comportamiento, no una firma 1:1 con una técnica
+#                  ATT&CK — varias de estas son multi-técnica por diseño y
+#                  quedan en "media" o "baja" a propósito. No tratar esto como
+#                  una tabla de verdad absoluta: es el mejor mapeo por defecto,
+#                  a usar cuando no hay señal más específica (p. ej. el SID de
+#                  la regla, que si trae metadata attack_target/mitre en el
+#                  .rules de ET Pro/Open, pesa más que este fallback).
+#   notes:         aclaración de por qué el mapeo es ambiguo o no aplica
 #
 # No usar como fuente única de verdad para T3_CLASSTYPES override en main.py —
 # eso es una decisión de severidad operacional ya tomada, distinta de esto.
+#
+# Wazuh ya trae <mitre> nativo en parte de su ruleset (FIM, sudo/su; rootcheck
+# casi nada) -- confirmado por la sesión con SSH el 6-oct, 1.053 de 4.505
+# reglas, formato rule.mitre.{id,tactic,technique} (listas paralelas) en la
+# alerta emitida. Para esas fuentes NO hace falta este mapeo: hay que leer
+# el campo que Wazuh ya entrega, no re-derivarlo de un classtype que Wazuh
+# ni siquiera usa. Este archivo es solo para la rama Suricata.
 
-version: "1.0-borrador"
-updated: "2026-10-05"
-source_classification_config: "OISF/suricata master, etc/classification.config"
+version: "1.1"
+updated: "2026-10-06"
+source_classification_config: "/etc/suricata/classification.config en .139, confirmado idéntico a OISF/suricata master"
 
 mappings:
   - classtype: not-suspicious
     description: "Not Suspicious Traffic"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: alta
     notes: "Tráfico benigno explícito, sin técnica asociada."
 
   - classtype: unknown
     description: "Unknown Traffic"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: alta
     notes: "Catch-all sin clasificar."
 
   - classtype: bad-unknown
     description: "Potentially Bad Traffic"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Demasiado genérico para asignar táctica sin ver la firma específica."
 
   - classtype: attempted-recon
     description: "Attempted Information Leak"
-    tactic: "TA0043 Reconnaissance"
-    technique: "T1595 Active Scanning"
+    tactic_id: "TA0043"
+    tactic_name: "Reconnaissance"
+    technique_id: "T1595"
+    technique_name: "Active Scanning"
     confidence: media
 
   - classtype: successful-recon-limited
     description: "Information Leak"
-    tactic: "TA0043 Reconnaissance"
-    technique: "T1592 Gather Victim Host Information"
+    tactic_id: "TA0043"
+    tactic_name: "Reconnaissance"
+    technique_id: "T1592"
+    technique_name: "Gather Victim Host Information"
     confidence: media
 
   - classtype: successful-recon-largescale
     description: "Large Scale Information Leak"
-    tactic: "TA0043 Reconnaissance"
-    technique: "T1595.002 Active Scanning: Vulnerability Scanning"
+    tactic_id: "TA0043"
+    tactic_name: "Reconnaissance"
+    technique_id: "T1595.002"
+    technique_name: "Active Scanning: Vulnerability Scanning"
     confidence: media
 
   - classtype: attempted-dos
     description: "Attempted Denial of Service"
-    tactic: "TA0040 Impact"
-    technique: "T1498 Network Denial of Service"
+    tactic_id: "TA0040"
+    tactic_name: "Impact"
+    technique_id: "T1498"
+    technique_name: "Network Denial of Service"
     confidence: alta
 
   - classtype: successful-dos
     description: "Denial of Service"
-    tactic: "TA0040 Impact"
-    technique: "T1498 Network Denial of Service"
+    tactic_id: "TA0040"
+    tactic_name: "Impact"
+    technique_id: "T1498"
+    technique_name: "Network Denial of Service"
     confidence: alta
+    notes: "Definido en classification.config pero sin regla cargada hoy en .139 (confirmado 6-oct)."
 
   - classtype: attempted-user
     description: "Attempted User Privilege Gain"
-    tactic: "TA0004 Privilege Escalation"
-    technique: "T1068 Exploitation for Privilege Escalation"
+    tactic_id: "TA0004"
+    tactic_name: "Privilege Escalation"
+    technique_id: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
     confidence: media
 
   - classtype: unsuccessful-user
     description: "Unsuccessful User Privilege Gain"
-    tactic: "TA0004 Privilege Escalation"
-    technique: "T1068 Exploitation for Privilege Escalation"
+    tactic_id: "TA0004"
+    tactic_name: "Privilege Escalation"
+    technique_id: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
     confidence: media
 
   - classtype: successful-user
     description: "Successful User Privilege Gain"
-    tactic: "TA0004 Privilege Escalation"
-    technique: "T1068 Exploitation for Privilege Escalation"
+    tactic_id: "TA0004"
+    tactic_name: "Privilege Escalation"
+    technique_id: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
     confidence: media
 
   - classtype: attempted-admin
     description: "Attempted Administrator Privilege Gain"
-    tactic: "TA0004 Privilege Escalation"
-    technique: "T1068 Exploitation for Privilege Escalation"
+    tactic_id: "TA0004"
+    tactic_name: "Privilege Escalation"
+    technique_id: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
     confidence: media
     notes: "Está en T3_CLASSTYPES (override) en main.py — severidad operacional ya decidida, coherente con el mapeo."
 
   - classtype: successful-admin
     description: "Successful Administrator Privilege Gain"
-    tactic: "TA0004 Privilege Escalation"
-    technique: "T1068 Exploitation for Privilege Escalation"
+    tactic_id: "TA0004"
+    tactic_name: "Privilege Escalation"
+    technique_id: "T1068"
+    technique_name: "Exploitation for Privilege Escalation"
     confidence: media
     notes: "Está en T3_CLASSTYPES (override) en main.py."
 
   - classtype: rpc-portmap-decode
     description: "Decode of an RPC Query"
-    tactic: "TA0007 Discovery"
-    technique: "T1046 Network Service Discovery"
+    tactic_id: "TA0007"
+    tactic_name: "Discovery"
+    technique_id: "T1046"
+    technique_name: "Network Service Discovery"
     confidence: media
 
   - classtype: shellcode-detect
     description: "Executable code was detected"
-    tactic: "TA0002 Execution"
-    technique: "T1203 Exploitation for Client Execution"
+    tactic_id: "TA0002"
+    tactic_name: "Execution"
+    technique_id: "T1203"
+    technique_name: "Exploitation for Client Execution"
     confidence: baja
     notes: "Está en T3_CLASSTYPES. El shellcode puede ser entrega (Initial Access, T1190) o ejecución (Execution) según dónde se detecte — ambigüedad real, no del mapeo."
 
   - classtype: string-detect
     description: "A suspicious string was detected"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Depende 100% de la firma específica, no del classtype."
 
   - classtype: suspicious-filename-detect
     description: "A suspicious filename was detected"
-    tactic: "TA0011 Command and Control"
-    technique: "T1105 Ingress Tool Transfer"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1105"
+    technique_name: "Ingress Tool Transfer"
     confidence: baja
 
   - classtype: suspicious-login
     description: "An attempted login using a suspicious username was detected"
-    tactic: "TA0006 Credential Access"
-    technique: "T1110 Brute Force"
+    tactic_id: "TA0006"
+    tactic_name: "Credential Access"
+    technique_id: "T1110"
+    technique_name: "Brute Force"
     confidence: media
 
   - classtype: system-call-detect
     description: "A system call was detected"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Señal de host, no de red — fuera del dominio de un IDS de red."
 
   - classtype: tcp-connection
     description: "A TCP connection was detected"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: alta
-    notes: "Informativo, no es señal de ataque."
+    notes: "Informativo, no es señal de ataque. Definido en classification.config pero sin regla cargada hoy en .139 (confirmado 6-oct)."
 
   - classtype: trojan-activity
     description: "A Network Trojan was detected"
-    tactic: "TA0011 Command and Control"
-    technique: "T1071 Application Layer Protocol"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1071"
+    technique_name: "Application Layer Protocol"
     confidence: media
-    notes: "Está en T3_CLASSTYPES."
+    notes: "Está en T3_CLASSTYPES. El classtype con más reglas cargadas en .139 (9.794, confirmado 6-oct)."
 
   - classtype: unusual-client-port-connection
     description: "A client was using an unusual port"
-    tactic: "TA0005 Defense Evasion"
-    technique: "T1571 Non-Standard Port"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1571"
+    technique_name: "Non-Standard Port"
     confidence: media
+    notes: "v1.1: corregido de TA0005 Defense Evasion a TA0011 — T1571 pertenece a Command and Control en ATT&CK."
 
   - classtype: network-scan
     description: "Detection of a Network Scan"
-    tactic: "TA0043 Reconnaissance"
-    technique: "T1595 Active Scanning"
+    tactic_id: "TA0043"
+    tactic_name: "Reconnaissance"
+    technique_id: "T1595"
+    technique_name: "Active Scanning"
     confidence: alta
 
   - classtype: denial-of-service
     description: "Detection of a Denial of Service Attack"
-    tactic: "TA0040 Impact"
-    technique: "T1498 Network Denial of Service"
+    tactic_id: "TA0040"
+    tactic_name: "Impact"
+    technique_id: "T1498"
+    technique_name: "Network Denial of Service"
     confidence: alta
 
   - classtype: non-standard-protocol
     description: "Detection of a non-standard protocol or event"
-    tactic: "TA0005 Defense Evasion"
-    technique: "T1571 Non-Standard Port"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1571"
+    technique_name: "Non-Standard Port"
     confidence: baja
+    notes: "v1.1: corregido de TA0005 Defense Evasion a TA0011 — T1571 pertenece a Command and Control en ATT&CK."
 
   - classtype: protocol-command-decode
     description: "Generic Protocol Command Decode"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Informativo/decodificación, no ataque por sí mismo."
 
   - classtype: web-application-activity
-    description: "Access to a potentially vulnerable web application"
-    tactic: "TA0043 Reconnaissance"
-    technique: "T1595.002 Active Scanning: Vulnerability Scanning"
+    description: "access to a potentially vulnerable web application"
+    tactic_id: "TA0043"
+    tactic_name: "Reconnaissance"
+    technique_id: "T1595.002"
+    technique_name: "Active Scanning: Vulnerability Scanning"
     confidence: baja
+    notes: "Descripción en minúscula inicial en .139, a diferencia de upstream (confirmado 6-oct, no afecta el mapeo)."
 
   - classtype: web-application-attack
     description: "Web Application Attack"
-    tactic: "TA0001 Initial Access"
-    technique: "T1190 Exploit Public-Facing Application"
+    tactic_id: "TA0001"
+    tactic_name: "Initial Access"
+    technique_id: "T1190"
+    technique_name: "Exploit Public-Facing Application"
     confidence: alta
-    notes: "Está en T3_CLASSTYPES."
+    notes: "Está en T3_CLASSTYPES. 4º en reglas cargadas en .139 (5.910, confirmado 6-oct)."
 
   - classtype: misc-activity
     description: "Misc activity"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Catch-all, depende de la firma."
 
   - classtype: misc-attack
     description: "Misc Attack"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Catch-all, depende de la firma."
 
   - classtype: icmp-event
     description: "Generic ICMP event"
-    tactic: "TA0043 Reconnaissance"
-    technique: "T1018 Remote System Discovery"
+    tactic_id: "TA0007"
+    tactic_name: "Discovery"
+    technique_id: "T1018"
+    technique_name: "Remote System Discovery"
     confidence: baja
-    notes: "Mayormente informativo (ping), se usa para barridos de red."
+    notes: "v1.1: corregido de TA0043 Reconnaissance a TA0007 — T1018 pertenece a Discovery en ATT&CK. Mayormente informativo (ping), se usa para barridos de red. Definido en classification.config pero sin regla cargada hoy en .139 (confirmado 6-oct)."
 
   - classtype: inappropriate-content
     description: "Inappropriate Content was Detected"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: alta
-    notes: "Política de contenido, no corresponde a ATT&CK."
+    notes: "Política de contenido, no corresponde a ATT&CK. Definido en classification.config pero sin regla cargada hoy en .139 (confirmado 6-oct)."
 
   - classtype: policy-violation
     description: "Potential Corporate Privacy Violation"
-    tactic: "TA0011 Command and Control"
-    technique: "T1572 Protocol Tunneling"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1572"
+    technique_name: "Protocol Tunneling"
     confidence: baja
     notes: "Está en T3_CLASSTYPES. Ambiguo a propósito: agrupa desde uso de Tor/P2P hasta exfiltración; depende de la firma puntual."
 
   - classtype: default-login-attempt
     description: "Attempt to login by a default username and password"
-    tactic: "TA0001 Initial Access"
-    technique: "T1078.001 Valid Accounts: Default Accounts"
+    tactic_id: "TA0001"
+    tactic_name: "Initial Access"
+    technique_id: "T1078.001"
+    technique_name: "Valid Accounts: Default Accounts"
     confidence: alta
 
   - classtype: targeted-activity
     description: "Targeted Malicious Activity was Detected"
-    tactic: null
-    technique: null
+    tactic_id: null
+    tactic_name: null
+    technique_id: null
+    technique_name: null
     confidence: baja
     notes: "Categoría de intención/severidad, no de técnica."
 
   - classtype: exploit-kit
     description: "Exploit Kit Activity Detected"
-    tactic: "TA0001 Initial Access"
-    technique: "T1189 Drive-by Compromise"
+    tactic_id: "TA0001"
+    tactic_name: "Initial Access"
+    technique_id: "T1189"
+    technique_name: "Drive-by Compromise"
     confidence: alta
 
   - classtype: external-ip-check
     description: "Device Retrieving External IP Address Detected"
-    tactic: "TA0007 Discovery"
-    technique: "T1016 System Network Configuration Discovery"
+    tactic_id: "TA0007"
+    tactic_name: "Discovery"
+    technique_id: "T1016"
+    technique_name: "System Network Configuration Discovery"
     confidence: media
     notes: "Comportamiento típico de malware al arrancar, confirmando conectividad/geolocalización."
 
   - classtype: domain-c2
     description: "Domain Observed Used for C2 Detected"
-    tactic: "TA0011 Command and Control"
-    technique: "T1071.001 Application Layer Protocol: Web Protocols"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1071.001"
+    technique_name: "Application Layer Protocol: Web Protocols"
     confidence: media
+    notes: "2º en reglas cargadas en .139 (6.715, confirmado 6-oct)."
 
   - classtype: pup-activity
     description: "Possibly Unwanted Program Detected"
-    tactic: "TA0002 Execution"
-    technique: "T1204 User Execution"
+    tactic_id: "TA0002"
+    tactic_name: "Execution"
+    technique_id: "T1204"
+    technique_name: "User Execution"
     confidence: baja
 
   - classtype: credential-theft
     description: "Successful Credential Theft Detected"
-    tactic: "TA0006 Credential Access"
-    technique: "T1552 Unsecured Credentials"
+    tactic_id: "TA0006"
+    tactic_name: "Credential Access"
+    technique_id: "T1552"
+    technique_name: "Unsecured Credentials"
     confidence: media
 
   - classtype: social-engineering
     description: "Possible Social Engineering Attempted"
-    tactic: "TA0001 Initial Access"
-    technique: "T1566 Phishing"
+    tactic_id: "TA0001"
+    tactic_name: "Initial Access"
+    technique_id: "T1566"
+    technique_name: "Phishing"
     confidence: media
 
   - classtype: coin-mining
     description: "Crypto Currency Mining Activity Detected"
-    tactic: "TA0040 Impact"
-    technique: "T1496 Resource Hijacking"
+    tactic_id: "TA0040"
+    tactic_name: "Impact"
+    technique_id: "T1496"
+    technique_name: "Resource Hijacking"
     confidence: alta
 
   - classtype: command-and-control
     description: "Malware Command and Control Activity Detected"
-    tactic: "TA0011 Command and Control"
-    technique: "T1071 Application Layer Protocol"
+    tactic_id: "TA0011"
+    tactic_name: "Command and Control"
+    technique_id: "T1071"
+    technique_name: "Application Layer Protocol"
     confidence: alta
