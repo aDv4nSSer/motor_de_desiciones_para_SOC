@@ -12,14 +12,14 @@ Sin esto Vector no puede leer el eve.json (directorio solo accesible por grupo s
 
 ### Modo desarrollo (stdin, para testing)
 ```bash
-cd ~/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta
+cd ~/documents/tesis/motor_de_decisiones_para_SOC/pipeline-ingesta
 source ../.venv/bin/activate
 cat samples/sample_eve.json | vector --config configs/vector.toml 2>/dev/null | jq -c .
 ```
 
 ### Modo producción (lee eve.json de Suricata en tiempo real)
 ```bash
-cd ~/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta
+cd ~/documents/tesis/motor_de_decisiones_para_SOC/pipeline-ingesta
 vector --config configs/vector.production.toml
 ```
 
@@ -41,7 +41,7 @@ vector test configs/vector.toml
 
 ### El archivo JSONL no se crea
 ```bash
-mkdir -p ~/documents/tesis/motor_de_desiciones_para_SOC/pipeline-ingesta/outputs
+mkdir -p ~/documents/tesis/motor_de_decisiones_para_SOC/pipeline-ingesta/outputs
 ```
 
 ### Resetear checkpoints
@@ -61,7 +61,7 @@ rm -rf .vector-data/*
 
 ## Deploy en ProLiant Gen 10
 
-1. Clonar repo: `git clone https://github.com/aDv4nSSer/motor_de_desiciones_para_SOC.git`
+1. Clonar repo: `git clone https://github.com/aDv4nSSer/motor_de_decisiones_para_SOC.git`
 2. Instalar Vector: `curl --proto '=https' --tlsv1.2 -sSfL https://sh.vector.dev | bash`
 3. Agregar al PATH: `echo 'export PATH="$HOME/.vector/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc`
 4. Actualizar rutas en vector.production.toml (cambiar /home/aiayala/ por ruta del servidor)
