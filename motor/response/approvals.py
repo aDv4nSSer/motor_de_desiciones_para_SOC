@@ -17,6 +17,7 @@ Motor SOC — Tesis UBO.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 from datetime import datetime, timezone
@@ -39,6 +40,22 @@ APPROVALS_META_PREFIX = "soc:approvals:meta:"    # hash: occurrences, last_seen_
 APPROVALS_MAX_LIMIT = 1000  # tope por request del panel
 EXPIRY_ACTOR = "system:expiry"
 CAS_RETRIES = 3
+
+# H-pendiente (medición 5-oct-2026, ver BITACORA_TECNICA): 78% de la cola de
+# aprobaciones N1 es un solo bloque /24 (91.92.42.0/24, señal de reputación a
+# nivel de red tipo Spamhaus DROP), pedido IP por IP. No hay hoy ninguna
+# fuente de enriquecimiento que marque "esto es un bloque de red" (OTX y
+# AbuseIPDB corroboran por IP puntual, CrowdSec es solo observacional) -- así
+# que agrupar por CIDR acá es presentación/triage, no una nueva fuente de
+# corroboración y NO toca el gate de R2 (enrichment.py) ni la política de
+# "2+ fuentes". Deliberadamente NO cambia la clave de dedup en
+# create_pending_approval (eso sigue siendo por IP exacta, H38, para no
+# romper la idempotencia por trace_id) -- agrupa solo en la lectura/resolución,
+# para que un operador N1 pueda revisar un bloque entero de una vez sin que
+# eso implique confiar a ciegas en IPs nuevas que aparezcan después en el
+# mismo /24 (esas arman su propio grupo nuevo, con su propia aprobación).
+GROUP_PREFIX_LEN = 24       # IPv4 /24 -- ver nota arriba, ajustable por llamador
+GROUP_MIN_SIZE = 3          # bajo este tamaño no vale la pena agrupar
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
 
@@ -217,7 +234,13 @@ def list_pending_approvals(rdb: redis.Redis, limit: int = 100) -> list[dict]:
 
 
 def pending_approvals_page(
-    rdb: redis.Redis, limit: int = 100, ttl_seconds: int | None = None, now: datetime | None = None,
+    rdb: redis.Redis,
+    limit: int = 100,
+    ttl_seconds: int | None = None,
+    now: datetime | None = None,
+    group: bool = False,
+    group_prefix_len: int = GROUP_PREFIX_LEN,
+    group_min_size: int = GROUP_MIN_SIZE,
 ) -> dict:
     """Página de pendientes con el total real y las ocurrencias por IP.
 
@@ -227,6 +250,10 @@ def pending_approvals_page(
         ttl_seconds: si se pasa, oculta las vencidas aunque el barrido del
             worker todavía no las haya expirado (solo lectura, no escribe).
         now: reloj inyectable para tests.
+        group: si True, colapsa IPs de la misma red /group_prefix_len (con
+            el mismo approval_level) en un solo ítem de grupo -- ver
+            group_by_subnet(). `total` sigue siendo la cantidad de IPs
+            reales, no de ítems en pantalla (ese es len(items) post-agrupar).
 
     Returns:
         {"items": [...], "total": int, "limit": int, "available": bool};
@@ -248,8 +275,110 @@ def pending_approvals_page(
         log.error(f"error leyendo ocurrencias de aprobaciones: {e}")
         metas = [None] * len(pending)
     items = [_with_meta(a, m) for a, m in zip(pending, metas)]
-    items.sort(key=lambda a: a.get("last_seen_at") or "", reverse=True)
-    return {"items": items[:limit], "total": len(items), "limit": limit, "available": True}
+    total = len(items)
+    if group:
+        items = group_by_subnet(items, group_prefix_len, group_min_size)
+    else:
+        items.sort(key=lambda a: a.get("last_seen_at") or "", reverse=True)
+    return {"items": items[:limit], "total": total, "limit": limit, "available": True}
+
+
+def _network_key(src_ip: str | None, prefix_len: int) -> str | None:
+    """Red /prefix_len de src_ip, o None si no es una IPv4/IPv6 válida (no
+    agrupar lo que no se puede parsear -- mejor un ítem suelto que un error)."""
+    if not src_ip:
+        return None
+    try:
+        addr = ipaddress.ip_address(src_ip)
+    except ValueError:
+        return None
+    if addr.version == 4:
+        prefix_len = min(prefix_len, 32)
+    else:
+        prefix_len = 64  # agrupación IPv6: a nivel de /64, no mezclar con el caso v4
+    network = ipaddress.ip_network(f"{src_ip}/{prefix_len}", strict=False)
+    return str(network)
+
+
+def group_by_subnet(
+    items: list[dict], prefix_len: int = GROUP_PREFIX_LEN, min_group_size: int = GROUP_MIN_SIZE,
+) -> list[dict]:
+    """Agrupa aprobaciones pendientes por red /prefix_len para que un
+    operador revise un bloque entero (ej. 91.92.42.0/24) como una sola
+    decisión en vez de una por IP.
+
+    Solo agrupa cuando hay >= min_group_size IPs distintas en la misma red Y
+    todas requieren el mismo approval_level -- mezclar niveles ocultaría que
+    algunas IPs necesitan un nivel más alto. Las que quedan bajo el umbral,
+    o cuya IP no se pudo parsear, pasan sin modificar (is_group=False).
+
+    No muta `items`; cada grupo es un dict nuevo con:
+        is_group=True, network, approval_level, member_trace_ids,
+        members (los items originales), occurrences (suma), tier (máximo),
+        risk_score (máximo), created_at (más antigua), last_seen_at (más
+        reciente). Los no agrupados se devuelven con is_group=False.
+    """
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    passthrough: list[dict] = []
+    for item in items:
+        network = _network_key(item.get("src_ip"), prefix_len)
+        if network is None:
+            passthrough.append(item)
+            continue
+        key = (network, item.get("approval_level") or "N1")
+        buckets.setdefault(key, []).append(item)
+
+    grouped: list[dict] = []
+    for (network, approval_level), members in buckets.items():
+        if len(members) < min_group_size:
+            passthrough.extend(members)
+            continue
+        grouped.append({
+            "is_group": True,
+            "network": network,
+            "approval_level": approval_level,
+            "tier": max(m.get("tier", 0) for m in members),
+            "risk_score": max(m.get("risk_score", 0.0) for m in members),
+            "occurrences": sum(int(m.get("occurrences", 1)) for m in members),
+            "member_trace_ids": [m["trace_id"] for m in members],
+            "member_count": len(members),
+            "created_at": min(m.get("created_at", "") for m in members),
+            "last_seen_at": max(m.get("last_seen_at", "") for m in members),
+            "members": members,
+        })
+
+    for item in passthrough:
+        item.setdefault("is_group", False)
+
+    result = grouped + passthrough
+    result.sort(key=lambda a: a.get("last_seen_at") or "", reverse=True)
+    return result
+
+
+def resolve_approval_group(
+    trace_ids: list[str], resolved_by: str, decision: ApprovalStatus, rdb: redis.Redis,
+) -> dict:
+    """Resuelve varias aprobaciones (un grupo de group_by_subnet) con la
+    misma decisión. Reutiliza resolve_approval por trace_id -- mismo CAS,
+    misma idempotencia -- así que un trace_id que otro operador ya resolvió
+    en paralelo simplemente no se pisa, no rompe el resto del lote.
+
+    Returns:
+        {"resolved": [trace_id...], "already_resolved": [trace_id...],
+         "missing": [trace_id...]} -- nunca lanza por un ítem individual.
+    """
+    out: dict[str, list[str]] = {"resolved": [], "already_resolved": [], "missing": []}
+    for trace_id in trace_ids:
+        before = get_approval(trace_id, rdb)
+        was_pending = before is not None and before.get("status") == "pending"
+        result = resolve_approval(trace_id, resolved_by, decision, rdb)
+        if result is None:
+            out["missing"].append(trace_id)
+        elif was_pending:
+            out["resolved"].append(trace_id)
+        else:
+            out["already_resolved"].append(trace_id)
+    return out
 
 
 def resolve_approval(

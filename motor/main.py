@@ -466,6 +466,13 @@ def auth_logout(current: tuple[User, str] = Depends(get_current_session)):
 @app.get("/api/v1/dashboard/approvals")
 def dashboard_approvals(
     limit: int = Query(100, ge=1, le=APPROVALS_MAX_LIMIT),
+    group: bool = Query(
+        False,
+        description="Agrupa IPs de la misma red /24 (mismo approval_level) en un "
+                     "solo ítem de revisión -- ver response/approvals.py:group_by_subnet. "
+                     "Solo cambia la vista; cada aprobación individual sigue viva y se "
+                     "resuelve por su propio trace_id (ver member_trace_ids del grupo).",
+    ),
     user: User = Depends(get_current_user),
 ):
     # Devuelve {items, total, limit, available}: el total real de la cola,
@@ -474,11 +481,19 @@ def dashboard_approvals(
     settings = get_response_settings()
     # ttl: oculta las vencidas aunque el barrido del worker no haya corrido
     # todavía (p. ej. con el worker caído). Solo lectura.
-    page = pending_approvals_page(rdb, limit, ttl_seconds=settings.approval_ttl_seconds)
+    page = pending_approvals_page(rdb, limit, ttl_seconds=settings.approval_ttl_seconds, group=group)
     # Marca las IPs de safelist (infra propia): el panel no ofrece aprobarlas
-    # y el endpoint de resolución lo rechaza igual (ver más abajo).
+    # y el endpoint de resolución lo rechaza igual (ver más abajo). Para un
+    # ítem de grupo, marca el grupo si CUALQUIER miembro es safelist -- el
+    # panel debe forzar a desarmar el grupo y resolver esa IP aparte, no
+    # ocultar que ahí hay infra propia mezclada con IPs de verdad hostiles.
     for item in page["items"]:
-        item["safelisted"] = is_safelisted(item.get("src_ip") or "", settings)
+        if item.get("is_group"):
+            item["safelisted"] = any(
+                is_safelisted(m.get("src_ip") or "", settings) for m in item.get("members", [])
+            )
+        else:
+            item["safelisted"] = is_safelisted(item.get("src_ip") or "", settings)
     return page
 
 
