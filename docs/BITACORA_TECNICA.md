@@ -2078,7 +2078,62 @@ La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total
 
 ---
 
+## H48 — `R1_MIN_TIER` de 1 a 2: producción alineada con el piso documentado de "alertar + enriquecer"
+
+**Fecha:** 2026-10-05. Decisión de alcance operacional (Antonio), no corrección de bug.
+
+**Desajuste:** producción corría con `R1_MIN_TIER=1` (`~/tesis/motor-runtime/.env`, línea 3; `motor/.env` es symlink a ese archivo y ningún proceso trae la variable en su entorno). La especificación (`docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 4, líneas 47-48) dice:
+- `| T0-T1 | Red/Host | Tráfico normal, hallazgo menor sin corroboración | Ninguna / log | Automática |`
+- `| T2 | Red | IP con reputación media en 1 sola fuente, sin confirmar | Alertar + enriquecer; crea caso automático para revisión, NO bloquea | Automática (solo notifica/crea caso) |`
+
+T2 es el piso documentado de "enriquecer"; T1 se enriquecía sin que la tabla lo pida.
+
+**Qué controla el umbral (código):** `response/queue.py:50` no encola la tarea si `tier < r1_min_tier` (lo lee `motor-soc`) y `response/worker.py:107` no llama a `enrich()` por debajo del umbral (lo lee `response-worker`). Con 2, un T1 deja de generar tarea, registro en `soc:response:audit` y documento en `soc-responses-*`, no solo enriquecimiento. Ambos servicios leen el mismo `.env`: los dos necesitan restart.
+
+**Impacto estimado con datos de producción** (`soc:response:audit`, últimas 2,1 h al 2026-10-05 ~11:20 -03, 59.854 registros):
+
+| Tier | Tareas | % | Con IP pública | IPs públicas únicas |
+|---|---|---|---|---|
+| T1 | 39.913 | 66,7% | 96 | 33 |
+| T2 | 15.247 | 25,5% | 14.182 | 2.203 |
+| T3 | 4.694 | 7,8% | 4.686 | 409 |
+
+- **Ahorro de AbuseIPDB: ~0.** El 99,8% de las T1 son IPs privadas (sin TI externa) y solo 15 de 2.360 IPs públicas aparecían únicamente en T1. Además AbuseIPDB estaba con la cuota agotada en el 100% de la muestra (`abuseipdb_available` falso en todos los tiers).
+- **Capacidad: sin efecto.** `lag` del grupo en 0; H38 ya había concluido que T1 no limita la capacidad.
+- **Ganancia real:** el stream de auditoría (capado en 100k) pasa de cubrir ~3,5 h a ~10 h, porque dos tercios de sus entradas eran T1.
+- Se presenta como **alineación con el diseño**, no como medida de ahorro.
+
+**Aplicación:**
+- Backup: `~/tesis/motor-runtime/.env.bak-r1-20261005-115631` (`-rw-------`, `cp -p`). Diff backup → nuevo: solo `R1_MIN_TIER=1` → `R1_MIN_TIER=2`.
+- Ambos procesos corrían el `HEAD` de `.140` (`272fbbe`, pull del 04-oct 01:19): el restart no cargó código nuevo.
+- **`motor-soc`**: restart emitido 11:56:31.705 -03 (`sudo -n`), `/health` 200 a los **12,2 s**, `NRestarts=0`. Hueco en `soc:decisions`: **13,6 s** (última 11:56:30.708 → siguiente 11:56:44.295) a ~10 decisiones/s, ≈ **136 flujos sin decisión**. Excluir esa ventana de métricas del Fast Path.
+- **`response-worker`**: restart con `sudo` interactivo de Antonio (comando 12:08:24, activo 12:08:28). Hueco en `soc:response:audit`: **~1,6 s** (último del proceso viejo 12:08:26.807 → primero del nuevo 12:08:28.442); `event_age_seconds` tras el restart: mediana 0,4 s, máx. 4,5 s.
+- Nota de método: el `date` de `.140` no soporta `%3N` (devuelve nanosegundos); la primera medición salió corrupta y se recalculó desde los IDs de los streams.
+
+**Verificado:** en los 90 s siguientes al restart de `motor-soc` se encolaron **0 T1** (224 T2, 89 T3), contra 636 T1 en los 2 minutos previos. `lag` 0 en ambos momentos.
+
+**Efecto colateral, no resuelto: 3 tareas T2 perdidas en el restart del worker.** `1791212908363-1`, `1791212908364-0` y `1791212908366-0` (encoladas 12:08:28.36; `trace_id` `4df6f888…`, `2bf489eb…`, `c6bfec2d…`) quedaron entregadas a `worker-1` sin `XACK` y sin registro de auditoría (`pending` del grupo 96 → 99). El worker lee solo `>`, así que nadie las reprocesa. Mismo patrón que el huérfano de H28; qué proceso las recibió (el viejo al apagarse o el nuevo al arrancar) no se determinó. No se reprocesaron: abrirían casos tarde.
+
+**Corrección del análisis previo:** se había propuesto "corregir el texto del frontend para T1" porque las T1 quedarían con "Sin respuesta en ventana". Era un error: `AlertsView` pide `tier_min=2` y ninguna otra vista cruza decisiones T1 con respuestas. No hay texto que corregir.
+
+### ⚠️ Advertencia activa: la métrica de corroboración mejora por artefacto, no por calidad
+
+`compliance.corroboration_sources()` (vista CISO) cuenta como `evaluated` solo los registros con `enrichment` y reporta `sin_corroboracion` sobre ese denominador. Desde **2026-10-05 11:56:31 -03** las T1 (≈2/3 de los registros, casi todas IPs privadas sin ninguna fuente) dejan de existir en `soc:response:audit`. Resultado: **la proporción "sin corroboración" baja de golpe sin que la corroboración real haya mejorado.**
+
+- No comparar ninguna cifra de corroboración, cobertura de enriquecimiento ni volumen de respuestas entre ventanas que crucen ese corte. Si se reporta en la tesis, separar antes/después y decir por qué cambia el denominador.
+- Lo mismo para `response_counts()` y cualquier tendencia sobre `soc-responses-*`: el volumen cae ~2/3 por definición, no por menos actividad.
+- La advertencia queda también en el docstring de `corroboration_sources()`.
+
+**Rollback:** `cp -p ~/tesis/motor-runtime/.env.bak-r1-20261005-115631 ~/tesis/motor-runtime/.env` y restart de `motor-soc` y `response-worker`.
+
+**Estado: APLICADO Y VERIFICADO EN PRODUCCIÓN.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
+
+- **⚠️ ACTIVA — métricas de corroboración y de respuestas no comparables a través del 2026-10-05 11:56:31 -03 (H48):** desde ese corte las T1 no generan registro; `sin_corroboracion` baja y el volumen de respuestas cae ~2/3 por cambio de denominador, no por calidad ni actividad. Separar ventanas en cualquier reporte.
+- **3 tareas T2 huérfanas del restart de `response-worker` (H48)** (`1791212908363-1`, `1791212908364-0`, `1791212908366-0`), más las 96 viejas: decidir si se descartan con `XACK` explícito o se reprocesan como stale, y por qué un restart deja mensajes entregados sin `XACK`.
 
 - **Decidir el alcance de `rules.yaml` (H47):** MVP estimado en 6-10 días (motor de reglas, ATT&CK, SHAP). Mientras no se decida, se declara como trabajo futuro.
 - **T3 con `classtype` vacío: el override por classtype no se dispara (H47):** confirmar si el Fast Path recibe solo flows (sin classtype) o si Vector no envía el header.
@@ -2097,7 +2152,7 @@ La cifra que ve el CISO hoy en Cumplimiento es inválida. Lo mismo afecta `total
 - **Migrar todos los servicios a `structlog` (H41):** `.claude/rules/observability.md` lo exige y ningún servicio lo usa (todos con `logging` de la stdlib; no está en `requirements.txt` ni instalado en `.140`). Hacerlo de una vez, con `trace_id` por contextvars, no parche por parche.
 - **`.opendistro-ism-config` con `number_of_replicas: 1` (H41):** clúster en `yellow` por réplicas sin asignar en un solo nodo (también `soc-experimental-detections`). Llevar a `replicas: 0` como pide CLAUDE.md.
 - **Persistir `soc:response:audit` (H39):** hoy ningún proceso lo consume; la auditoría de R1/R2, aprobaciones y accesos vive solo en un stream de Redis capado en 100k (~5-6 h en operación normal). Decidir índice y hash-chain, y corregir los docstrings de `motor/auth.py` que afirman lo contrario.
-- **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
+- **Atraso de `response-worker` (H38):** decidir entre negative caching de TI, parseo único de la caché de CrowdSec, no enriquecer IPs privadas, `R1_MIN_TIER=2` (*aplicado el 2026-10-05 por alineación con la especificación, no por capacidad: H48*) y/o más consumidores, y qué hacer con el backlog de ~200k tareas de ~15 h. Hasta resolverlo, acotar o excluir de las métricas de resultados todo lo calculado sobre `soc:response:audit` en este período.
 
 
 - **`--workers 2` para `motor-soc.service`, evaluado pero no aplicado** (H30): el `run_in_executor` ya mitiga el bloqueo del event loop; un segundo worker de proceso completo daría paralelismo real adicional pero duplica el modelo en memoria por proceso — pendiente confirmar con Joaquín si el modelo tolera esa duplicación sin problema (RAM disponible en `.140` no parece ser el límite real, ver H30 original, pero no se asumió sin preguntar).

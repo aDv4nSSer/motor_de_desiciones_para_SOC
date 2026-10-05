@@ -341,6 +341,12 @@ def action_trend(since: datetime, now: datetime, interval: str,
 def corroboration_sources(since: datetime, rdb: redis.Redis) -> dict[str, Any]:
     """Fuentes que corroboraron, contadas sobre soc:response:audit.
 
+    ADVERTENCIA (H48): desde 2026-10-05 11:56:31 -03 (R1_MIN_TIER=2) las T1
+    no generan registro. `evaluated` pierde ~2/3 de sus filas (casi todas IPs
+    privadas sin fuentes), así que `sin_corroboracion` baja por cambio de
+    denominador, no porque la corroboración mejore. No comparar ventanas que
+    crucen ese corte.
+
     Returns:
         {"available", "sources": [{"source", "count"}], "evaluated",
          "sin_corroboracion", "crowdsec_observado", "coverage_from", "truncated"}.
