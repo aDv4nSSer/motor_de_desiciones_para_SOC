@@ -2191,20 +2191,41 @@ Verificado contra la infraestructura real antes de escribir código:
 - **Decisión real post-deploy:** `trace_id e9aad026-e9b6-495e-af80-ab4b9bc8c648`, `soc-decisions-2026.10.06/_doc/1791247809222-0`, `chain_seq 1667845`, T2 `ALERT`, puerto 443. Trae `classtype` y los 6 `attack_*` **en `null`**, como corresponde sin fuente de classtype. No se puede mostrar una decisión real con ATT&CK poblado sin un `POST /decide` sintético, que escribiría en un índice append-only. No se hizo.
 - **Hash-chain:** `verify_chain` sobre los 3.000 documentos `chain_seq 1664846 → 1667845` (2.899 de antes del deploy y 101 de después, con los campos nuevos en `null`): **0 problemas**, con la cadena continua a través del cambio de formato.
 - `exists classtype` en el índice de hoy: 0. Esperado: `null` no se indexa.
-- **Parte B pendiente de activar:** el bloqueo automático lo ejecuta `response-worker`, que necesita `sudo` interactivo de Antonio para reiniciar (H28). Hasta ese restart, solo la aprobación manual (en `motor-soc`) manda el contexto nuevo. **Ese restart también pone en producción el motor de reglas (`1da3670`).**
+- **Parte B:** el bloqueo automático lo ejecuta `response-worker`, que necesita `sudo` interactivo de Antonio para reiniciar (H28). Ese restart también pone en producción el motor de reglas (`1da3670`). Ver la sección siguiente.
 
 **Hallazgo lateral, no resuelto:** `model_version` llega vacío a `soc-decisions-*`. `publish_decision()` no lo incluye en el payload, aunque `parse_decision()` lo lee y `model-contract.md` lo exige. Es anterior a H50 y no se tocó.
 
-**Estado: PARTE A DESPLEGADA Y VERIFICADA. PARTE B EN `motor-soc`; FALTA EL RESTART DE `response-worker`.**
+### Activación de la Parte B, regresión de `data.srcip` y fix `ecd42b9`
+
+- **Restart de `response-worker` (Antonio, `sudo` interactivo): 2026-10-05 23:25:03 -03**, con `09bc330`. Pone en producción la Parte B de H50 y el motor de reglas `1da3670`.
+- **Regresión introducida por `d025b70`:** `WazuhAPIEnforcer.block()` mandaba `alert.data = {**contexto, "srcip": ip}`, con `srcip` al final para que el contexto no pudiera pisarlo. El decoder de fábrica de Wazuh que llena el campo `data.srcip` de la alerta 651 (`/var/ossec/ruleset/decoders/0010-active-response_decoders.xml:56`, `<regex type="pcre2">\"data\":\{\"srcip\"\:\"([^\"]+)\"</regex>`) solo matchea si `srcip` es la **primera** clave. Resultado: **33/33 alertas 651 entre 23:25:03 y el fix salieron sin `data.srcip` arriba de todo, contra 50/50 de las anteriores**. En el dashboard de Wazuh esos bloqueos quedaron sin el campo de IP.
+- **El bloqueo en sí no se afectó:** `firewall-drop` lee la IP por clave. En `active-responses.log` de `.138`, el bloqueo `ef84d326-d05d-45df-a21e-7c1bad8498d1` (23:25:26, `91.92.42.54`) muestra `check_keys ["91.92.42.54"]` → `continue`, igual que antes del restart, y hay 33 `add` para los 33 bloqueos. No se pudo leer `iptables` en `.138` (fuera del sudo de auditoría).
+- **Por qué no lo vio el test de H50:** comparaba `alert.data` con `==` entre dicts, y la igualdad de dicts no mira el orden.
+- **Fix `ecd42b9`:** `srcip` va primero y el contexto se filtra para no pisarlo. Test nuevo que aplica la regex real del decoder sobre la línea compacta que escribe `execd`: falla con `d025b70` y pasa con el fix. `pytest tests/`: 544 passed, ruff limpio.
+
+### Deploy y verificación del fix
+
+- **`response-worker`:** `git pull` + restart de Antonio, activo desde **23:47:33 -03** con `ecd42b9`, `NRestarts=0`.
+- **`motor-soc`** (aprobación manual): restart 23:50:45 -03 (`sudo -n`), `/health` 200 a los ~11 s, `NRestarts=0`. **Hueco en `soc:decisions`: 11,0 s** (23:50:44,701 → 23:50:55,745 -03; 2026-10-06 02:50:44,7Z–02:50:55,7Z). Excluir esa ventana de métricas del Fast Path.
+- **Bloqueo real de evidencia:** `trace_id 6ca5c2ed-5ac3-4548-b7e0-c0e04939af2b`, `91.92.42.100`, T3.
+  - `api.log` de `.139`, 23:48:05 -03: `"alert": {"data": {"srcip": "91.92.42.100", "trace_id": "6ca5c2ed-…", "tier": "3"}}` → 200.
+  - Alerta 651 `2026-10-05T23:48:07.585-0300`, id `1791254887.1096961`: trae `"data":{"srcip":"91.92.42.100", …}` arriba de todo y `data.parameters.alert.data` con `srcip`, `trace_id` y `tier`, en ese orden. `active-responses.log`: `"command":"add"`.
+- Las 7 alertas 651 entre 23:47:33 y la verificación traen `data.srcip` y `trace_id` (contra 0/33 en el tramo con la regresión). La aprobación manual también manda el orden nuevo desde el restart de `motor-soc`, pero no hubo una aprobación real para comprobarlo.
+
+**Para métricas o reportes sobre alertas 651 de Wazuh:** entre 2026-10-05 23:25:03 y 23:47:33 -03 las alertas 651 no tienen `data.srcip`; la IP está en `data.parameters.alert.data.srcip`.
+
+**Estado: PARTE A Y PARTE B DESPLEGADAS Y VERIFICADAS EN PRODUCCIÓN (con el fix `ecd42b9`).**
 
 ---
 
 ## Pendientes detectados (no resueltos hoy)
 
 - **Fuente de classtype para el Fast Path (H50):** hoy no existe. Decidir si se construye (Vector agrega `flow_id` a los flows y lleva las alertas al motor, que las guarda en Redis `alert:{flow_id}` con TTL para un lookup O(1)) sabiendo que activa el override T3 en producción con `enforce`, o si en la tesis se declara que el override y ATT&CK operan solo cuando el classtype llega. `category` de las alertas trae la descripción; `attck_mapping.lookup()` ya la acepta.
-- **Restart de `response-worker` para activar la Parte B de H50 (y el motor de reglas `1da3670`)**, después verificar con el próximo bloqueo real que `api.log` y la alerta 651 traen `trace_id`/`tier`.
+- ~~**Restart de `response-worker` para activar la Parte B de H50**~~ → hecho el 2026-10-05 (23:25:03 y, con el fix `ecd42b9`, 23:47:33 -03); verificado con el bloqueo real `6ca5c2ed` (H50).
 - **`model_version` vacío en `soc-decisions-*` (H50):** `publish_decision()` no lo manda.
 - **Ventana sin decisiones del deploy de H50 (2026-10-06 00:49:45,9Z–00:49:54,8Z, 8,9 s):** excluir de métricas del Fast Path.
+- **Ventana sin decisiones del restart de `motor-soc` por el fix `ecd42b9` (2026-10-06 02:50:44,7Z–02:50:55,7Z, 11,0 s):** excluir de métricas del Fast Path.
+- **Alertas 651 sin `data.srcip` (2026-10-05 23:25:03–23:47:33 -03, H50):** la IP está solo en `data.parameters.alert.data.srcip`; tenerlo en cuenta en cualquier conteo por IP sobre `wazuh-alerts-*`.
 
 - **⚠️ ACTIVA — métricas de corroboración y de respuestas no comparables a través del 2026-10-05 11:56:31 -03 (H48):** desde ese corte las T1 no generan registro; `sin_corroboracion` baja y el volumen de respuestas cae ~2/3 por cambio de denominador, no por calidad ni actividad. Separar ventanas en cualquier reporte.
 - **3 tareas T2 huérfanas del restart de `response-worker` (H48)** (`1791212908363-1`, `1791212908364-0`, `1791212908366-0`), más las 96 viejas: decidir si se descartan con `XACK` explícito o se reprocesan como stale, y por qué un restart deja mensajes entregados sin `XACK`.
