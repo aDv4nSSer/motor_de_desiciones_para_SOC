@@ -123,8 +123,11 @@ ninguna decisión trae `rules_fired[]` ni `reasoning[]`.
 entran a alcance de este ciclo — ver PROHIBICIONES #15 (actualizada). `rules.yaml` +
 `rules_fired[]`/`reasoning[]` siguen sin decisión — confirmar alcance exacto antes de
 tocarlos. Punto de partida de ATT&CK: `motor/classtype_attack.yaml` (mapeo de referencia
-classtype → técnica, confirmado contra el `classification.config` real de `.139`), **sin
-wirear todavía** a `soc-decisions` ni a Wazuh.
+classtype → técnica, confirmado contra el `classification.config` real de `.139`), wireado
+a `soc-decisions` (campos `classtype` + `attack_*`) y al Active Response de Wazuh
+(`alert.data`) en H50. **Pero en producción el classtype nunca llega al motor** (Vector solo
+manda flows a `/decide`): los campos quedan en `null` y el override T3 no se dispara hasta
+que exista una fuente — decisión pendiente, ver H50.
 **No usar threshold global 0.5.** Ver `.claude/rules/model-contract.md` para thresholds por dataset.
 
 ---
@@ -302,7 +305,8 @@ Cambio de arquitectura → actualizar `ROADMAP.md` en el mismo commit.
 15. **Mapeo ATT&CK, SHAP y `rules.yaml`/`rules_fired`/`reasoning`: EN ALCANCE (decisión de
     Antonio, 5-oct-2026, ampliada 5-oct-2026)** — las tres dejan de ser trabajo futuro.
     Estado al ampliar la decisión: ATT&CK con mapeo de referencia listo y corregido
-    (`motor/classtype_attack.yaml`), sin wirear todavía a `soc-decisions`/Wazuh; SHAP y
+    (`motor/classtype_attack.yaml`), wireado a `soc-decisions`/Wazuh en H50 (sin fuente
+    de classtype en producción todavía); SHAP y
     `rules.yaml` sin empezar (`motor/rules/` y `motor/scoring/` siguen `__init__.py`
     vacíos). El MVP de las tres juntas se había estimado en 6-10 días contra el cierre del
     documento (16-oct, quedan 11 días al ampliar esto) — confirmar secuencia y esfuerzo

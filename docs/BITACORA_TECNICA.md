@@ -2130,13 +2130,71 @@ T2 es el piso documentado de "enriquecer"; T1 se enriquecía sin que la tabla lo
 
 ---
 
+## H50 — ATT&CK wireado a `soc-decisions` y al Active Response de Wazuh; el classtype nunca llega al motor (confirma la hipótesis de H47)
+
+**Fecha:** 2026-10-05 (noche, -03; en UTC ya es 2026-10-06). Punto 2 del roadmap aprobado el 5-oct, después de `rules.yaml`.
+
+### Hallazgo previo al código: en producción `classtype` llega siempre vacío
+
+Verificado contra la infraestructura real antes de escribir código:
+
+- **Vector (`.139`)** corre `/usr/bin/vector --config /home/aiayala/tesis/repo/pipeline-ingesta/configs/vector.production.toml` (PID 1734817, desde el 5-sep). El transform `parse_eve` hace `abort` si `event_type != "flow"` y arma un objeto de 13 campos NetFlow **sin `flow_id`**; el sink `motor_soc` (`http://10.10.10.3:8000/decide`) **no define `headers`**: nunca manda `X-Suricata-Classtype`. Las alertas van por otro camino (`parse_eve_alerts` → `suricata-alerts-YYYY.MM.DD` en el OpenSearch de `.140`), sin pasar por el motor.
+- **`soc:response:tasks`** (200.012 tareas, todo el stream al 2026-10-05 ~21:35 -03): **200.012 con `classtype == ""` y 0 con `classtype_override = true`.** El override a T3 por `T3_CLASSTYPES` no se dispara en producción. Confirma la hipótesis de H47: el Fast Path recibe solo flows.
+- **`suricata-alerts-*`** sí tiene los classtypes, con `flow_id` (long), pero `category` trae la **descripción** de `classification.config`, no el nombre corto. Distribución en todos los índices (192.264 alertas, ~6-8k/día desde el 9-sep):
+
+| `category` | Alertas | Técnica (v1.1) |
+|---|---|---|
+| Misc Attack | 133.129 | — (catch-all) |
+| Generic Protocol Command Decode | 44.537 | — |
+| Potentially Bad Traffic | 7.541 | — |
+| Detection of a Network Scan | 4.852 | T1595 |
+| Attempted Information Leak | 1.945 | T1595 |
+| Attempted Administrator Privilege Gain | 115 | T1068 |
+| Decode of an RPC Query | 105 | T1046 |
+| Misc activity | 30 | — |
+| Web Application Attack | 7 | T1190 |
+| Device Retrieving External IP Address Detected | 2 | T1016 |
+| Attempted Denial of Service | 1 | T1498 |
+
+  Solo ~3,6% de las alertas (7.027) cae en un classtype con técnica ATT&CK; el 96% son categorías catch-all o informativas que el mapeo deja en `null` a propósito.
+
+**Decisión (Antonio, 5-oct):** wirear ahora (queda listo, sin datos en tráfico real hasta que exista una fuente de classtype) y tratar la fuente como decisión aparte. Hacer que el classtype llegue al motor implica cambiar Vector en `.139` (agregar `flow_id` a los flows y llevar las alertas al motor; la correlación debe quedar en el motor, PROHIBICIÓN #1) y **activaría por primera vez el override T3 en producción con `RESPONSE_MODE=enforce`**. Queda pendiente.
+
+### Parte A — `soc-decisions`
+
+- **`motor/attck_mapping.py` (nuevo):** loader Pydantic v2 de `classtype_attack.yaml` con `@lru_cache(maxsize=1)` (mismo patrón que `rules/engine.py:get_rules()`), valida formato de IDs (`TA\d{4}`, `T\d{4}(.\d{3})?`), id+nombre juntos, `confidence` en `alta|media|baja`, y claves de lookup únicas. Falla ruidoso (`AttckMappingLoadError`). Lookup por nombre corto **y** por descripción, sin distinguir mayúsculas (en `.139` la descripción de `web-application-activity` empieza en minúscula). Vive en `motor/` y no en `motor/rules/` porque lo consumen el Fast Path y R2, no el motor de reglas.
+- **`main.py`:** el `lifespan` carga el mapeo (YAML roto → no arranca). `process_event()` agrega `classtype` (el gap real: antes solo se guardaba `classtype_override`) y `attack_tactic_id/_name`, `attack_technique_id/_name`, `attack_confidence`, `attack_mapping_version`. `score_event()` no se tocó (puro/picklable, H36). Lookup = `dict.get` en memoria; si el mapeo no está disponible, campos en `None` + log `ERROR`, la decisión sigue.
+- **`redis_client.publish_decision()`:** las 7 claves viajan siempre, `""` si no hay valor.
+- **`opensearch_indexer`:** `parse_decision()` las convierte a `null` cuando vienen vacías o faltan (mensajes del productor anterior); `INDEX_MAPPINGS` las declara `keyword`.
+- **Entrada sin técnica vs. classtype desconocido:** `misc-attack` devuelve técnica `null` pero `attack_confidence="baja"` y la versión del mapeo; un classtype ausente del YAML devuelve todo `null`.
+- **Hash-chain:** sin cambios de lógica. `chain_document()` hashea el contenido completo, así que los campos nuevos (incluidos los `null`) quedan cubiertos; test que altera `attack_technique_id`/`classtype` y rompe `verify_chain`, y otro que verifica tras ida y vuelta por JSON (como vuelve `_source`).
+
+**`dynamic: false` y el índice abierto (verificado en `.140`, 2026-10-05 21:3x -03):** `soc-decisions-2026.10.06` ya existía (creado 2026-10-06T00:00:01Z con 119 docs) con el mapping viejo, idéntico al template `soc-decisions`. Con `"dynamic": "false"`, un campo nuevo queda en `_source` pero **no se indexa**: no es consultable hasta un índice creado con el template nuevo (el siguiente rollover es a las 00:00 UTC = 21:00 -03 del 6-oct). Por eso, antes de reiniciar el indexador, se aplica un `PUT soc-decisions-2026.10.06/_mapping` aditivo con los 7 campos `keyword` (agregar campos a un mapping es compatible; no toca ni reindexa documentos — la PROHIBICIÓN #6 es sobre documentos, no sobre el mapping). El template se actualiza solo: `bootstrap_until_ready()` llama `ensure_template()` en cada arranque del indexador. Resultado del deploy: ver más abajo.
+
+### Parte B — Wazuh: sí hay un canal real (investigado antes de escribir código)
+
+- **Ruleset en `.139`:** `/var/ossec/etc/rules/local_rules.xml` (497 B) y `/var/ossec/etc/decoders/local_decoder.xml` (815 B), ambos con fecha 2025-03-26, igual que `local_internal_options.conf` del paquete y anterior a la instalación (2026-06-01): son las plantillas de fábrica sin modificar. No se pudo leer el contenido (el sudo de auditoría no cubre `etc/rules`/`etc/decoders`), así que esto es inferencia por tamaño y fecha. `ossec.conf` solo carga `ruleset/` + `etc/` (más `rule_exclude 0215-policy_rules.xml`).
+- **Lo que deja hoy cada bloqueo del motor:** `api.log` registra `PUT /active-response` con body `{"command": "!firewall-drop", "alert": {"data": {"srcip": "…"}}}` desde `10.10.10.3` (639 en el log actual). El agente (`001 servidorwebubo`, `.138`) lo ejecuta, escribe la línea en su `active-responses.log` y el manager emite la **alerta regla 651 "Host Blocked by firewall-drop Active Response"** (640 en `alerts.json`), con el decoder `ar_log_json` exponiendo el objeto completo como `data.parameters.alert.data.*`. `wazuh-dashboard`, `wazuh-indexer` y `filebeat` activos.
+- **¿Acepta contexto adicional?** Sí: en `spec.yaml` de la API (`/var/ossec/framework/python/lib/python3.10/site-packages/api/spec/spec.yaml:1450`) `alert.data` es un objeto libre, y `wazuh/core/active_response.py:create_message()` lo serializa tal cual dentro de `parameters.alert`. Se eligió `alert.data` y no `extra_args` (`arguments`): queda como campos con nombre, consultables en la alerta 651, en vez de una lista de strings posicionales.
+- **El hueco que esto cierra hoy:** `observability.md` exige `trace_id` en la alerta de Wazuh y el motor no lo mandaba. Desde un bloqueo en Wazuh no había forma de llegar a la decisión.
+
+**Implementación:** `response/enforcer.py:ar_context(trace_id, tier, classtype)` arma `{trace_id, tier, classtype?, attack_*?}` (todo string, solo claves con valor). `WazuhAPIEnforcer.block()` lo manda en `alert.data` con `srcip` siempre al final (el contexto no puede pisar la IP que lee `firewall-drop`). Lo pasan el worker (bloqueo automático: trace_id + tier + ATT&CK) y la aprobación manual de `main.py` (trace_id + tier; el registro de aprobación no guarda classtype). Sin contexto, `respond_block` manda al menos `trace_id`.
+
+**Tests / lint:** `pytest tests/` 495 → **543 passed** (`tests/unit/test_attck_mapping.py` nuevo + 1 en `test_approval_resolve_gate.py`). `ruff check motor/ tests/` limpio. `bandit -ll -r api/ motor/` (versión del pre-commit): 0 Medium, 0 High.
+
+**Estado: IMPLEMENTADO EN `develop`. Deploy: ver sección siguiente.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
+
+- **Fuente de classtype para el Fast Path (H50):** hoy no existe. Decidir si se construye (Vector agrega `flow_id` a los flows y lleva las alertas al motor, que las guarda en Redis `alert:{flow_id}` con TTL para un lookup O(1)) sabiendo que activa el override T3 en producción con `enforce`, o si en la tesis se declara que el override y ATT&CK operan solo cuando el classtype llega. `category` de las alertas trae la descripción; `attck_mapping.lookup()` ya la acepta.
 
 - **⚠️ ACTIVA — métricas de corroboración y de respuestas no comparables a través del 2026-10-05 11:56:31 -03 (H48):** desde ese corte las T1 no generan registro; `sin_corroboracion` baja y el volumen de respuestas cae ~2/3 por cambio de denominador, no por calidad ni actividad. Separar ventanas en cualquier reporte.
 - **3 tareas T2 huérfanas del restart de `response-worker` (H48)** (`1791212908363-1`, `1791212908364-0`, `1791212908366-0`), más las 96 viejas: decidir si se descartan con `XACK` explícito o se reprocesan como stale, y por qué un restart deja mensajes entregados sin `XACK`.
 
 - **Decidir el alcance de `rules.yaml` (H47):** MVP estimado en 6-10 días (motor de reglas, ATT&CK, SHAP). Mientras no se decida, se declara como trabajo futuro.
-- **T3 con `classtype` vacío: el override por classtype no se dispara (H47):** confirmar si el Fast Path recibe solo flows (sin classtype) o si Vector no envía el header.
+- ~~**T3 con `classtype` vacío: el override por classtype no se dispara (H47)**~~ → **confirmado en H50:** Vector solo manda flows a `/decide`, sin header ni `flow_id` (200.012/200.012 tareas con classtype vacío). Sigue abierto como "fuente de classtype" (arriba).
 
 - **`total_eventos` de `response_counts()` topeado en 10.000 (H46):** mismo bug que `get_stats()`; agregar `track_total_hits` y un test.
 - **ufw en `.140`, regla `10.10.10.0/24 → Anywhere` ([8] al verla; [9] después del cierre de H33) (todos los puertos) (H33):** la vio Antonio en `ufw status numbered` (2026-10-04) al preparar el cierre de H33. Cualquier host de la VLAN 10 llega a todos los puertos de `.140`, más de lo necesario (hoy el único cliente legítimo en la VLAN es `.139`, `10.10.10.1`). No bloquea el cierre de H33: las reglas específicas de 6379 (allow `.139` / deny resto) se insertan antes en el orden de evaluación. Acotarla es una decisión de alcance más amplio, no parte de H33; **no se tocó**.

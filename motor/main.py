@@ -18,6 +18,7 @@ import audit_view
 import compliance
 import redis
 import user_admin
+from attck_mapping import attack_fields, get_mapping
 from auth import (
     get_current_session,
     get_current_user,
@@ -63,7 +64,7 @@ from response.approvals import (
 )
 from response.approvals import is_expired as is_approval_expired
 from response.config import get_settings as get_response_settings
-from response.enforcer import build_enforcer, is_safelisted
+from response.enforcer import ar_context, build_enforcer, is_safelisted
 from response.queue import enqueue_response_task
 from schemas import FlowFeatures
 from sessions import revoke_session
@@ -166,6 +167,11 @@ async def lifespan(app: FastAPI):
     from model import get_model  # ver _init_score_worker() — import local a propósito
     model = get_model()
     log.info(f"Modelo cargado: {model.model_version}")
+    # Mapeo classtype -> ATT&CK: se carga acá para que un YAML roto impida
+    # arrancar (AttckMappingLoadError) en vez de dejar decisiones sin ATT&CK
+    # en silencio. Después process_event solo hace un dict.get en memoria.
+    attck, _ = get_mapping()
+    log.info(f"Mapeo ATT&CK cargado: v{attck.version}, {len(attck.mappings)} classtypes")
     # H36: calentar el pool de procesos ahora, no en la primera request real
     # — fuerza a spawnear los N workers y cargar el modelo en cada uno.
     log.info(f"Calentando {_PROCESS_POOL_WORKERS} workers del ProcessPoolExecutor...")
@@ -212,6 +218,10 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
     tier                = scored["tier"]
     classtype_override  = scored["classtype_override"]
 
+    # ATT&CK acá y no en score_event(): score_event corre en el
+    # ProcessPoolExecutor y se mantiene puro (H36). Esto es un dict.get en
+    # memoria; sin match o sin classtype -> campos en None (H50: hoy Vector
+    # no manda classtype, así que en tráfico real siempre es el caso).
     response = {
         "trace_id":           trace_id,
         "tier":               tier,
@@ -220,7 +230,9 @@ def process_event(event_data: dict, trace_id: str, classtype: str) -> dict:
         "anomaly_score":      scored["anomaly_score"],
         "ml_score":           scored["ml_score"],
         "decision":           scored["decision"],
+        "classtype":          classtype or None,
         "classtype_override": classtype_override,
+        **attack_fields(classtype),
         "model_version":      scored["model_version"],
         "features_used": {
             "SERVER_TCP_FLAGS":           features["SERVER_TCP_FLAGS"],
@@ -565,7 +577,11 @@ def dashboard_resolve_approval(
         # quede trazado quién aprobó y con qué rol.
         settings = get_response_settings()
         enforcer = build_enforcer(settings)
-        enforced, error = enforcer.block(approval["src_ip"], settings.block_ttl_seconds)
+        # Mismo contexto que el bloqueo automático (H50): trace_id + tier
+        # llegan a la alerta 651 de Wazuh. El registro de aprobación no
+        # guarda classtype, así que acá no viaja ATT&CK.
+        enforced, error = enforcer.block(approval["src_ip"], settings.block_ttl_seconds,
+                                         ar_context(trace_id, approval.get("tier")))
         try:
             audit_payload = {
                 "trace_id": trace_id,

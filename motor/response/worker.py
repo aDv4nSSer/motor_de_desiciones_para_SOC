@@ -27,7 +27,7 @@ import redis
 from response.approvals import create_pending_approval, expire_stale_approvals
 from response.cases import open_case
 from response.config import get_settings
-from response.enforcer import build_enforcer, is_safelisted, respond_block
+from response.enforcer import ar_context, build_enforcer, is_safelisted, respond_block
 from response.enrichment import enrich
 from response.schemas import (
     ACCION_ALERTAR_CREAR_CASO,
@@ -207,7 +207,10 @@ def process_task(
             else:
                 record.accion_recomendada = ACCION_ALERTAR_PENDIENTE_APROBACION
         elif corroborated:
-            record.block = respond_block(task.src_ip, settings, rdb, enforcer, task.trace_id)
+            record.block = respond_block(
+                task.src_ip, settings, rdb, enforcer, task.trace_id,
+                context=ar_context(task.trace_id, task.tier, task.classtype),
+            )
             record.accion_recomendada = (
                 ACCION_BLOQUEO_IP if record.block.action == ActionType.BLOCK
                 else ACCION_NINGUNA  # ya bloqueada / safelisted / dry_run sin ejecutar

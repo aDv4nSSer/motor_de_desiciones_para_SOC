@@ -95,6 +95,14 @@ class TestCuarentenaExigeN2:
         assert resp.json()["resolved_by"] == f"user-{role.lower()}"
         app_env["enforcer"].block.assert_called_once()
 
+    def test_bloqueo_aprobado_manda_trace_id_y_tier_a_wazuh(self, app_env) -> None:
+        """H50: la alerta 651 de Wazuh del bloqueo manual también lleva el
+        contexto de la decisión (sin ATT&CK: el registro no guarda classtype)."""
+        app_env["pending"]("t-ctx-manual", "N2")
+        app_env["as_role"]("N2")
+        assert _resolve(app_env, "t-ctx-manual").status_code == 200
+        assert app_env["enforcer"].block.call_args.args[2] == {"trace_id": "t-ctx-manual", "tier": "3"}
+
 
 class TestJerarquia:
     def test_n1_confirma_bloqueo_de_red_nivel_n1(self, app_env) -> None:

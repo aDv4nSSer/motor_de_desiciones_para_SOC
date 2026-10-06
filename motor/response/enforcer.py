@@ -22,11 +22,45 @@ from typing import Protocol
 
 import httpx
 import redis
+from attck_mapping import ATTACK_FIELDS, attack_fields
 
 from response.config import ResponseSettings
 from response.schemas import ActionType, BlockResult
 
 log = logging.getLogger("response.r2")
+
+
+# ── Contexto de la decisión en el Active Response (H50) ─────────────────────────
+def ar_context(trace_id: str, tier: int | str | None, classtype: str | None = None) -> dict[str, str]:
+    """Contexto que viaja en alert.data del Active Response de Wazuh.
+
+    Verificado en .139 (H50): la API pasa `alert` tal cual al agente
+    (spec.yaml: alert.data es objeto libre; core/active_response.py lo
+    serializa sin filtrar), el agente lo escribe en active-responses.log y
+    el manager lo convierte en la alerta 651 "Host Blocked by firewall-drop
+    Active Response", con el decoder ar_log_json exponiendo cada clave como
+    data.parameters.alert.data.<clave>. Así un analista que mira el bloqueo
+    en Wazuh puede saltar a soc-decisions/soc-responses por trace_id.
+
+    Args:
+        trace_id: trace_id de la decisión que originó el bloqueo.
+        tier: tier de la decisión (int, o str si viene de un hash Redis);
+            None si el origen no lo conoce.
+        classtype: classtype de Suricata, si llegó (H50: hoy nunca llega).
+
+    Returns:
+        Diccionario de strings (tipos estables en el índice de alertas de
+        Wazuh). Solo claves con valor: trace_id siempre; tier, classtype y
+        los campos ATT&CK cuando existen.
+    """
+    ctx: dict[str, str] = {"trace_id": trace_id}
+    if tier is not None:
+        ctx["tier"] = str(tier)
+    if classtype:
+        ctx["classtype"] = classtype
+        attck = attack_fields(classtype)
+        ctx.update({f: attck[f] for f in ATTACK_FIELDS if attck[f]})
+    return ctx
 
 
 # ── Safelist ───────────────────────────────────────────────────────────────────
@@ -69,14 +103,24 @@ def _record_block(ip: str, settings: ResponseSettings, rdb: redis.Redis, trace_i
 # ── Interfaz de enforcer ────────────────────────────────────────────────────────
 class Enforcer(Protocol):
     name: str
-    def block(self, ip: str, ttl: int) -> tuple[bool, str | None]: ...
+    def block(self, ip: str, ttl: int, context: dict[str, str] | None = None) -> tuple[bool, str | None]: ...
 
 
 class DryRunEnforcer:
     """No toca la red. Registra lo que haría. Default seguro."""
     name = "dry_run"
 
-    def block(self, ip: str, ttl: int) -> tuple[bool, str | None]:
+    def block(self, ip: str, ttl: int, context: dict[str, str] | None = None) -> tuple[bool, str | None]:
+        """Registra el bloqueo sin ejecutarlo.
+
+        Args:
+            ip: IP que se bloquearía.
+            ttl: segundos que duraría el bloqueo.
+            context: contexto de la decisión (ver ar_context); solo se ignora.
+
+        Returns:
+            (False, None): no se bloqueó realmente y no hubo error.
+        """
         log.info(f"[DRY_RUN] bloquearía {ip} por {ttl}s (no ejecutado)")
         return False, None  # enforced=False: no se bloqueó realmente
 
@@ -101,12 +145,25 @@ class WazuhAPIEnforcer:
         resp.raise_for_status()
         return resp.json()["data"]["token"]
 
-    def block(self, ip: str, ttl: int) -> tuple[bool, str | None]:
+    def block(self, ip: str, ttl: int, context: dict[str, str] | None = None) -> tuple[bool, str | None]:
+        """Dispara el Active Response sobre `ip`.
+
+        Args:
+            ip: IP a bloquear.
+            ttl: segundos del bloqueo (lo aplica Wazuh según su config).
+            context: contexto de la decisión para alert.data (ver
+                ar_context). `srcip` siempre es `ip`: el contexto no puede
+                pisarlo, porque es lo que lee el script firewall-drop.
+
+        Returns:
+            (enforced, error): (True, None) si la API aceptó el comando;
+            (False, "wazuh_api error: <tipo>") si falló, sin lanzar.
+        """
         try:
             token = self._token()
             body = {
                 "command": f"!{self.s.wazuh_ar_command}",
-                "alert": {"data": {"srcip": ip}},
+                "alert": {"data": {**(context or {}), "srcip": ip}},
             }
             params = {}
             agents = self.s.target_agents_list
@@ -142,10 +199,23 @@ def respond_block(
     rdb: redis.Redis,
     enforcer: Enforcer,
     trace_id: str,
+    context: dict[str, str] | None = None,
 ) -> BlockResult:
     """
     Evalúa y (si corresponde) ejecuta el bloqueo de una IP.
     Orden de las salvaguardas: safelist -> idempotencia -> modo -> enforce.
+
+    Args:
+        src_ip: IP de origen a bloquear.
+        settings: ResponseSettings.
+        rdb: cliente Redis (idempotencia/TTL del bloqueo).
+        enforcer: backend de bloqueo.
+        trace_id: trace_id de la decisión.
+        context: contexto para el Active Response (ver ar_context); None
+            manda solo trace_id.
+
+    Returns:
+        El BlockResult con la acción tomada y su motivo.
     """
     result = BlockResult(src_ip=src_ip, enforcer=enforcer.name,
                          ttl_seconds=settings.block_ttl_seconds)
@@ -182,7 +252,8 @@ def respond_block(
         return result
 
     # 4) Enforce — ejecuta el bloqueo real
-    enforced, error = enforcer.block(src_ip, settings.block_ttl_seconds)
+    enforced, error = enforcer.block(src_ip, settings.block_ttl_seconds,
+                                     context or ar_context(trace_id, None))
     result.enforced = enforced
     result.error = error
     if enforced:

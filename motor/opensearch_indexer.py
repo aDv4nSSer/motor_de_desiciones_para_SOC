@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import redis
+from attck_mapping import ATTACK_FIELDS
 from response_audit_indexer import (
     BOOTSTRAP_RETRYABLE,
     GENESIS_HASH,
@@ -104,6 +105,11 @@ def parse_decision(msg_id: str, msg_data: dict) -> dict:
             "SERVER_FLAGS": int(msg_data.get("SERVER_FLAGS", 0)),
             "model_version": msg_data.get("model_version", ""),
             "latency_ms": float(msg_data.get("latency_ms", 0)),
+            # H50: "" en el stream (o clave ausente, productor anterior) ->
+            # null en el documento: un keyword vacío "" sería un término
+            # buscable sin significado; null queda fuera de exists/terms.
+            "classtype": msg_data.get("classtype") or None,
+            **{f: msg_data.get(f) or None for f in ATTACK_FIELDS},
         }
     except (TypeError, ValueError):
         return {"stream_id": msg_id, "doc_type": "unparseable",
@@ -132,6 +138,12 @@ INDEX_MAPPINGS = {
         "SERVER_FLAGS": {"type": "integer"},
         "model_version": {"type": "keyword"},
         "latency_ms": {"type": "float"},
+        # H50: IDs/categorías, no texto libre -> keyword. Con "dynamic": False
+        # un campo nuevo solo es consultable en índices creados con este
+        # template; el índice diario ya abierto se actualiza con un PUT
+        # _mapping aditivo (ver H50 en BITACORA), sin tocar documentos.
+        "classtype": {"type": "keyword"},
+        **{f: {"type": "keyword"} for f in ATTACK_FIELDS},
         "chain_seq": {"type": "long"},
         "prev_hash": {"type": "keyword"},
         "hash": {"type": "keyword"},

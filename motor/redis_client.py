@@ -5,6 +5,7 @@ Streams: soc:flows (Fast Path) y soc:decisions (decisiones finales)
 import redis, json, logging, os
 from datetime import datetime, timezone
 
+from attck_mapping import ATTACK_FIELDS
 from dotenv import load_dotenv
 from redis.backoff import NoBackoff
 from redis.retry import Retry
@@ -74,6 +75,11 @@ def publish_decision(trace_id: str, features: dict, decision: dict):
             "SERVER_FLAGS":  str(features.get("SERVER_TCP_FLAGS", 0)),
             "decision":      decision["decision"],
             "latency_ms":    str(decision.get("latency_ms", 0)),
+            # classtype + ATT&CK (H50): el stream es todo string, así que
+            # None/ausente viaja como "" -- la clave nunca se omite (contrato
+            # estable del stream; opensearch_indexer.parse_decision lo vuelve null).
+            "classtype":     decision.get("classtype") or "",
+            **{f: decision.get(f) or "" for f in ATTACK_FIELDS},
         }
         r.xadd("soc:decisions", payload, maxlen=MAXLEN, approximate=True)
         return True
