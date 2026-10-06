@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -393,6 +394,21 @@ class TestWazuhAPIEnforcer:
         put = self._mock_api(mocker)
         WazuhAPIEnforcer(_enforce_settings()).block("1.2.3.4", 3600)
         assert put.call_args.kwargs["json"]["alert"] == {"data": {"srcip": "1.2.3.4"}}
+
+    def test_decoder_de_wazuh_extrae_srcip_de_la_alerta_651(self, mocker) -> None:
+        """Regresión encontrada en producción tras H50: con srcip al final de
+        alert.data, la alerta 651 salía sin data.srcip (33/33). El decoder de
+        fábrica (0010-active-response_decoders.xml) usa esta regex sobre la
+        línea compacta que escribe execd en active-responses.log, así que
+        srcip tiene que ser la PRIMERA clave (la igualdad de dicts no lo ve)."""
+        wazuh_regex = re.compile(r'"data":\{"srcip":"([^"]+)"')
+        put = self._mock_api(mocker)
+        WazuhAPIEnforcer(_enforce_settings()).block("1.2.3.4", 3600, ar_context("t-wz", 3, "attempted-admin"))
+        data = put.call_args.kwargs["json"]["alert"]["data"]
+        assert next(iter(data)) == "srcip"
+        line = json.dumps({"parameters": {"extra_args": [], "alert": {"data": data}}}, separators=(",", ":"))
+        match = wazuh_regex.search(line)
+        assert match is not None and match.group(1) == "1.2.3.4"
 
 
 class TestRespondBlockPasaElContexto:

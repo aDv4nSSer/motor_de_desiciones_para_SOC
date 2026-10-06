@@ -152,8 +152,13 @@ class WazuhAPIEnforcer:
             ip: IP a bloquear.
             ttl: segundos del bloqueo (lo aplica Wazuh según su config).
             context: contexto de la decisión para alert.data (ver
-                ar_context). `srcip` siempre es `ip`: el contexto no puede
-                pisarlo, porque es lo que lee el script firewall-drop.
+                ar_context). `srcip` siempre es `ip` y va PRIMERO: el
+                contexto no puede pisarlo (es lo que lee firewall-drop), y
+                el decoder de fábrica de Wazuh que llena data.srcip en la
+                alerta 651 (0010-active-response_decoders.xml, regex
+                `"data":{"srcip":"..."`) solo lo encuentra si es la
+                primera clave -- con srcip al final, la alerta 651 perdía
+                data.srcip (encontrado en producción tras H50).
 
         Returns:
             (enforced, error): (True, None) si la API aceptó el comando;
@@ -161,9 +166,10 @@ class WazuhAPIEnforcer:
         """
         try:
             token = self._token()
+            extra = {k: v for k, v in (context or {}).items() if k != "srcip"}
             body = {
                 "command": f"!{self.s.wazuh_ar_command}",
-                "alert": {"data": {**(context or {}), "srcip": ip}},
+                "alert": {"data": {"srcip": ip, **extra}},
             }
             params = {}
             agents = self.s.target_agents_list
