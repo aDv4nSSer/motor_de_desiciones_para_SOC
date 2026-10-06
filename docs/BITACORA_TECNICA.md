@@ -2182,13 +2182,29 @@ Verificado contra la infraestructura real antes de escribir código:
 
 **Tests / lint:** `pytest tests/` 495 → **543 passed** (`tests/unit/test_attck_mapping.py` nuevo + 1 en `test_approval_resolve_gate.py`). `ruff check motor/ tests/` limpio. `bandit -ll -r api/ motor/` (versión del pre-commit): 0 Medium, 0 High.
 
-**Estado: IMPLEMENTADO EN `develop`. Deploy: ver sección siguiente.**
+### Deploy a `.140` (2026-10-05, -03)
+
+- `git pull --ff-only` en `~/tesis/repo`: `7c299bf` → `d025b70`. Además de H50, el pull trae lo mergeado a `develop` desde el 4-oct: agrupación de aprobaciones por /24 (`4415a7c`, `eceb3b2`), el motor de reglas (`1da3670`) y el YAML corregido.
+- **`PUT soc-decisions-2026.10.06/_mapping`** con los 7 campos `keyword`: `200 {"acknowledged":true}`. Mapping de 21 → 28 propiedades, `dynamic` sigue en `"false"`, 14.823 documentos sin tocar.
+- **`opensearch-indexer`**: restart 21:49:43 (`sudo -n`), `active`, `NRestarts=0`. El bootstrap actualizó el template `soc-decisions` (28 propiedades, `classtype`/`attack_*` en `keyword`).
+- **`motor-soc`**: restart 21:49:46, `/health` 200 a los ~8 s (`model_real`/`iforest_real` true). El `lifespan` cargó el mapeo (si no, no habría arrancado). **Hueco en `soc:decisions`: 8,9 s** (último sin las claves nuevas 21:49:45,921 → primero con ellas 21:49:54,784 -03; 00:49:45,9Z–00:49:54,8Z). Excluir esa ventana de métricas del Fast Path.
+- **Decisión real post-deploy:** `trace_id e9aad026-e9b6-495e-af80-ab4b9bc8c648`, `soc-decisions-2026.10.06/_doc/1791247809222-0`, `chain_seq 1667845`, T2 `ALERT`, puerto 443. Trae `classtype` y los 6 `attack_*` **en `null`**, como corresponde sin fuente de classtype. No se puede mostrar una decisión real con ATT&CK poblado sin un `POST /decide` sintético, que escribiría en un índice append-only. No se hizo.
+- **Hash-chain:** `verify_chain` sobre los 3.000 documentos `chain_seq 1664846 → 1667845` (2.899 de antes del deploy y 101 de después, con los campos nuevos en `null`): **0 problemas**, con la cadena continua a través del cambio de formato.
+- `exists classtype` en el índice de hoy: 0. Esperado: `null` no se indexa.
+- **Parte B pendiente de activar:** el bloqueo automático lo ejecuta `response-worker`, que necesita `sudo` interactivo de Antonio para reiniciar (H28). Hasta ese restart, solo la aprobación manual (en `motor-soc`) manda el contexto nuevo. **Ese restart también pone en producción el motor de reglas (`1da3670`).**
+
+**Hallazgo lateral, no resuelto:** `model_version` llega vacío a `soc-decisions-*`. `publish_decision()` no lo incluye en el payload, aunque `parse_decision()` lo lee y `model-contract.md` lo exige. Es anterior a H50 y no se tocó.
+
+**Estado: PARTE A DESPLEGADA Y VERIFICADA. PARTE B EN `motor-soc`; FALTA EL RESTART DE `response-worker`.**
 
 ---
 
 ## Pendientes detectados (no resueltos hoy)
 
 - **Fuente de classtype para el Fast Path (H50):** hoy no existe. Decidir si se construye (Vector agrega `flow_id` a los flows y lleva las alertas al motor, que las guarda en Redis `alert:{flow_id}` con TTL para un lookup O(1)) sabiendo que activa el override T3 en producción con `enforce`, o si en la tesis se declara que el override y ATT&CK operan solo cuando el classtype llega. `category` de las alertas trae la descripción; `attck_mapping.lookup()` ya la acepta.
+- **Restart de `response-worker` para activar la Parte B de H50 (y el motor de reglas `1da3670`)**, después verificar con el próximo bloqueo real que `api.log` y la alerta 651 traen `trace_id`/`tier`.
+- **`model_version` vacío en `soc-decisions-*` (H50):** `publish_decision()` no lo manda.
+- **Ventana sin decisiones del deploy de H50 (2026-10-06 00:49:45,9Z–00:49:54,8Z, 8,9 s):** excluir de métricas del Fast Path.
 
 - **⚠️ ACTIVA — métricas de corroboración y de respuestas no comparables a través del 2026-10-05 11:56:31 -03 (H48):** desde ese corte las T1 no generan registro; `sin_corroboracion` baja y el volumen de respuestas cae ~2/3 por cambio de denominador, no por calidad ni actividad. Separar ventanas en cualquier reporte.
 - **3 tareas T2 huérfanas del restart de `response-worker` (H48)** (`1791212908363-1`, `1791212908364-0`, `1791212908366-0`), más las 96 viejas: decidir si se descartan con `XACK` explícito o se reprocesan como stale, y por qué un restart deja mensajes entregados sin `XACK`.
