@@ -2271,6 +2271,21 @@ T3 con score: 231 (≈1.460 T3/h), 132 IPs distintas pero solo 8 /24 (`91.92.42.
 - `high & ¬corroborado`: 206, por ejemplo `37cf76f2-83ca-480d-be52-447a222e5c2c` (92,3, count 1, `91.92.42.64`). `¬high & corroborado`: 0, porque no hubo ningún T3 con count ≥ 2 (AbuseIPDB sin cuota).
 - **Advertencia para la decisión del gate:** con `signature`/`context` sin instrumentar y TI no disponible, el score se renormaliza sobre `ml` sola. Un T3 con `risk_score` 0,83 queda en 82,8 → `high` sin ninguna corroboración externa. Pasó en la muestra: `95.40.160.2` y `200.54.12.139` (el propio bastion, protegido por la safelist en `respond_block`) con count 0. Si hoy se reemplazara el gate por `band == "high"`, se autobloquearía ~89% de los T3 y, cuando TI está caída, decidiría solo el ML. No se cambió nada: queda como insumo para la decisión.
 
+### CONDICIÓN FORMAL: `band == "high"` no puede ser gate de R2 (agregado 2026-10-07, ~15:45 -03)
+
+Formalizado también en `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección 9, punto 14.
+
+- **Regla:** `corroboration_band == "high"` **no se wirea como gate real de autobloqueo** mientras AbuseIPDB siga sin cuota y no haya un segundo proveedor de TI realmente redundante.
+- **Mecanismo (nota técnica para quien escriba Resultados/Discusión):** `compute_corroboration()` renormaliza sobre los grupos disponibles (`C = 100·Σ w_i·g_i / Σ w_i`, solo grupos con `available = true`). Hoy `signature` y `context` nunca están disponibles. Si `ti` tampoco lo está (OTX caído o sin pulsos útiles y AbuseIPDB sin cuota), queda `C = 100·g_ml`: un T3 con `risk_score` 0,828 da **82,8 → `high`**, sin que ningún grupo independiente lo respalde. En la ventana de sombra: `95.40.160.2` y **`200.54.12.139` (el bastion)** con count 0 y `high`; el bastion no se bloquea solo porque lo protege la safelist de `respond_block`. Es el comportamiento de diseño (un grupo ausente no es evidencia negativa), **no un bug de `corroboration.py`**. Es una **limitación del enfoque en este entorno**: con un solo grupo disponible, el score expresa solo la confianza de ese grupo, y el `band` no distingue "alto porque varias fuentes coinciden" de "alto porque solo hay una".
+- **Condición de salida (las dos, en orden):**
+  1. **TI disponible de verdad**, de una de dos formas: (a) `abuseipdb_available = true` en ≥ 95% de los T3 de la ventana, lo que exige un plan o una estrategia de consultas que alcance para el volumen (que la cuota diaria se reponga no alcanza: hoy se agota a las ~2 h); o (b) OTX solo, con `corr_otx_pulse_saturation` calibrada con datos y `otx_available = true` en ≥ 95% de los T3. Con (b) se pierde la redundancia de proveedores y la decisión de bloquear con una sola fuente tiene que tomarse explícitamente.
+  2. **Repetir el período de sombra** con esa TI disponible de punta a punta (criterio en `docs/PENDIENTES_MODO_SOMBRA.md`). La ventana del 2026-10-07 queda como evidencia del problema, no como validación.
+
+### Diagnóstico de AbuseIPDB (solo lectura, 2026-10-07 15:41 -03)
+
+- **Cuota:** lookup directo (1 request, devolvió 429 y no consumió cuota): `HTTP 429`, `X-RateLimit-Limit: 1000`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset: 1791417600` = **2026-10-08 00:00 UTC (21:00 -03)**, `Retry-After: 19128`. La negative cache del worker coincide: `soc:enrich:abuseipdb:quota_exhausted = "HTTP 429"`, TTL 19.128 s. Último 429 registrado en `worker.log`: 2026-10-06 22:51:53 -03, **~1 h 52 min después del reset anterior** (21:00 -03). La cuota de 1.000/día alcanza para menos de dos horas de tráfico real: es estructural, no un pico. `GET /health` del motor no expone el estado de la TI (solo modelo).
+- **Rotación de la key: NO hecha.** `config.py` la marca "OBLIGATORIO rotar (estuvo expuesta)" desde `e7a27b7` (2026-07-06). La huella sha256 (10 caracteres, nunca la key) es **la misma** en el `.env` vigente y en los 6 backups de `.140`, del 2026-09-03 al 2026-10-05, incluidos `.env.bak-preH27rotation-*`/`.env.bak-preH32rotation-*` (esas rotaciones fueron de OpenSearch y Redis, no de AbuseIPDB). No hay ninguna entrada de bitácora sobre su rotación. **Queda como bloqueante del período de sombra**, no solo como deuda técnica general: el período tiene que correr con la key definitiva. Rotarla por sí solo no resuelve la cuota (el límite de 1.000/día lo informa la API para el plan).
+
 ### Período de modo sombra propuesto
 
 Mínimo **72 h** continuas (tres ciclos día/noche y tres resets diarios de cuota de AbuseIPDB a las 00:00 UTC), y además:
@@ -2278,9 +2293,9 @@ Mínimo **72 h** continuas (tres ciclos día/noche y tres resets diarios de cuot
 - **≥ 20 T3 con `corroboration_count >= 2`**, para poder medir la celda `¬high & corroborado`. Si no se alcanza porque AbuseIPDB sigue sin cuota, la comparación contra el gate binario no es informativa y hace falta revisión humana de una muestra.
 - **Revisión de una muestra de ≥ 50 IPs `high & ¬corroborado`**, para estimar cuántas serían bloqueos correctos. Es lo único que separa "el gate es demasiado estricto" de "el score es demasiado laxo".
 
-**Gate real: sin cambios. La decisión de wirearlo la toma Antonio con estos datos.**
+**Gate real: sin cambios. La decisión de wirearlo la toma Antonio con estos datos.** Seguimiento formal del período, con la condición de arriba como **prerrequisito** (no en paralelo): `docs/PENDIENTES_MODO_SOMBRA.md`.
 
-**PENDIENTE:** cuando se cumplan las 72 h, las 100 /24 y los 20 T3 con count ≥ 2 (o se cierre la revisión humana), correr `python3 ../scripts/corroboration_shadow_report.py --since 2026-10-07T18:24:50Z --max-list 50` desde `~/tesis/repo/motor` en `.140` y reportar la contingencia `band == "high"` vs. `corroboration_count >= 2` con sus discrepancias.
+**PENDIENTE:** cumplidos los prerrequisitos de `docs/PENDIENTES_MODO_SOMBRA.md` y, sobre esa ventana, las 72 h, las 100 /24 y los 20 T3 con count ≥ 2 (o la revisión humana), correr `python3 ../scripts/corroboration_shadow_report.py --since 2026-10-07T18:24:50Z --max-list 50` desde `~/tesis/repo/motor` en `.140` y reportar la contingencia `band == "high"` vs. `corroboration_count >= 2` con sus discrepancias.
 
 **Estado: MODO SOMBRA DESPLEGADO Y VERIFICADO EN PRODUCCIÓN. Gate de R2 intacto.**
 
@@ -2288,7 +2303,10 @@ Mínimo **72 h** continuas (tres ciclos día/noche y tres resets diarios de cuot
 
 ## Pendientes detectados (no resueltos hoy)
 
-- **Comparación final del modo sombra de corroboración (H52):** criterio en H52 (72 h + ≥ 100 /24 con T3 puntuado + ≥ 20 T3 con `corroboration_count >= 2` o revisión humana de ≥ 50 IPs `high & ¬corroborado`). Antes de wirear el gate, decidir qué hacer cuando TI no está disponible: hoy el score se renormaliza a ML sola y un T3 típico queda en `high`.
+- **⚠️ CONDICIÓN FORMAL (H52): `band == "high"` no puede ser gate de R2** mientras AbuseIPDB siga sin cuota y no haya un segundo proveedor de TI redundante. Salida: TI disponible en ≥ 95% de los T3 y período de sombra repetido con esa TI. Ver H52 y la especificación ampliada, sección 9, punto 14.
+- **Rotar la API key de AbuseIPDB (H52), BLOQUEANTE del período de sombra:** misma huella en el `.env` y en todos los backups de `.140` desde el 2026-09-03; marcada como expuesta desde el 2026-07-06.
+- **Cuota de AbuseIPDB estructuralmente insuficiente (H52):** 1.000/día, se agota ~2 h después del reset de las 00:00 UTC. Decidir plan pago, estrategia de consultas, o la variante "OTX solo" con saturación calibrada.
+- **Período de modo sombra (H52):** seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`.
 - **H51 sin documentar** (número reservado, trabajo de otra sesión).
 
 - **Fuente de classtype para el Fast Path (H50):** hoy no existe. Decidir si se construye (Vector agrega `flow_id` a los flows y lleva las alertas al motor, que las guarda en Redis `alert:{flow_id}` con TTL para un lookup O(1)) sabiendo que activa el override T3 en producción con `enforce`, o si en la tesis se declara que el override y ATT&CK operan solo cuando el classtype llega. `category` de las alertas trae la descripción; `attck_mapping.lookup()` ya la acepta.

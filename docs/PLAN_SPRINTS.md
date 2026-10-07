@@ -201,6 +201,7 @@ graduada" de R2) y ya tiene su propio slot protegido arriba.
 | Revisión cruzada completa del documento (Antonio revisa lo de Joaquín y viceversa) | Ambos | Lista de correcciones cerrada |
 | Generar versión de PDF/Word final para revisión de Miguel | Antonio | Archivo entregado |
 | Enviar tesis completa a Miguel para revisión final | Antonio | Confirmación de envío |
+| **[R2 — corroboración ponderada, H52] Cerrar prerrequisitos del modo sombra** (rotar key de AbuseIPDB, TI disponible en ≥ 95% de los T3, decidir el comportamiento sin TI) y recién entonces correr el período de 72 h | Antonio | Seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`. **`band == "high"` no se usa como gate mientras los prerrequisitos sigan abiertos.** Si no se llega antes del 16-oct, se reporta como limitación y el gate binario queda como está |
 
 ---
 
