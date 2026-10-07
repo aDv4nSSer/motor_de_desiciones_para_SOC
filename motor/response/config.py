@@ -157,6 +157,14 @@ class ResponseSettings(BaseSettings):
     corr_disagreement_threshold: float = 0.6
     corr_min_weight_for_disagreement: float = 15.0
 
+    # P3 (H53): diversidad mínima de evidencia para band "high". Con menos
+    # grupos disponibles que esto, la banda se capa en "medium" aunque el
+    # score renormalizado sea alto -- con un solo grupo, el score expresa
+    # solo la confianza de ese grupo (caso real: T3 de ML solo -> 82,8, H52).
+    # Mecanismo distinto del desacuerdo de arriba: aquel mira cuánto
+    # discrepan los grupos disponibles; este, cuántos hay.
+    corr_min_groups_for_high: int = 2
+
     # Normalización de OTX: pulse_count es un conteo sin cota superior
     # natural (a diferencia de abuseipdb_score, que ya es 0-100). Se satura
     # a 1.0 en este valor -- un puñado de pulses ya es evidencia fuerte

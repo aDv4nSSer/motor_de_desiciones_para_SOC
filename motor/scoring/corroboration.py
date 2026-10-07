@@ -153,18 +153,26 @@ def _score_context_group(weight: float) -> GroupScore:
     )
 
 
-def _band(score: float, ambiguous: bool, settings: ResponseSettings) -> str:
+def _band(score: float, ambiguous: bool, n_available: int, settings: ResponseSettings) -> str:
     """La ambigüedad viene SIEMPRE del desacuerdo entre grupos (ver
     `ambiguous` en compute_corroboration), nunca de un techo de score --
     un score=95 por consenso de todos los grupos disponibles es, si acaso,
     MÁS confiable que uno de 75, no menos. `corr_band_high_max` queda solo
     como referencia documental de dónde empieza "alta confianza" para
-    dashboards/reasoning, no como un segundo gate hacia "ambiguous"."""
+    dashboards/reasoning, no como un segundo gate hacia "ambiguous".
+
+    P3 (H53): "high" exige al menos `corr_min_groups_for_high` grupos
+    disponibles. Con menos, el máximo es "medium" -- la renormalización
+    hace que un único grupo valga 100% del score, y eso no es
+    corroboración (caso real de H52: T3 con ML solo -> 82,8 -> "high",
+    incluido el propio bastion .139)."""
     if ambiguous:
         return "ambiguous"
     if score <= settings.corr_band_low_max:
         return "low"
     if score <= settings.corr_band_medium_max:
+        return "medium"
+    if n_available < settings.corr_min_groups_for_high:
         return "medium"
     return "high"
 
@@ -216,13 +224,19 @@ def compute_corroboration(
         if max(scores) - min(scores) >= settings.corr_disagreement_threshold:
             ambiguous = True
 
-    band = _band(score, ambiguous, settings)
+    band = _band(score, ambiguous, len(available), settings)
 
     reasoning = [g.detail for g in groups]
     reasoning.append(
         f"score={score:.1f}/100 sobre {weight_available:.0f}/100 de peso disponible "
         f"({len(available)}/{len(groups)} grupos instrumentados)"
     )
+    if (not ambiguous and score > settings.corr_band_medium_max
+            and len(available) < settings.corr_min_groups_for_high):
+        reasoning.append(
+            f"band limitada a 'medium': {len(available)} grupo(s) disponible(s), "
+            f"'high' exige {settings.corr_min_groups_for_high} (P3)"
+        )
     if ambiguous:
         reasoning.append(
             "grupos de evidencia en desacuerdo fuerte -- escalado a aprobación aunque "

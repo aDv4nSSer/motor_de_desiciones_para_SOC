@@ -210,3 +210,83 @@ class TestDegradacionConGracia:
             enrichment=None, settings=settings,
         )
         assert len(result.reasoning) == 5  # 4 grupos + 1 línea de resumen
+
+
+class TestDiversidadMinimaParaHigh:
+    """P3 (H53): ningún grupo solo alcanza para "high"."""
+
+    def test_solo_ml_con_risk_1_queda_medium_nunca_high(self) -> None:
+        """El caso de H52: sin TI, firma ni contexto, el score renormalizado
+        es 100*ml (82,8 para el bastion .139). Con risk_score=1.0 da 100."""
+        settings = _settings()
+        result = compute_corroboration(
+            risk_score=1.0, classtype="", classtype_override=False, attack_mapped=False,
+            enrichment=None, settings=settings,
+        )
+        assert result.score == 100.0
+        assert [g.name for g in result.groups if g.available] == ["ml"]
+        assert result.band == "medium"
+        assert result.ambiguous is False
+        assert any("P3" in line for line in result.reasoning)
+
+    def test_solo_ml_bajo_sigue_en_low(self) -> None:
+        """El cap solo baja "high" a "medium": low/medium no cambian."""
+        result = compute_corroboration(
+            risk_score=0.2, classtype="", classtype_override=False, attack_mapped=False,
+            enrichment=None, settings=_settings(),
+        )
+        assert result.band == "low"
+        assert not any("P3" in line for line in result.reasoning)
+
+    def test_ml_y_ti_altos_y_de_acuerdo_siguen_llegando_a_high(self) -> None:
+        enrichment = EnrichmentResult(
+            src_ip="1.2.3.4", abuseipdb_available=True, abuseipdb_score=90,
+            otx_available=True, otx_pulse_count=10,
+        )
+        result = compute_corroboration(
+            risk_score=0.9, classtype="", classtype_override=False, attack_mapped=False,
+            enrichment=enrichment, settings=_settings(),
+        )
+        assert len([g for g in result.groups if g.available]) == 2
+        assert result.band == "high"
+
+    def test_grupo_sin_peso_para_desacuerdo_igual_cuenta_para_diversidad(self) -> None:
+        """Dos mecanismos distintos: con ti por debajo de
+        corr_min_weight_for_disagreement, el desacuerdo no lo compara (un solo
+        grupo comparable -> nunca ambiguous), pero la diversidad sí lo cuenta
+        (2 disponibles -> "high" permitido)."""
+        settings = _settings(corr_weight_ti=10.0)  # < corr_min_weight_for_disagreement (15)
+        enrichment = EnrichmentResult(
+            src_ip="1.2.3.4", abuseipdb_available=True, abuseipdb_score=40,
+            otx_available=False,
+        )
+        result = compute_corroboration(
+            risk_score=1.0, classtype="", classtype_override=False, attack_mapped=False,
+            enrichment=enrichment, settings=settings,
+        )
+        # (20*1.0 + 10*0.4) / 30 = 80 -> sobre el umbral de "high"
+        assert result.score == 80.0
+        assert result.ambiguous is False  # ml 1.0 vs ti 0.4 discrepan 0.6, pero ti no es comparable
+        assert result.band == "high"
+
+    def test_dos_grupos_en_desacuerdo_quedan_ambiguous_no_medium(self) -> None:
+        """Con 2 grupos comparables que discrepan, manda el desacuerdo
+        ("ambiguous"), no el cap de diversidad: son reglas independientes."""
+        enrichment = EnrichmentResult(
+            src_ip="1.2.3.4", abuseipdb_available=True, abuseipdb_score=0,
+            otx_available=True, otx_pulse_count=0,
+        )
+        result = compute_corroboration(
+            risk_score=1.0, classtype="", classtype_override=False, attack_mapped=False,
+            enrichment=enrichment, settings=_settings(),
+        )
+        assert result.band == "ambiguous"
+        assert not any("P3" in line for line in result.reasoning)
+
+    def test_umbral_configurable(self) -> None:
+        """corr_min_groups_for_high=1 devuelve el comportamiento anterior."""
+        result = compute_corroboration(
+            risk_score=1.0, classtype="", classtype_override=False, attack_mapped=False,
+            enrichment=None, settings=_settings(corr_min_groups_for_high=1),
+        )
+        assert result.band == "high"

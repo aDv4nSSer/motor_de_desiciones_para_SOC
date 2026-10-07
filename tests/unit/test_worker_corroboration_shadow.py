@@ -209,9 +209,10 @@ class TestInvariancia:
 
     def test_sin_ti_disponible_el_score_es_solo_ml(self, mocker) -> None:
         record, _, _ = _run(mocker, 3, PUBLIC_IP, False, None, {"r1_min_tier": 5})
-        # risk_score 0.93 renormalizado sobre g_ml sola -> 93/100.
+        # risk_score 0.93 renormalizado sobre g_ml sola -> 93/100, pero con
+        # un solo grupo disponible la banda se capa en "medium" (P3, H53).
         assert record.corroboration_score == 93.0
-        assert record.corroboration_band == "high"
+        assert record.corroboration_band == "medium"
         assert record.corroboration_ambiguous is False
 
 
