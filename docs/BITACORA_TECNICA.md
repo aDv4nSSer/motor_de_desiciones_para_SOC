@@ -2218,7 +2218,78 @@ Verificado contra la infraestructura real antes de escribir código:
 
 ---
 
+> **H51:** número reservado. Corresponde a trabajo de otra sesión, pendiente de documentar.
+
+## H52 — Score de corroboración ponderado en MODO SOMBRA: wireado al worker y buscable en `soc-responses-*`, sin tocar el gate de R2
+
+**Fecha:** 2026-10-07 (-03). Código: `659ebc0`, `fe58bdb`, `6973d06`, `233407e`. Scoring ya existente en `e5d0280` (`motor/scoring/corroboration.py`, no se modificó).
+
+**Problema:** el gate de autobloqueo (`worker.py`, `corroborated = corroboration_count >= 2`) exige dos fuentes de TI externas. Con AbuseIPDB casi siempre sin cuota no se cumple casi nunca: ~98,8% de los T3 terminan en "pendiente de aprobación", y 31.559 de 31.560 aprobaciones expiraron sin que nadie las resolviera desde el 30-sep. Antes de reemplazar el gate hay que medir qué haría el score ponderado con tráfico real. Por eso el score corre en modo sombra: se calcula y se audita, pero no decide nada.
+
+### Qué se wireó
+
+- **`response/worker.py:process_task()`:** después de R1 y antes de R2, para `tier >= 2` (el mismo gate que `rules.yaml`), llama `compute_corroboration(risk_score, classtype, classtype_override, attack_mapped, enrichment, settings)`. `attack_mapped` sale de `attack_fields(classtype)`. Guarda `corroboration_score/_band/_ambiguous/_groups` en el `ResponseRecord` y escribe una línea de log `corroboración sombra score=… band=… ambiguous=… count=…`. Todo va dentro de un `try/except` con el mismo patrón que `rules.yaml`: si falla, se loguea `corroboración sombra falló, sin score`, los campos quedan en su default y la rama R2 sigue igual. **La rama R2 no lee ninguno de estos campos.**
+- **`response/schemas.py:ResponseRecord`:** cuatro campos opcionales con default seguro (`0.0`/`""`/`False`/`[]`). Viajan solos por `to_audit_dict()` a `soc:response:audit`.
+- **`response_audit_indexer.py`:** `build_content()`, en la rama `response`, extrae `corroboration_score/_band/_ambiguous` solo si `band` no está vacío (un `0.0` por default no es un score), y `corroboration_count` desde `enrichment`. `INDEX_MAPPINGS` los declara `float`/`keyword`/`boolean`/`integer`. `corroboration_groups` queda solo en `payload`, sin indexar, porque trae texto libre en `detail`.
+- **Destino correcto:** el `ResponseRecord` va a **`soc-responses-*`** (`response_audit_indexer`), **no a `soc-decisions`**, que es la auditoría del Fast Path y no se tocó. `rules_fired`/`reasoning` (`1da3670`) siguen viviendo solo dentro de `payload`; los campos de corroboración sí quedaron buscables a propósito.
+- **`scripts/corroboration_shadow_report.py`:** reporte de solo lectura. (1) Invariancia: recalcula la rama R2 desde los insumos guardados (tier, `corroboration_count`, safelist, `event_age_seconds` contra el umbral stale) y la compara con lo registrado. (2) Distribución tier × acción × bloqueo. (3) Contingencia T3 `band × (count >= 2)` con las discrepancias por `trace_id`. Excluye la ventana de H25. `233407e` corrige un caso borde: el audit guarda `round(age, 1)` y el worker compara la edad sin redondear, así que un `3600.0` registrado puede caer de cualquiera de los dos lados del umbral.
+
+**Tests:** `tests/unit/test_worker_corroboration_shadow.py` (40). Cubre: invariancia en 13 escenarios T2/T3 (corroborado o no, count 0/1, safelist, stale, sin enrichment, `r2_min_tier=2`), corriendo `process_task` con el score real y con uno forzado a `band=high, score=100`: block, acción, caso y las llamadas a `respond_block`/aprobación/enforcer salen idénticos; fallas de `compute_corroboration` y de `attack_fields`; T0/T1 sin cálculo; extracción en el indexer, y cadena hash mixta con docs viejos y nuevos. `pytest tests/`: **558 → 598 passed**. `ruff check motor/ tests/` limpio; bandit del pre-commit sin hallazgos.
+
+### Contexto del retraso del deploy (no relacionado con H52)
+
+- El reinicio de `.140` de las 08:56:58 dejó `redis-server` en crash loop por un AOF incremental truncado. Antonio lo reparó con `redis-check-aof --fix` (perdió 467 bytes, el último comando) y levantó a mano `motor-soc`, `response-worker` y `response-audit-indexer` (habían quedado en "Dependency failed") a las 11:34. Se documenta aparte.
+- El mismo reinicio dejó `net.ipv4.ip_forward=0` en `.139`. `99-soc-hardening.conf` lo fija en 0 y pisó un primer `99-ip-forward.conf` por orden alfabético, así que `.140` quedó sin egress (sin DNS, sin TI, sin `git pull`) hasta que se corrigió la línea dentro de `99-soc-hardening.conf`. Mientras duró el corte, R1 corrió sin TI: la línea base de las 15:12 se descartó por eso.
+
+### Deploy a `.140`
+
+- **Línea base válida** (15:23 -03, código `ecd42b9`, última hora, TI ya con egress): 5.672 docs `response`. T2 `alertar_crear_caso` 4.465; T3 `pendiente/block_pending_approval` 85, `pendiente/block_skipped` 1.102, `ninguna/block_skipped` 20. **T3 pendiente: 1.187/1.207 = 98,3%**. Ejemplos T3: `dcab9afc-0a6c-4ddd-9e38-f40aff91bfae`, `38705d80-b3f1-4299-9a84-0a13b722156c`, `4d408ab9-2284-462a-8482-4a3246324de3`, `08723d65-7a58-474a-8791-21b114c2beec`, `6693b7ed-71ba-4198-99ef-415a7204a8b7`. AbuseIPDB estuvo `available=False` en el 100% por cuota agotada, no por el egress. Eso no distorsiona la comparación línea base vs. post-deploy (en las dos ventanas pasa lo mismo), pero implica que `corroboration_count >= 2` es prácticamente inalcanzable en ambas: el 98,3% de pendientes es en parte un artefacto de la cuota.
+- **`git pull --ff-only`** en `~/tesis/repo`: `ecd42b9` → `6973d06` (15:23:55 -03), fast-forward limpio. Después `233407e` (solo el script). Rollback: `ecd42b9`. El formato de la cadena no cambia, solo se agregan campos.
+- **`dynamic: false` otra vez (mismo gotcha que H50 Parte A):** el template nuevo recién aplica desde el rollover. Para el índice abierto se aplicó **`PUT soc-responses-2026.10.07/_mapping`** aditivo con los 4 campos: `200 {"acknowledged":true}`, de 21 a 25 propiedades, `dynamic` sigue en `false`, 68.878 docs sin tocar. El template `soc-responses` lo actualizó el bootstrap del indexer al reiniciar (antes del rollover de las 21:00 -03).
+- **Restarts (Antonio, sudo interactivo), 15:24:49 -03:** primero `response-audit-indexer` (PID 72028) y después `response-worker` (PID 72034), `NRestarts=0`. `lstart` de ambos posterior al pull de las 15:23:55, así que corren el código nuevo. El worker arrancó con `mode=enforce enforcer=wazuh_api r1_tier>=2 r2_tier>=3`. `motor-soc` no se tocó; `/health` 200.
+
+### Verificación en producción (15:34 -03, ~9,5 min de tráfico)
+
+- **Campos poblados y buscables:** 865 docs `response` desde el corte: 864 con `corroboration_band/_score/_ambiguous` y 865 con `corroboration_count`. El único sin `band` (`aeca2c66-7308-42be-b2a6-d26217681421`, `chain_seq 1512201`) lo procesó el worker viejo (`processed_at` 18:24:49,6Z, payload sin ninguna clave `corroboration_*`) y lo publicó al stream a las 18:24:50,5. 0 docs pre-restart con `band`. Las queries por `term corroboration_band` devuelven hits.
+- **Evidencia:** `trace_id 51161093-3da7-4088-b672-7faa5853e906`, `soc-responses-2026.10.07/_doc/1791397949279-0`, `chain_seq 1513064`, T3, **score 92,3, band `high`, `corroboration_count` 1**, `alertar_pendiente_aprobacion` / `block_pending_approval`. Grupos: `ml` 0,828; `ti` 1,0 (OTX 25 pulses, saturación 5); `signature` y `context` no disponibles, como corresponde (H50, sin acumulador).
+- **INVARIANCIA: 1.090/1.090 docs post-restart coinciden con la rama R2 recalculada (0 discrepancias).** Sobre la hora previa (código viejo, para validar el propio recálculo): 5.698/5.698.
+- **Distribución post-restart:** T2 `alertar_crear_caso` 859; T3 `pendiente/block_pending_approval` 227, `ninguna/block_skipped` 3 (safelist), `pendiente/block_skipped` 1 (stale). **T3 pendiente: 228/231 = 98,7%**, contra 98,3% en la línea base: la acción recomendada no cambió. Lo que sí cambió es el reparto `block_skipped` (stale) vs. `block_pending_approval` dentro de "pendiente". Depende de cuánto atraso tenga el worker respecto del umbral de 1 h (H38: `event_age` post-restart entre 60 s y 1 h, `lag` de `soc:response:tasks` en 7.208), no del modo sombra.
+- **Hash-chain:** `verify_chain` sobre `soc-responses-2026.10.07` completo (69.884 docs, `chain_seq 1443196 → 1513079`): **0 problemas**. Empalme del restart: `1512201` (último del worker viejo) → `1512202` (18:24:51,4Z, el primero con `band`), `prev_hash` correcto, sin salto.
+- **Logs:** `worker.log` desde `Response worker iniciando` (15:24:51): 886 líneas `corroboración sombra score=`, **0 `sombra falló`, 0 `Traceback`, 0 `ERROR`**. El journal de `response-audit-indexer` no se puede leer (`sudo` interactivo, H44). Evidencia indirecta de que no hubo HTTP 400: el grupo `response-audit-indexer` quedó con `pending 0` y `lag 0`, y la cadena avanzó sin huecos (un 400 deja el mensaje sin `XACK`).
+
+### Primera lectura de la contingencia (no concluyente, ventana de 9,5 min)
+
+T3 con score: 231 (≈1.460 T3/h), 132 IPs distintas pero solo 8 /24 (`91.92.42.0/24` = 181).
+
+| band | count ≥ 2 | count < 2 |
+|---|---|---|
+| low | 0 | 0 |
+| medium | 0 | 0 |
+| high | 0 | **206** (89,2%) |
+| ambiguous | 0 | 25 |
+
+- `high & ¬corroborado`: 206, por ejemplo `37cf76f2-83ca-480d-be52-447a222e5c2c` (92,3, count 1, `91.92.42.64`). `¬high & corroborado`: 0, porque no hubo ningún T3 con count ≥ 2 (AbuseIPDB sin cuota).
+- **Advertencia para la decisión del gate:** con `signature`/`context` sin instrumentar y TI no disponible, el score se renormaliza sobre `ml` sola. Un T3 con `risk_score` 0,83 queda en 82,8 → `high` sin ninguna corroboración externa. Pasó en la muestra: `95.40.160.2` y `200.54.12.139` (el propio bastion, protegido por la safelist en `respond_block`) con count 0. Si hoy se reemplazara el gate por `band == "high"`, se autobloquearía ~89% de los T3 y, cuando TI está caída, decidiría solo el ML. No se cambió nada: queda como insumo para la decisión.
+
+### Período de modo sombra propuesto
+
+Mínimo **72 h** continuas (tres ciclos día/noche y tres resets diarios de cuota de AbuseIPDB a las 00:00 UTC), y además:
+- **≥ 100 /24 distintas** con T3 puntuado. La unidad es la /24 y no el evento, porque una sola campaña domina el volumen. Con 0 problemas en 100 entidades independientes, la cota superior al 95% de la tasa es ≈ 3% (regla de tres: 3/N).
+- **≥ 20 T3 con `corroboration_count >= 2`**, para poder medir la celda `¬high & corroborado`. Si no se alcanza porque AbuseIPDB sigue sin cuota, la comparación contra el gate binario no es informativa y hace falta revisión humana de una muestra.
+- **Revisión de una muestra de ≥ 50 IPs `high & ¬corroborado`**, para estimar cuántas serían bloqueos correctos. Es lo único que separa "el gate es demasiado estricto" de "el score es demasiado laxo".
+
+**Gate real: sin cambios. La decisión de wirearlo la toma Antonio con estos datos.**
+
+**PENDIENTE:** cuando se cumplan las 72 h, las 100 /24 y los 20 T3 con count ≥ 2 (o se cierre la revisión humana), correr `python3 ../scripts/corroboration_shadow_report.py --since 2026-10-07T18:24:50Z --max-list 50` desde `~/tesis/repo/motor` en `.140` y reportar la contingencia `band == "high"` vs. `corroboration_count >= 2` con sus discrepancias.
+
+**Estado: MODO SOMBRA DESPLEGADO Y VERIFICADO EN PRODUCCIÓN. Gate de R2 intacto.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
+
+- **Comparación final del modo sombra de corroboración (H52):** criterio en H52 (72 h + ≥ 100 /24 con T3 puntuado + ≥ 20 T3 con `corroboration_count >= 2` o revisión humana de ≥ 50 IPs `high & ¬corroborado`). Antes de wirear el gate, decidir qué hacer cuando TI no está disponible: hoy el score se renormaliza a ML sola y un T3 típico queda en `high`.
+- **H51 sin documentar** (número reservado, trabajo de otra sesión).
 
 - **Fuente de classtype para el Fast Path (H50):** hoy no existe. Decidir si se construye (Vector agrega `flow_id` a los flows y lleva las alertas al motor, que las guarda en Redis `alert:{flow_id}` con TTL para un lookup O(1)) sabiendo que activa el override T3 en producción con `enforce`, o si en la tesis se declara que el override y ATT&CK operan solo cuando el classtype llega. `category` de las alertas trae la descripción; `attck_mapping.lookup()` ya la acepta.
 - ~~**Restart de `response-worker` para activar la Parte B de H50**~~ → hecho el 2026-10-05 (23:25:03 y, con el fix `ecd42b9`, 23:47:33 -03); verificado con el bloqueo real `6ca5c2ed` (H50).
