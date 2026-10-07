@@ -149,6 +149,19 @@ def build_content(msg_id: str, fields: dict[str, Any]) -> dict:
                    block_enforced=block.get("enforced"),
                    event_age_seconds=payload.get("event_age_seconds"),
                    case_id=payload.get("case_id"))
+        # H52: corroboración ponderada en modo sombra + el conteo del gate
+        # real, top-level para compararlos con una sola query. Solo si el
+        # score se calculó (band no vacío): un 0.0 por default (tier < 2 o
+        # cálculo fallido) no es un score real. Payloads anteriores no los
+        # traen y quedan fuera (None se descarta abajo).
+        # corroboration_groups queda solo en payload (lista con texto libre).
+        if payload.get("corroboration_band"):
+            doc.update(corroboration_score=payload.get("corroboration_score"),
+                       corroboration_band=payload.get("corroboration_band"),
+                       corroboration_ambiguous=payload.get("corroboration_ambiguous"))
+        enrichment = payload.get("enrichment")
+        if isinstance(enrichment, dict):
+            doc["corroboration_count"] = enrichment.get("corroboration_count")
     else:
         doc["event_type"] = "other"
     doc["payload"] = payload
@@ -201,6 +214,11 @@ INDEX_MAPPINGS = {
         "block_enforced": {"type": "boolean"},
         "event_age_seconds": {"type": "float"},
         "case_id": {"type": "keyword"},
+        # H52: corroboración ponderada (modo sombra) vs. gate real
+        "corroboration_score": {"type": "float"},
+        "corroboration_band": {"type": "keyword"},
+        "corroboration_ambiguous": {"type": "boolean"},
+        "corroboration_count": {"type": "integer"},
         "chain_seq": {"type": "long"},
         "prev_hash": {"type": "keyword"},
         "hash": {"type": "keyword"},
