@@ -28,6 +28,7 @@ from auth import (
     require_role_session,
 )
 from auth import login as auth_login
+from constants import T3_CLASSTYPES
 from dashboard import (
     DECISIONS_MAX_LIMIT,
     RESPONSE_LOOKUP_MAX_IDS,
@@ -78,10 +79,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("motor")
 
-T3_CLASSTYPES = {
-    "trojan-activity", "shellcode-detect", "web-application-attack",
-    "attempted-admin", "attempted-user", "successful-admin", "policy-violation",
-}
 
 TIER_NAMES = {0: "T0_BENIGNO", 1: "T1_BAJO", 2: "T2_MEDIO", 3: "T3_CRITICO"}
 DECISIONS  = {0: "ALLOW", 1: "LOG", 2: "ALERT", 3: "BLOCK"}
