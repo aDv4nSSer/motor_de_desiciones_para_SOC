@@ -2348,13 +2348,34 @@ Las bandas T3 pasaron de **63,9% `high` / 36,0% `ambiguous`** (línea base) a **
 
 Haber visto la IP en **una** hora previa es evidencia positiva débil, pero con desacuerdo bilateral cuenta como contradicción. Lo mismo pasa con una alerta no crítica: correlacionar una alerta de Suricata **baja** la confianza en vez de subirla. Es la misma lógica de "evidencia unilateral" que ya se aplicó al recidivismo 0. **Decisión pendiente (Antonio):** sacar `context` y `signature` del chequeo de desacuerdo (que solo sumen), recalibrar la saturación, o mantenerlo. No se cambió nada.
 
-**Estado: GRUPOS `signature` Y `context` + P3 DESPLEGADOS Y VERIFICADOS EN MODO SOMBRA. Gate de R2 intacto.**
+### Cierre de P4: solo `ml` y `ti` pueden marcar `ambiguous` (`a90df02`, 2026-10-07 20:18 -03)
+
+**Regla generalizada:** `signature` y `context` **nunca** entran al chequeo de desacuerdo, sin importar su score (`corroboration.py:is_ambiguous`, `_DISAGREEMENT_GROUPS = {ml, ti}`). Siguen entrando al promedio ponderado sin cambios. **Por qué:** son evidencia unilateral. Un score bajo (recidivismo de 1 hora previa = 0,2, o una alerta no crítica = 0,3) es una señal positiva más débil, no evidencia en contra. Es la misma lógica que ya se aplicaba al recidivismo 0, extendida a cualquier score. El desacuerdo real ML contra TI no se toca.
+
+**Tests:** 4 nuevos en `test_corroboration_scoring.py`: recidivismo 0,2 con ML/TI altos → `high` (70,2), no `ambiguous`; `misc-attack` 0,3 con TI 1,0 → `medium` (65,1), no `ambiguous`; ML 1,0 contra TI 0,0 → sigue `ambiguous`, también con firma crítica y recidivismo saturado presentes. Hay además una **fixture de regresión con los 306 `ambiguous` reales** de la ventana 19:43:55–19:57:00Z (`tests/fixtures/h53_ambiguous_regression.json`, solo `trace_id` y vectores de grupos, sin IPs): con P4 siguen `ambiguous` exactamente los 183 de ML contra TI y 0 de los 120 de `context` y los 3 de `signature`. `pytest tests/`: 647 → **651 passed**; 107 pasan en `.140`. Restart de `response-worker` (Antonio): **20:18:40 -03**, PID 113205, `NRestarts=0`. El indexer no se reinició: no hay campos nuevos.
+
+**Cómo comparar: no vale comparar % crudos de `ambiguous` entre ventanas distintas.** La mezcla de tráfico cambia hora a hora: con el mismo código previo a P4, T3 `ambiguous` fue 53,1% entre 16:43 y 16:57 y **1,9% entre 19:00 y 20:00**. El 36,0% de la línea base de H52 tampoco sirve de referencia: otra ventana, otro código, y en ese momento `context` y `signature` no existían. La comparación correcta es **recalcular los mismos documentos con las dos reglas** desde los grupos guardados en `payload.corroboration_groups`. Es la que se reporta abajo; el recálculo con la regla que corría en vivo coincide con lo guardado en el 100% de los docs de ambas ventanas.
+
+| Mismo tráfico, regla vieja → P4 | T3 `ambiguous` | T2 `ambiguous` |
+|---|---|---|
+| Ventana H53, 16:43:55–16:57:00 -03 (339 T3 / 1.125 T2, corría la regla vieja) | **180 → 133: 53,1% → 39,2%** | 126 → 50: 11,2% → 4,4% |
+| Post-restart, 20:18:40–20:28 -03 (218 T3 / 481 T2, corre P4) | 6 → 4: 2,8% → 1,8% | 63 → 9: 13,1% → 1,9% |
+
+- En la ventana H53, 47 T3 dejan de ser `ambiguous`: **44 pasan a `high`** (los de recidivismo bajo) y **3 a `medium`** (los 3 `misc-attack`: la firma 0,3 sigue bajando el promedio a 65,1). Los 133 que quedan son desacuerdo real ML contra TI (p. ej., OTX con 1 pulse = 0,2 contra ML 0,83).
+- **Estado actual en vivo (P4, post-restart): T3 `ambiguous` 1,8% (4/218), `high` 97,2% (212/218), `medium` 2 (0,9%).**
+- **Invariancia post-restart: 699/699** coinciden con la rama R2 recalculada. T3 pendiente: 216/218 = **99,1%**.
+- **Cadena:** `verify_chain` sobre `soc-responses-2026.10.07` completo (107.226 docs, `1443196 → 1550421`): **0 problemas**. Empalme del restart `1549699` (23:18:39,6Z) → `1549700` (23:18:41,3Z) con `prev_hash` correcto.
+- **Logs del worker** desde el restart: 725 líneas de score sombra, 0 `sombra falló`, 0 `Traceback`, 0 `ERROR`.
+- Dato de contexto: a ~4 h del deploy, `context` ya aporta en el 97,7% de los T3 (recidivismo ≥ 5 en 345 de 699 docs T2+). La campaña `91.92.42.0/24` vuelve hora tras hora, como se esperaba. Como `ml` y `context` son una sola familia, eso no alcanza para `high` sin TI.
+
+**Estado: GRUPOS `signature` Y `context` + P3 + P4 DESPLEGADOS Y VERIFICADOS EN MODO SOMBRA. Gate de R2 intacto.**
 
 ---
 
 ## Pendientes detectados (no resueltos hoy)
 
-- **Desacuerdo de grupos unilaterales (H53):** el recidivismo bajo (score 0,2) y las alertas no críticas (`misc-attack`, 0,3) disparan `ambiguous` contra ML/TI altos: 154 + 3 de los `ambiguous` en los primeros 13 min. Decidir si `context`/`signature` salen del chequeo de desacuerdo antes de usar las bandas para algo.
+- ~~**Desacuerdo de grupos unilaterales (H53)**~~ → **resuelto con P4** (`a90df02`): solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%.
+- **Alertas no críticas bajan el promedio (H53):** `signature` 0,3 (`misc-attack`) sigue en el promedio ponderado: un T3 con ML/TI altos pasa de ~92 a 65,1 (`medium`) cuando se le correlaciona una alerta no crítica. Ya no es `ambiguous`, pero la alerta sigue restando confianza. Decidir si `signature` debería ser "solo suma" también en el promedio.
 - **Tope de 64 miembros del acumulador sin ejercer en producción (H53):** re-medir `ZCARD` máximo de `risk:*` y `used_memory` cuando haya ≥ 3 días de acumulación.
 
 - **⚠️ CONDICIÓN FORMAL (H52): `band == "high"` no puede ser gate de R2** mientras AbuseIPDB siga sin cuota y no haya un segundo proveedor de TI redundante. Salida: TI disponible en ≥ 95% de los T3 y período de sombra repetido con esa TI. Ver H52 y la especificación ampliada, sección 9, punto 14.

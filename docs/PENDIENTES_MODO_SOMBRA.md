@@ -1,7 +1,7 @@
 # Seguimiento: período de modo sombra del score de corroboración ponderado
 
 **Creado:** 2026-10-07 (H52). **Dueño de las decisiones:** Antonio.
-**Estado:** prerrequisitos **NO cumplidos** (P1, P2 y P4 abiertos; P3 hecho en H53): el período válido todavía no empezó.
+**Estado:** prerrequisitos **NO cumplidos** (P1 y P2 abiertos; P3 y P4 hechos en H53): el período válido todavía no empezó.
 
 El score de corroboración ponderado (`motor/scoring/corroboration.py`), con sus 4 grupos instrumentados desde H53 (`signature` por correlación con `suricata-alerts-*`, ~1% de los T3; `context` por recidivismo acotado), corre en **modo sombra** en `response-worker` desde el 2026-10-07 15:24:49 -03: se calcula y se audita en `soc-responses-*` (`corroboration_score/_band/_ambiguous/_count`), pero **no decide nada**. El gate real de R2 sigue siendo `corroboration_count >= 2` (`motor/response/worker.py`). Este archivo define cuándo los datos de la sombra sirven para decidir si se reemplaza el gate. Contexto completo: `docs/BITACORA_TECNICA.md`, H52.
 
@@ -16,7 +16,7 @@ Mientras alguno siga abierto, lo que acumule la sombra es evidencia del problema
 | P1 | **Rotar la API key de AbuseIPDB** (marcada "OBLIGATORIO rotar (estuvo expuesta)" en `config.py` desde 2026-07-06) | ❌ No rotada: misma huella sha256 en el `.env` y en los 6 backups de `.140` desde 2026-09-03 | Huella del `.env` distinta de `0170c4a5f8` + entrada en la bitácora |
 | P2 | **TI disponible de verdad** en una de dos variantes: **(a)** AbuseIPDB con cuota suficiente para el volumen, o **(b)** OTX solo con `corr_otx_pulse_saturation` calibrada con datos (hoy 5, valor inicial) y decisión explícita de aceptar bloquear sin redundancia de proveedor | ❌ AbuseIPDB: 1.000/día, se agota ~2 h después del reset de 00:00 UTC. OTX: no disponible en ~16% de los T3 de la primera ventana | (a) `abuseipdb_available = true` en ≥ 95% de los T3 de una ventana de 24 h; (b) `otx_available = true` en ≥ 95% de los T3 + calibración documentada |
 | P3 | Decidir qué hace el score cuando el grupo `ti` no está disponible (antes se renormalizaba a ML solo y un T3 típico daba `high`) | ✅ **Implementado y verificado (H53, 2026-10-07):** `"high"` exige ≥ 2 familias de evidencia (`ml`+`context` cuentan como una). En producción: 199 docs con solo la familia `ml`, los 199 en `"medium"` | `corr_min_evidence_families_for_high` en `config.py`; tests en `test_corroboration_scoring.py` y `test_recidivism_context.py` |
-| P4 | Decidir si `context` (recidivismo bajo) y `signature` (alertas no críticas) salen del chequeo de desacuerdo: hoy generan `ambiguous` contra ML/TI altos (154 + 3 en los primeros 13 min, H53) | ❌ Abierto, decisión de Antonio | Decisión registrada en la bitácora; si cambia `corroboration.py`, con sus tests |
+| P4 | Decidir si `context` (recidivismo bajo) y `signature` (alertas no críticas) salen del chequeo de desacuerdo | ✅ **Resuelto (H53, `a90df02`, 2026-10-07):** solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%; en vivo post-restart: 1,8% | `is_ambiguous()` en `corroboration.py`; fixture de regresión con 306 casos reales |
 
 ---
 
