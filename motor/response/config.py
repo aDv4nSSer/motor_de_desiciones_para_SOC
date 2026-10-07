@@ -114,7 +114,54 @@ class ResponseSettings(BaseSettings):
     # 2+ fuentes corroborando -> bloqueo automático (tabla sección 4 de la
     # especificación). Con menos, R2 no ejecuta: queda como pendiente de
     # aprobación humana (Operador N1+).
+    # TODO(corroboración ponderada, 7-oct-2026): reemplazado como gate real
+    # de R2 por `motor/scoring/corroboration.py` (bandas sobre `score`, ver
+    # abajo). Se deja esta constante sin borrar porque los tests y el gate
+    # anterior la siguen usando hasta que se apruebe wirear el reemplazo en
+    # worker.py -- ver reports/Corroboracion ponderada para respuesta
+    # autonoma SOAR.md.
     min_corroborating_sources_for_autoblock: int = 2
+
+    # ── Score de corroboración ponderado (motor/scoring/corroboration.py) ──
+    # Pesos máximos por grupo de evidencia, suman 100. Un grupo no
+    # disponible para un evento (ver GroupScore.available) se excluye del
+    # denominador de la normalización -- no se cuenta como 0. Pesos
+    # iniciales según reports/Corroboracion ponderada para respuesta
+    # autonoma SOAR.md (firma/ATT&CK > TI externa > ML ~= contexto), sujetos
+    # a recalibración con datos reales de producción (soc-feedback).
+    corr_weight_signature: float = 35.0   # classtype crítico + ATT&CK
+    corr_weight_ti: float = 25.0          # AbuseIPDB + OTX (fusión sub-lineal)
+    corr_weight_ml: float = 20.0          # risk_score (LightGBM + IsolationForest)
+    corr_weight_context: float = 20.0     # recidivismo/kill-chain -- NO instrumentado
+                                           # todavía (sin historical-context-svc ni
+                                           # acumulador Redis); queda siempre
+                                           # `available=False` hasta construirlo.
+
+    # Bandas de decisión sobre el score renormalizado 0-100 (ver
+    # CorroborationResult.band). Alineadas a T0-T3 de motor/model.py:tier(),
+    # pero el GATE de autoblock en R2 es band=="high", no el tier solo.
+    corr_band_low_max: float = 39.0        # <= esto: band "low"
+    corr_band_medium_max: float = 69.0     # <= esto: band "medium"
+    # > corr_band_medium_max y sin desacuerdo entre grupos: band "high"
+    # (autoblock elegible). No hay techo superior -- la ambigüedad viene
+    # SOLO del desacuerdo entre grupos (ver corr_disagreement_threshold),
+    # nunca de que el score sea "demasiado alto". Referencia documental de
+    # dónde empieza "alta confianza" para dashboards/reasoning.
+    corr_band_high_max_reference: float = 84.0
+
+    # Si el grupo de mayor score disponible y el de menor score disponible
+    # (entre los que tienen peso >= corr_min_weight_for_disagreement)
+    # difieren más que esto, el evento se marca `ambiguous` sin importar el
+    # score agregado -- un C=75 por consenso no es lo mismo que un C=75 por
+    # un grupo en 1.0 contra otro en 0.0 (ver corroboration.py).
+    corr_disagreement_threshold: float = 0.6
+    corr_min_weight_for_disagreement: float = 15.0
+
+    # Normalización de OTX: pulse_count es un conteo sin cota superior
+    # natural (a diferencia de abuseipdb_score, que ya es 0-100). Se satura
+    # a 1.0 en este valor -- un puñado de pulses ya es evidencia fuerte
+    # (reportes curados por analistas, no autogenerados, ver enrichment.py).
+    corr_otx_pulse_saturation: int = 5
 
     # ── R2: enforcer Wazuh API ─────────────────────────────────────────
     enforcer_backend: str = "dry_run"    # dry_run | wazuh_api
