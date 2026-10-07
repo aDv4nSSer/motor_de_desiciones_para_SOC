@@ -14,6 +14,10 @@ Lee los documentos event_type="response" de soc-responses-* en una ventana y rep
    con las discrepancias high & no-corroborado y no-high & corroborado
    listadas por trace_id. Es la comparación que decide si el score puede
    reemplazar al gate (decisión de Antonio, no de este script).
+4. Disponibilidad real de los 4 grupos (ml, ti, signature, context) por tier,
+   cuántos aportan al score, resultado del lookup a suricata-alerts-* y
+   distribución del recidivismo (H53: signature y context ya no están
+   siempre apagados).
 
 Excluye siempre la ventana sin datos reales del Fast Path de H25
 (2026-08-18 a 2026-09-04).
@@ -131,6 +135,11 @@ def main() -> int:
     high_not_corr: list[str] = []
     corr_not_high: list[str] = []
     shadow_examples: list[str] = []
+    group_avail: Counter = Counter()
+    group_contrib: Counter = Counter()
+    scored_by_tier: Counter = Counter()
+    alert_status: Counter = Counter()
+    recid: Counter = Counter()
 
     for d in iter_docs(client, args.since, args.until):
         p = d.get("payload") or {}
@@ -160,6 +169,17 @@ def main() -> int:
         band = d.get("corroboration_band")
         if band:
             with_shadow += 1
+            tier = d.get("tier")
+            scored_by_tier[tier] += 1
+            for g in p.get("corroboration_groups") or []:
+                if g.get("available"):
+                    group_avail[(tier, g.get("name"))] += 1
+                    if g.get("contributes", True):
+                        group_contrib[(tier, g.get("name"))] += 1
+            if tier == 3:
+                alert_status[p.get("alert_lookup") or "(sin intento)"] += 1
+            r = p.get("recidivism_count")
+            recid["sin dato" if r is None else "0" if r == 0 else "1-4" if r < 5 else ">=5"] += 1
             if len(shadow_examples) < 3:
                 shadow_examples.append(
                     f"{d.get('trace_id')} T{d.get('tier')} score={d.get('corroboration_score')} "
@@ -200,6 +220,15 @@ def main() -> int:
     print(f"   no-high & corroborado (primeros {args.max_list}):")
     for x in corr_not_high:
         print("     ", x)
+    print("\n== 4. Disponibilidad de grupos (docs con score sombra)")
+    for tier in sorted(t for t in scored_by_tier if t is not None):
+        n = scored_by_tier[tier]
+        cells = "  ".join(
+            f"{g}={100 * group_avail[(tier, g)] / n:5.1f}% (aporta {100 * group_contrib[(tier, g)] / n:5.1f}%)"
+            for g in ("ml", "ti", "signature", "context"))
+        print(f"   T{tier} (n={n}): {cells}")
+    print(f"   lookup suricata-alerts (T3): {dict(alert_status)}")
+    print(f"   recidivismo (horas previas con T2+ en 30d): {dict(recid)}")
     print("\nejemplos con score sombra:")
     for x in shadow_examples:
         print("   ", x)
