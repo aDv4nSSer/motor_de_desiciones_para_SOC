@@ -98,14 +98,35 @@ def expected_r2(payload: dict, settings) -> tuple[str, str | None]:
     return ACCION_ALERTAR_PENDIENTE_APROBACION, ActionType.BLOCK_PENDING_APPROVAL.value
 
 
-def iter_docs(client: OpenSearchClient, since: str, until: str | None):
+def matches_r2(payload: dict, settings) -> bool:
+    """True si lo registrado (accion_recomendada, block.action/enforced)
+    coincide con alguna de las ramas R2 admisibles para sus insumos."""
+    block = payload.get("block") or {}
+    rec_accion = payload.get("accion_recomendada")
+    rec_action = block.get("action", "absent")
+    ok = False
+    for exp_accion, exp_action in expected_r2_options(payload, settings):
+        match = rec_accion == exp_accion and (exp_action is None or rec_action == exp_action)
+        if exp_action is None:  # corroborado: coherencia interna con respond_block
+            match = match and rec_action in (ActionType.BLOCK.value, ActionType.BLOCK_SKIPPED.value)
+        ok = ok or match
+    if rec_action != "absent":  # enforced solo si hubo bloqueo real (enforcer.respond_block)
+        ok = ok and bool(block.get("enforced")) == (rec_action == ActionType.BLOCK.value)
+    return ok
+
+
+def iter_docs(client: OpenSearchClient, since: str, until: str | None,
+              source: list[str] | None = None, min_tier: int | None = None):
     rng = {"gte": since, **({"lt": until} if until else {})}
     query = {"bool": {
-        "filter": [{"term": {"event_type": "response"}}, {"range": {"event_time": rng}}],
+        "filter": [{"term": {"event_type": "response"}}, {"range": {"event_time": rng}}]
+        + ([{"range": {"tier": {"gte": min_tier}}}] if min_tier is not None else []),
         "must_not": [{"range": {"event_time": H25_EXCLUDED}}]}}
     search_after = None
     while True:
         body = {"size": PAGE, "query": query, "sort": [{"chain_seq": "asc"}]}
+        if source is not None:
+            body["_source"] = source
         if search_after is not None:
             body["search_after"] = search_after
         r = client.request("POST", "/soc-responses-*/_search", body)
@@ -149,16 +170,8 @@ def main() -> int:
         rec_action = block.get("action", "absent")
         dist[(d.get("tier"), rec_accion, rec_action, block.get("enforced"))] += 1
 
-        ok = False
-        options = expected_r2_options(p, settings)
-        for exp_accion, exp_action in options:
-            match = rec_accion == exp_accion and (exp_action is None or rec_action == exp_action)
-            if exp_action is None:  # corroborado: coherencia interna con respond_block
-                match = match and rec_action in (ActionType.BLOCK.value, ActionType.BLOCK_SKIPPED.value)
-            ok = ok or match
-        exp_accion, exp_action = options[0]
-        if rec_action != "absent":  # enforced solo si hubo bloqueo real (enforcer.respond_block)
-            ok = ok and bool(block.get("enforced")) == (rec_action == ActionType.BLOCK.value)
+        ok = matches_r2(p, settings)
+        exp_accion, exp_action = expected_r2_options(p, settings)[0]
         if not ok:
             mismatches += 1
             if len(mismatch_examples) < args.max_list:
