@@ -13,7 +13,7 @@ Casos cubiertos:
    disponibles -> grupo no disponible (no es 0).
 4. g_ctx: sin recidivism_count (default) no disponible. Recidivismo real
    y su efecto en P3: tests/unit/test_recidivism_context.py (H53).
-5. Desacuerdo entre grupos marca `ambiguous=True` aunque el score agregado
+5. Desacuerdo entre ml y ti (solo esos dos, P4) marca `ambiguous=True` aunque el score agregado
    sea alto.
 6. Degradación: función nunca lanza, incluso con enrichment=None.
 
@@ -22,6 +22,7 @@ la justificación de diseño.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -291,3 +292,66 @@ class TestDiversidadMinimaParaHigh:
             enrichment=None, settings=_settings(corr_min_evidence_families_for_high=1),
         )
         assert result.band == "high"
+
+
+class TestDesacuerdoSoloMlTi:
+    """P4 (H53): signature y context son evidencia unilateral -- nunca
+    disparan "ambiguous", sin importar su score. Solo ml contra ti."""
+
+    TI_FUERTE = EnrichmentResult(src_ip="1.2.3.4", otx_available=True, otx_pulse_count=24,
+                                 abuseipdb_available=False)
+
+    def _corr(self, risk, enrichment, recidivism=None, classtype="", override=False, mapped=False):
+        return compute_corroboration(
+            risk_score=risk, classtype=classtype, classtype_override=override, attack_mapped=mapped,
+            enrichment=enrichment, settings=_settings(), recidivism_count=recidivism,
+        )
+
+    def test_recidivismo_bajo_contra_ml_y_ti_altos_no_es_ambiguous(self) -> None:
+        """Caso real de H53 (154 docs): 1 hora previa (score 0,2) contra
+        ML 0,83 y TI 1,0. Antes: ambiguous. Ahora entra al promedio y nada más."""
+        res = self._corr(0.83, self.TI_FUERTE, recidivism=1)
+        ctx = next(g for g in res.groups if g.name == "context")
+        assert ctx.contributes is True and ctx.score == 0.2
+        assert res.ambiguous is False
+        # (20*0.83 + 25*1.0 + 20*0.2) / 65 = 70.2 -> "high" (2 familias)
+        assert res.score == 70.2
+        assert res.band == "high"
+
+    def test_classtype_no_critico_contra_ti_fuerte_no_es_ambiguous(self) -> None:
+        """Caso real de H53 (3 docs, misc-attack): signature 0,3 contra TI 1,0.
+        Antes: ambiguous. Sigue en el promedio, así que baja el score."""
+        res = self._corr(0.83, self.TI_FUERTE, classtype="misc-attack")
+        sig = next(g for g in res.groups if g.name == "signature")
+        assert sig.available is True and sig.score == 0.3
+        assert res.ambiguous is False
+        # (20*0.83 + 25*1.0 + 35*0.3) / 80 = 65.1 -> "medium"
+        assert res.score == 65.1
+        assert res.band == "medium"
+
+    def test_ml_contra_ti_sigue_siendo_ambiguous(self) -> None:
+        enr = EnrichmentResult(src_ip="1.2.3.4", abuseipdb_available=True, abuseipdb_score=0,
+                               otx_available=True, otx_pulse_count=0)
+        assert self._corr(1.0, enr).band == "ambiguous"
+        # ...también con signature crítica y recidivismo saturado presentes.
+        res = self._corr(1.0, enr, recidivism=40, classtype="trojan-activity", override=True, mapped=True)
+        assert res.ambiguous is True and res.band == "ambiguous"
+
+    def test_regresion_306_ambiguous_reales_de_h53(self) -> None:
+        """Los 306 "ambiguous" de los primeros 13 min post-deploy de H53
+        (soc-responses-2026.10.07): solo los causados por ml contra ti siguen
+        siéndolo; los de context (120) y signature (3) dejan de serlo."""
+        from scoring.corroboration import is_ambiguous
+        from scoring.schemas import GroupScore
+
+        path = Path(__file__).resolve().parents[1] / "fixtures" / "h53_ambiguous_regression.json"
+        cases = json.loads(path.read_text())["cases"]
+        assert len(cases) == 306
+        settings = _settings()
+        still = {"ml_vs_ti": 0, "context": 0, "signature": 0}
+        for case in cases:
+            scoring = [GroupScore(**g) for g in case["groups"]
+                       if g["available"] and g.get("contributes", True) is not False]
+            if is_ambiguous(scoring, settings):
+                still[case["cause"]] += 1
+        assert still == {"ml_vs_ti": 183, "context": 0, "signature": 0}

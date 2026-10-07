@@ -189,6 +189,34 @@ def _score_context_group(
 _EVIDENCE_FAMILY = {"ml": "ml", "context": "ml", "ti": "ti", "signature": "signature"}
 
 
+#: Grupos que pueden disparar "ambiguous" (P4, H53). signature y context son
+#: evidencia unilateral: un score bajo es una señal positiva más débil, no
+#: evidencia en contra (recidivismo de 1 hora, una alerta no crítica), así
+#: que nunca entran al chequeo de desacuerdo. Sí siguen en el promedio.
+_DISAGREEMENT_GROUPS = frozenset({"ml", "ti"})
+
+
+def is_ambiguous(scoring: list[GroupScore], settings: ResponseSettings) -> bool:
+    """Desacuerdo fuerte entre los grupos bilaterales que aportan al score.
+
+    Solo `ml` y `ti` (con peso >= corr_min_weight_for_disagreement) se
+    comparan: si el más alto y el más bajo difieren al menos
+    corr_disagreement_threshold, el evento es "ambiguous". Un score=75 por
+    consenso no es lo mismo que uno por ML en 1.0 contra TI en 0.0.
+
+    Args:
+        scoring: grupos disponibles que aportan al score.
+        settings: ResponseSettings (umbral y peso mínimo).
+
+    Returns:
+        True si ml y ti discrepan por encima del umbral.
+    """
+    comparable = [g.score for g in scoring
+                  if g.name in _DISAGREEMENT_GROUPS
+                  and g.weight >= settings.corr_min_weight_for_disagreement]
+    return len(comparable) >= 2 and max(comparable) - min(comparable) >= settings.corr_disagreement_threshold
+
+
 def _band(score: float, ambiguous: bool, n_families: int, settings: ResponseSettings) -> str:
     """La ambigüedad viene SIEMPRE del desacuerdo entre grupos (ver
     `ambiguous` en compute_corroboration), nunca de un techo de score --
@@ -257,16 +285,7 @@ def compute_corroboration(
     raw = sum(g.score * g.weight for g in scoring)
     score = 100.0 * raw / weight_available
 
-    # Desacuerdo: entre los grupos que aportan con peso suficiente para
-    # importar, ¿el más alto y el más bajo difieren fuerte? Un score=75 por
-    # consenso no es lo mismo que uno por un grupo en 1.0 contra otro en 0.0.
-    comparable = [g for g in scoring if g.weight >= settings.corr_min_weight_for_disagreement]
-    ambiguous = False
-    if len(comparable) >= 2:
-        scores = [g.score for g in comparable]
-        if max(scores) - min(scores) >= settings.corr_disagreement_threshold:
-            ambiguous = True
-
+    ambiguous = is_ambiguous(scoring, settings)
     families = {_EVIDENCE_FAMILY.get(g.name, g.name) for g in scoring}
     band = _band(score, ambiguous, len(families), settings)
 
