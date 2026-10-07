@@ -132,10 +132,8 @@ class ResponseSettings(BaseSettings):
     corr_weight_signature: float = 35.0   # classtype crítico + ATT&CK
     corr_weight_ti: float = 25.0          # AbuseIPDB + OTX (fusión sub-lineal)
     corr_weight_ml: float = 20.0          # risk_score (LightGBM + IsolationForest)
-    corr_weight_context: float = 20.0     # recidivismo/kill-chain -- NO instrumentado
-                                           # todavía (sin historical-context-svc ni
-                                           # acumulador Redis); queda siempre
-                                           # `available=False` hasta construirlo.
+    corr_weight_context: float = 20.0     # recidivismo (H53, acumulador Redis por IP);
+                                           # kill-chain todavía no instrumentado.
 
     # Bandas de decisión sobre el score renormalizado 0-100 (ver
     # CorroborationResult.band). Alineadas a T0-T3 de motor/model.py:tier(),
@@ -157,13 +155,33 @@ class ResponseSettings(BaseSettings):
     corr_disagreement_threshold: float = 0.6
     corr_min_weight_for_disagreement: float = 15.0
 
-    # P3 (H53): diversidad mínima de evidencia para band "high". Con menos
-    # grupos disponibles que esto, la banda se capa en "medium" aunque el
-    # score renormalizado sea alto -- con un solo grupo, el score expresa
-    # solo la confianza de ese grupo (caso real: T3 de ML solo -> 82,8, H52).
+    # P3 (H53): diversidad mínima de evidencia para band "high". Se cuentan
+    # FAMILIAS independientes entre los grupos que aportan al score: ml y
+    # context son una sola familia (el recidivismo cuenta decisiones T2+
+    # pasadas, que salen del mismo ML), ti y signature una cada una. Con
+    # menos familias que esto, la banda se capa en "medium" aunque el score
+    # renormalizado sea alto (caso real: T3 de ML solo -> 82,8, H52).
     # Mecanismo distinto del desacuerdo de arriba: aquel mira cuánto
-    # discrepan los grupos disponibles; este, cuántos hay.
-    corr_min_groups_for_high: int = 2
+    # discrepan los grupos disponibles; este, cuántas fuentes independientes hay.
+    corr_min_evidence_families_for_high: int = 2
+
+    # Grupo context (H53): recidivismo = horas distintas con un incidente
+    # T2+ de la misma IP en los 30 días previos (acumulador Redis, ver
+    # constants.py y response/recidivism.py). Satura a 1.0 en este valor.
+    # Valor inicial, sujeto a calibración (mismo criterio que
+    # corr_otx_pulse_saturation): 5 horas distintas en un mes ya no es una
+    # ráfaga aislada. Con 0 el grupo queda disponible pero no aporta al score
+    # ni al desacuerdo (evidencia unilateral: "primera vez" no es evidencia
+    # de benignidad).
+    corr_context_recidivism_saturation: int = 5
+
+    # ── OpenSearch para la correlación con suricata-alerts-* (H53) ─────
+    # Mismas variables de entorno que response_audit_indexer.py (.env de
+    # motor/). Certificado autofirmado en .140, mismo criterio que el indexer.
+    os_host: str = "https://localhost:9201"
+    os_user: str = "admin"
+    os_pass: str = ""
+    os_verify_tls: bool = False
 
     # Normalización de OTX: pulse_count es un conteo sin cota superior
     # natural (a diferencia de abuseipdb_score, que ya es 0-100). Se satura

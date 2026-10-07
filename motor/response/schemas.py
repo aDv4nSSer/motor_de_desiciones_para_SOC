@@ -86,6 +86,29 @@ class CrowdSecDecision(BaseModel):
     origin: str | None = None
 
 
+class AlertMatch(BaseModel):
+    """Alerta de Suricata correlacionada con un evento del worker (H53), leída
+    de suricata-alerts-* (la indexa Vector; `category` trae la DESCRIPCIÓN de
+    classification.config, `classtype` es el nombre corto resuelto con
+    classtype_attack.yaml)."""
+    category: str
+    classtype: str                     # nombre corto si el mapeo lo conoce; si no, category en minúscula
+    classtype_override: bool = False   # classtype en constants.T3_CLASSTYPES
+    attack_mapped: bool = False        # técnica ATT&CK no nula en classtype_attack.yaml
+    attack_technique_id: str | None = None
+    signature: str | None = None
+    signature_id: int | None = None
+    severity: int | None = None
+    alert_timestamp: str | None = None
+
+
+class AlertLookupResult(BaseModel):
+    """Resultado del lookup de correlación: `status` distingue "no hubo
+    alerta" de "no se pudo consultar" para la auditoría."""
+    status: str                        # "match" | "no_match" | "unavailable" | "skipped"
+    match: AlertMatch | None = None
+
+
 class BlockResult(BaseModel):
     """Resultado de R2 — intento de bloqueo de una IP."""
     src_ip: str | None = None
@@ -155,6 +178,13 @@ class ResponseRecord(BaseModel):
     corroboration_band: str = ""
     corroboration_ambiguous: bool = False
     corroboration_groups: list[dict] = Field(default_factory=list)  # GroupScore.model_dump()
+    # Insumos de los grupos signature/context (H53, también modo sombra):
+    # alert_lookup = "match" | "no_match" | "unavailable" | "skipped" (""
+    # si no se intentó); correlated_alert = AlertMatch.model_dump() si hubo
+    # match; recidivism_count = horas previas con T2+ en 30d (None = sin dato).
+    alert_lookup: str = ""
+    correlated_alert: dict | None = None
+    recidivism_count: int | None = None
     processed_at: float = 0.0
     # Segundos entre la detección (task.ts) y el inicio del procesamiento.
     # None si la tarea no trae marca de tiempo (ver worker.process_task).

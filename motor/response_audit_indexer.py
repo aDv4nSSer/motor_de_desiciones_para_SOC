@@ -162,6 +162,19 @@ def build_content(msg_id: str, fields: dict[str, Any]) -> dict:
         enrichment = payload.get("enrichment")
         if isinstance(enrichment, dict):
             doc["corroboration_count"] = enrichment.get("corroboration_count")
+        # H53: insumos de los grupos signature/context y qué grupos estuvieron
+        # disponibles, para medir su cobertura con una query. Payloads
+        # anteriores no los traen (None se descarta abajo).
+        groups = payload.get("corroboration_groups")
+        if isinstance(groups, list) and groups:
+            doc["corroboration_groups_available"] = [
+                g.get("name") for g in groups if isinstance(g, dict) and g.get("available")]
+        alert = payload.get("correlated_alert")
+        if isinstance(alert, dict):
+            doc.update(correlated_classtype=alert.get("classtype"),
+                       correlated_attack_technique_id=alert.get("attack_technique_id"))
+        doc.update(alert_lookup=payload.get("alert_lookup") or None,
+                   recidivism_count=payload.get("recidivism_count"))
     else:
         doc["event_type"] = "other"
     doc["payload"] = payload
@@ -219,6 +232,12 @@ INDEX_MAPPINGS = {
         "corroboration_band": {"type": "keyword"},
         "corroboration_ambiguous": {"type": "boolean"},
         "corroboration_count": {"type": "integer"},
+        # H53: grupos signature/context (modo sombra)
+        "corroboration_groups_available": {"type": "keyword"},
+        "correlated_classtype": {"type": "keyword"},
+        "correlated_attack_technique_id": {"type": "keyword"},
+        "alert_lookup": {"type": "keyword"},
+        "recidivism_count": {"type": "integer"},
         "chain_seq": {"type": "long"},
         "prev_hash": {"type": "keyword"},
         "hash": {"type": "keyword"},

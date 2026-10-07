@@ -16,6 +16,7 @@ import ipaddress
 import json
 import logging
 import socket
+import ssl
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -23,9 +24,19 @@ from typing import Optional
 import httpx
 import redis
 
+from attck_mapping import AttckMappingLoadError, lookup
+from constants import (
+    ALERT_CORRELATION_LOOKAHEAD_SECONDS,
+    ALERT_CORRELATION_LOOKBACK_SECONDS,
+    ALERT_LOOKUP_CONNECT_TIMEOUT_SECONDS,
+    ALERT_LOOKUP_FAILURE_COOLDOWN_SECONDS,
+    ALERT_LOOKUP_READ_TIMEOUT_SECONDS,
+    SURICATA_ALERTS_INDEX_PATTERN,
+    T3_CLASSTYPES,
+)
 from response.config import ResponseSettings
 from response.crowdsec_adapter import fetch_decisions_stream
-from response.schemas import EnrichmentResult
+from response.schemas import AlertLookupResult, AlertMatch, EnrichmentResult
 
 log = logging.getLogger("response.r1")
 
@@ -427,3 +438,140 @@ def enrich(
     result.corroboration_count = count
     result.corroborating_sources = names
     return result
+
+
+# ── Correlación con alertas de Suricata (grupo `signature`, H53) ────────────
+# El Fast Path solo recibe flows (H50): el classtype no llega al motor. El
+# worker lo busca en suricata-alerts-* (Vector -> OpenSearch .140), fuera del
+# camino crítico. Correlación en el motor, no en Vector (CLAUDE.md).
+# httpx.Client sync a propósito: el worker es un loop sync sin event loop,
+# misma excepción consciente que response_audit_indexer.py (H41).
+
+_alerts_client: httpx.Client | None = None
+_alerts_unavailable_until: float = 0.0
+
+
+def _get_alerts_client(settings: ResponseSettings) -> httpx.Client:
+    """Cliente OpenSearch reutilizable, con timeout explícito corto."""
+    global _alerts_client
+    if _alerts_client is None:
+        verify: bool | ssl.SSLContext = True
+        if not settings.os_verify_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            verify = ctx
+        _alerts_client = httpx.Client(
+            base_url=settings.os_host, auth=(settings.os_user, settings.os_pass), verify=verify,
+            timeout=httpx.Timeout(ALERT_LOOKUP_READ_TIMEOUT_SECONDS,
+                                  connect=ALERT_LOOKUP_CONNECT_TIMEOUT_SECONDS),
+        )
+    return _alerts_client
+
+
+def build_alert_query(src_ip: str, dst_ip: str, dst_port: int, event_ts: float) -> dict:
+    """DSL de la correlación flow -> alerta (objeto, nunca f-strings: los
+    valores entran como términos ya validados por el llamador).
+
+    3-tupla en cualquiera de los dos sentidos (la firma puede describir la
+    respuesta del servidor) dentro de la ventana asimétrica de constants.py.
+    Prioriza la alerta más severa (severity 1 = máxima) y, a igualdad, la
+    más reciente.
+    """
+    lo = int((event_ts - ALERT_CORRELATION_LOOKBACK_SECONDS) * 1000)
+    hi = int((event_ts + ALERT_CORRELATION_LOOKAHEAD_SECONDS) * 1000)
+    return {
+        "size": 1,
+        "sort": [{"severity": {"order": "asc"}}, {"timestamp": {"order": "desc"}}],
+        "_source": ["timestamp", "category", "signature", "signature_id", "severity"],
+        "query": {"bool": {
+            "filter": [{"range": {"timestamp": {"gte": lo, "lte": hi, "format": "epoch_millis"}}}],
+            "should": [
+                {"bool": {"filter": [{"term": {"src_ip.keyword": src_ip}},
+                                     {"term": {"dest_ip.keyword": dst_ip}},
+                                     {"term": {"dest_port": dst_port}}]}},
+                {"bool": {"filter": [{"term": {"src_ip.keyword": dst_ip}},
+                                     {"term": {"dest_ip.keyword": src_ip}},
+                                     {"term": {"src_port": dst_port}}]}},
+            ],
+            "minimum_should_match": 1,
+        }},
+    }
+
+
+def alert_match_from_source(src: dict) -> AlertMatch | None:
+    """Arma el AlertMatch desde el _source de la alerta. `category` trae la
+    descripción del classtype: se resuelve a nombre corto con
+    classtype_attack.yaml (que indexa nombre y descripción)."""
+    category = str(src.get("category") or "").strip()
+    if not category:
+        return None
+    try:
+        entry = lookup(category)
+    except AttckMappingLoadError as e:
+        log.error(f"mapeo ATT&CK no disponible, alerta sin resolver: {e}")
+        entry = None
+    classtype = entry.classtype if entry else category.lower()
+    return AlertMatch(
+        category=category,
+        classtype=classtype,
+        classtype_override=classtype in T3_CLASSTYPES,
+        attack_mapped=bool(entry and entry.technique_id),
+        attack_technique_id=entry.technique_id if entry else None,
+        signature=src.get("signature"),
+        signature_id=src.get("signature_id"),
+        severity=src.get("severity"),
+        alert_timestamp=src.get("timestamp"),
+    )
+
+
+def lookup_suricata_alert(
+    src_ip: str | None, dst_ip: str | None, dst_port: int, event_ts: float,
+    settings: ResponseSettings, client: httpx.Client | None = None, now: float | None = None,
+) -> AlertLookupResult:
+    """Busca en suricata-alerts-* una alerta de Suricata para el evento.
+
+    Nunca lanza (degradación con gracia, mismo criterio que la TI): ante
+    error o timeout de OpenSearch devuelve status "unavailable", loguea un
+    WARNING y no vuelve a consultar durante
+    ALERT_LOOKUP_FAILURE_COOLDOWN_SECONDS (el worker va justo de capacidad).
+
+    Args:
+        src_ip, dst_ip, dst_port: 3-tupla del flow (ResponseTask no trae
+            src_port ni protocolo).
+        event_ts: epoch en que el flow llegó al motor (task.ts).
+        settings: ResponseSettings (credenciales de OpenSearch).
+        client: cliente inyectable para tests.
+        now: epoch actual, inyectable para tests del cooldown.
+
+    Returns:
+        AlertLookupResult con status "match" (y la alerta), "no_match",
+        "unavailable" o "skipped" (entrada inválida, no se consultó).
+    """
+    global _alerts_unavailable_until
+    now = time.time() if now is None else now
+    try:
+        src = str(ipaddress.ip_address(src_ip or ""))
+        dst = str(ipaddress.ip_address(dst_ip or ""))
+        port = int(dst_port)
+        if not 0 <= port <= 65535:
+            raise ValueError("puerto fuera de rango")
+    except (ValueError, TypeError):
+        return AlertLookupResult(status="skipped")
+    if now < _alerts_unavailable_until:
+        return AlertLookupResult(status="unavailable")
+
+    try:
+        http = client or _get_alerts_client(settings)
+        r = http.post(f"/{SURICATA_ALERTS_INDEX_PATTERN}/_search",
+                      json=build_alert_query(src, dst, port, event_ts))
+        r.raise_for_status()
+        hits = r.json().get("hits", {}).get("hits", [])
+    except (httpx.HTTPError, ValueError) as e:
+        _alerts_unavailable_until = now + ALERT_LOOKUP_FAILURE_COOLDOWN_SECONDS
+        log.warning("alert_lookup_unavailable error=%s detail=%s cooldown_s=%d",
+                    type(e).__name__, str(e)[:120], ALERT_LOOKUP_FAILURE_COOLDOWN_SECONDS)
+        return AlertLookupResult(status="unavailable")
+
+    match = alert_match_from_source(hits[0].get("_source", {})) if hits else None
+    return AlertLookupResult(status="match" if match else "no_match", match=match)

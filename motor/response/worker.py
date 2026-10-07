@@ -29,7 +29,8 @@ from response.approvals import create_pending_approval, expire_stale_approvals
 from response.cases import open_case
 from response.config import get_settings
 from response.enforcer import ar_context, build_enforcer, is_safelisted, respond_block
-from response.enrichment import enrich
+from response.enrichment import enrich, lookup_suricata_alert
+from response.recidivism import count_and_record
 from response.schemas import (
     ACCION_ALERTAR_CREAR_CASO,
     ACCION_ALERTAR_PENDIENTE_APROBACION,
@@ -158,23 +159,57 @@ def process_task(
             f"cached={e.cached} avail={e.abuseipdb_available}"
         )
 
-    # ── Corroboración ponderada en MODO SOMBRA (H52) ────────────────────
+    # ── Corroboración ponderada en MODO SOMBRA (H52, ampliada en H53) ────
     # Calcula el score 0-100 de scoring/corroboration.py con los insumos ya
-    # disponibles (risk_score, classtype, R1) y SOLO lo guarda en el record
-    # para compararlo contra el gate real. No decide nada: la rama R2 de
-    # abajo sigue usando corroboration_count. Mismo gate de tier que
-    # rules.yaml. Degradación con gracia: si attack_fields() o el cálculo
-    # fallan, los campos quedan en su default y R2 sigue igual.
+    # disponibles (risk_score, R1) más dos nuevos de H53: recidivismo de la
+    # IP (acumulador Redis, grupo context) y la alerta de Suricata
+    # correlacionada (suricata-alerts-*, grupo signature). SOLO se guarda en
+    # el record para compararlo contra el gate real: no decide nada, la rama
+    # R2 de abajo sigue usando corroboration_count y task.classtype. Mismo
+    # gate de tier que rules.yaml. Degradación con gracia en cada pieza: si
+    # algo falla, ese insumo queda sin dato y R2 sigue igual.
     if task.tier >= 2:
+        event_ts = task.ts or enqueued_at or now
+        ctx_reason = ""
         try:
-            attack_mapped = attack_fields(task.classtype).get("attack_technique_id") is not None
+            if not task.src_ip or is_safelisted(task.src_ip, settings):
+                ctx_reason = "IP propia/privada/safelist, recidivismo no aplica"
+            else:
+                record.recidivism_count = count_and_record(rdb, task.src_ip, event_ts, now)
+                if record.recidivism_count is None:
+                    ctx_reason = "acumulador Redis no respondió"
+        except Exception as e:  # noqa: BLE001 — la sombra nunca debe tumbar la decisión
+            ctx_reason = "error del acumulador"
+            log.error(f"[{task.trace_id[:8]}] recidivismo sombra falló: {e}")
+
+        # La correlación con alertas solo para tareas que llegan a R2 (T3):
+        # el grupo signature importa para el gate de autobloqueo, y el worker
+        # va justo de capacidad (H38) como para consultar OpenSearch en cada T2.
+        sig_classtype, sig_override, attack_mapped = task.classtype, task.classtype_override, None
+        if not task.classtype and task.tier >= settings.r2_min_tier:
+            try:
+                lk = lookup_suricata_alert(task.src_ip, task.dst_ip, task.dst_port, event_ts, settings)
+                record.alert_lookup = lk.status
+                if lk.match:
+                    record.correlated_alert = lk.match.model_dump()
+                    sig_classtype = lk.match.classtype
+                    sig_override = lk.match.classtype_override
+                    attack_mapped = lk.match.attack_mapped
+            except Exception as e:  # noqa: BLE001 — la sombra nunca debe tumbar la decisión
+                log.error(f"[{task.trace_id[:8]}] correlación con suricata-alerts falló: {e}")
+
+        try:
+            if attack_mapped is None:
+                attack_mapped = attack_fields(sig_classtype).get("attack_technique_id") is not None
             corr = compute_corroboration(
                 risk_score=task.risk_score,
-                classtype=task.classtype,
-                classtype_override=task.classtype_override,
+                classtype=sig_classtype,
+                classtype_override=sig_override,
                 attack_mapped=attack_mapped,
                 enrichment=record.enrichment,
                 settings=settings,
+                recidivism_count=record.recidivism_count,
+                context_unavailable_reason=ctx_reason,
             )
             record.corroboration_score = corr.score
             record.corroboration_band = corr.band
@@ -183,7 +218,8 @@ def process_task(
             log.info(
                 f"[{task.trace_id[:8]}] corroboración sombra score={corr.score} "
                 f"band={corr.band} ambiguous={corr.ambiguous} "
-                f"count={record.enrichment.corroboration_count if record.enrichment else 0}"
+                f"count={record.enrichment.corroboration_count if record.enrichment else 0} "
+                f"recid={record.recidivism_count} alert={record.alert_lookup or '-'}"
             )
         except Exception as e:  # noqa: BLE001 — la sombra nunca debe tumbar la decisión
             log.error(f"[{task.trace_id[:8]}] corroboración sombra falló, sin score: {e}")

@@ -11,7 +11,8 @@ Casos cubiertos:
    con T3 sin ATT&CK, 0.3 con classtype no crítico.
 3. g_ti: fusión sub-lineal (max + 30% del resto), ambas fuentes no
    disponibles -> grupo no disponible (no es 0).
-4. g_ctx: siempre no disponible (no instrumentado).
+4. g_ctx: sin recidivism_count (default) no disponible. Recidivismo real
+   y su efecto en P3: tests/unit/test_recidivism_context.py (H53).
 5. Desacuerdo entre grupos marca `ambiguous=True` aunque el score agregado
    sea alto.
 6. Degradación: función nunca lanza, incluso con enrichment=None.
@@ -153,7 +154,7 @@ class TestGrupoTI:
 
 
 class TestGrupoContexto:
-    def test_siempre_no_disponible(self) -> None:
+    def test_sin_recidivism_count_no_disponible(self) -> None:
         settings = _settings()
         result = compute_corroboration(
             risk_score=0.9, classtype="trojan-activity", classtype_override=True,
@@ -284,9 +285,9 @@ class TestDiversidadMinimaParaHigh:
         assert not any("P3" in line for line in result.reasoning)
 
     def test_umbral_configurable(self) -> None:
-        """corr_min_groups_for_high=1 devuelve el comportamiento anterior."""
+        """corr_min_evidence_families_for_high=1 devuelve el comportamiento anterior."""
         result = compute_corroboration(
             risk_score=1.0, classtype="", classtype_override=False, attack_mapped=False,
-            enrichment=None, settings=_settings(corr_min_groups_for_high=1),
+            enrichment=None, settings=_settings(corr_min_evidence_families_for_high=1),
         )
         assert result.band == "high"

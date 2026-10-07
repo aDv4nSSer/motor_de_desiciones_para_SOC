@@ -14,11 +14,15 @@ Hoy, de los 4 grupos de la propuesta original, solo 2 están realmente
 instrumentados en producción:
   - g_ml:  SIEMPRE disponible (motor/model.py ya calcula risk_score).
   - g_ti:  disponible si AbuseIPDB u OTX respondieron (enrichment.py).
-  - g_sig: NO disponible en producción (H50 -- Vector no manda classtype
-           al Fast Path todavía). Queda listo para activarse solo con ese
-           fix, sin tocar este módulo otra vez.
-  - g_ctx: NO existe ningún instrumento (sin historical-context-svc, sin
-           acumulador Redis de riesgo por entidad). Siempre no disponible.
+  - g_sig: el Fast Path no recibe classtype (H50). Desde H53 el worker lo
+           obtiene correlacionando el evento T3 con suricata-alerts-*
+           (response/enrichment.py:lookup_suricata_alert); disponible solo
+           cuando hay una alerta correlacionable (~5% de los T2+ medidos).
+  - g_ctx: recidivismo por IP (H53, acumulador Redis `risk:ip:{ip}`,
+           response/recidivism.py), calculado por el worker y pasado acá.
+           Kill-chain todavía no.
+
+(Texto original del 7-oct, previo a H53: g_sig y g_ctx nunca disponibles.)
 
 Si se calculara `C = 0.35*g_sig + 0.25*g_ti + 0.20*g_ml + 0.20*g_ctx` con
 g_sig=g_ctx=0 SIEMPRE (porque no es que la evidencia sea negativa, es que
@@ -140,20 +144,52 @@ def _score_signature_group(
     )
 
 
-def _score_context_group(weight: float) -> GroupScore:
-    """g_ctx: recidivismo/kill-chain por entidad. NO existe ningún
-    instrumento todavía -- no hay historical-context-svc ni acumulador
-    Redis de riesgo por entidad (verificado contra el repo real, 7-oct-2026:
-    cero referencias a `risk:{entity_type}:{entity_id}` o equivalente).
-    Siempre `available=False` hasta construirlo; no es un placeholder a
-    medias, es honestidad sobre lo que hoy no se puede calcular."""
+def _score_context_group(
+    recidivism_count: int | None, unavailable_reason: str,
+    settings: ResponseSettings, weight: float,
+) -> GroupScore:
+    """g_ctx: recidivismo por entidad (H53) -- horas distintas con un
+    incidente T2+ de la misma IP en los 30 días previos, contadas por el
+    worker sobre el acumulador Redis `risk:ip:{ip}` (response/recidivism.py)
+    y pasadas acá ya calculadas: este módulo sigue siendo puro, sin IO.
+
+    - `recidivism_count is None`: no hay dato (Redis falló, IP propia/privada
+      o tarea fuera de alcance) -> `available=False` con el motivo.
+    - `0`: disponible ("primera vez" queda auditado) pero `contributes=False`:
+      la ausencia de historial no es evidencia de benignidad, así que no baja
+      el score ni dispara desacuerdo (evidencia unilateral, decisión del
+      7-oct-2026).
+    - `> 0`: aporta normal, normalizado contra
+      `corr_context_recidivism_saturation`.
+
+    Kill-chain progression (técnicas ATT&CK distintas de la misma entidad en
+    ventana corta) queda como extensión futura del mismo acumulador: necesita
+    que `signature` tenga cobertura real primero."""
+    if recidivism_count is None:
+        return GroupScore(
+            name="context", available=False, weight=weight,
+            detail=f"recidivismo no disponible ({unavailable_reason or 'sin dato'})",
+        )
+    sat = max(1, settings.corr_context_recidivism_saturation)
+    score = max(0.0, min(1.0, recidivism_count / sat))
+    if recidivism_count <= 0:
+        return GroupScore(
+            name="context", available=True, score=0.0, weight=weight, contributes=False,
+            detail="recidivismo: 0 horas con incidentes T2+ en 30d (primera vez; no aporta al score)",
+        )
     return GroupScore(
-        name="context", available=False, weight=weight,
-        detail="no instrumentado (sin acumulador de riesgo por entidad ni recidivismo)",
+        name="context", available=True, score=score, weight=weight,
+        detail=(f"recidivismo: {recidivism_count} horas con incidentes T2+ en 30d "
+                f"(score={score:.2f}, sat={sat})"),
     )
 
 
-def _band(score: float, ambiguous: bool, n_available: int, settings: ResponseSettings) -> str:
+#: Familias de evidencia independientes para P3. ml y context son una sola:
+#: el recidivismo cuenta decisiones T2+ pasadas, que salen del mismo modelo.
+_EVIDENCE_FAMILY = {"ml": "ml", "context": "ml", "ti": "ti", "signature": "signature"}
+
+
+def _band(score: float, ambiguous: bool, n_families: int, settings: ResponseSettings) -> str:
     """La ambigüedad viene SIEMPRE del desacuerdo entre grupos (ver
     `ambiguous` en compute_corroboration), nunca de un techo de score --
     un score=95 por consenso de todos los grupos disponibles es, si acaso,
@@ -161,10 +197,11 @@ def _band(score: float, ambiguous: bool, n_available: int, settings: ResponseSet
     como referencia documental de dónde empieza "alta confianza" para
     dashboards/reasoning, no como un segundo gate hacia "ambiguous".
 
-    P3 (H53): "high" exige al menos `corr_min_groups_for_high` grupos
-    disponibles. Con menos, el máximo es "medium" -- la renormalización
-    hace que un único grupo valga 100% del score, y eso no es
-    corroboración (caso real de H52: T3 con ML solo -> 82,8 -> "high",
+    P3 (H53): "high" exige al menos `corr_min_evidence_families_for_high`
+    familias de evidencia independientes entre los grupos que aportan (ver
+    _EVIDENCE_FAMILY). Con menos, el máximo es "medium" -- la
+    renormalización hace que una única fuente valga 100% del score, y eso no
+    es corroboración (caso real de H52: T3 con ML solo -> 82,8 -> "high",
     incluido el propio bastion .139)."""
     if ambiguous:
         return "ambiguous"
@@ -172,7 +209,7 @@ def _band(score: float, ambiguous: bool, n_available: int, settings: ResponseSet
         return "low"
     if score <= settings.corr_band_medium_max:
         return "medium"
-    if n_available < settings.corr_min_groups_for_high:
+    if n_families < settings.corr_min_evidence_families_for_high:
         return "medium"
     return "high"
 
@@ -185,6 +222,8 @@ def compute_corroboration(
     attack_mapped: bool,
     enrichment: EnrichmentResult | None,
     settings: ResponseSettings,
+    recidivism_count: int | None = None,
+    context_unavailable_reason: str = "",
 ) -> CorroborationResult:
     """
     Punto de entrada único. Pura (sin IO, sin Redis) -- todos los insumos ya
@@ -197,13 +236,17 @@ def compute_corroboration(
         _score_ml_group(risk_score, settings.corr_weight_ml),
         _score_ti_group(enrichment, settings, settings.corr_weight_ti),
         _score_signature_group(classtype, classtype_override, attack_mapped, settings.corr_weight_signature),
-        _score_context_group(settings.corr_weight_context),
+        _score_context_group(recidivism_count, context_unavailable_reason, settings,
+                             settings.corr_weight_context),
     ]
 
     available = [g for g in groups if g.available]
-    weight_available = sum(g.weight for g in available)
+    # Solo los grupos que aportan entran al score, al desacuerdo y a P3
+    # (context con recidivismo 0 está disponible pero no aporta, H53).
+    scoring = [g for g in available if g.contributes]
+    weight_available = sum(g.weight for g in scoring)
 
-    if not available or weight_available <= 0:
+    if not scoring or weight_available <= 0:
         # No debería ocurrir (g_ml siempre disponible) -- fallback explícito
         # en vez de dividir por cero.
         return CorroborationResult(
@@ -211,31 +254,33 @@ def compute_corroboration(
             reasoning=["ningún grupo de evidencia disponible -- score 0 por defecto"],
         )
 
-    raw = sum(g.score * g.weight for g in available)
+    raw = sum(g.score * g.weight for g in scoring)
     score = 100.0 * raw / weight_available
 
-    # Desacuerdo: entre los grupos disponibles con peso suficiente para
+    # Desacuerdo: entre los grupos que aportan con peso suficiente para
     # importar, ¿el más alto y el más bajo difieren fuerte? Un score=75 por
     # consenso no es lo mismo que uno por un grupo en 1.0 contra otro en 0.0.
-    comparable = [g for g in available if g.weight >= settings.corr_min_weight_for_disagreement]
+    comparable = [g for g in scoring if g.weight >= settings.corr_min_weight_for_disagreement]
     ambiguous = False
     if len(comparable) >= 2:
         scores = [g.score for g in comparable]
         if max(scores) - min(scores) >= settings.corr_disagreement_threshold:
             ambiguous = True
 
-    band = _band(score, ambiguous, len(available), settings)
+    families = {_EVIDENCE_FAMILY.get(g.name, g.name) for g in scoring}
+    band = _band(score, ambiguous, len(families), settings)
 
     reasoning = [g.detail for g in groups]
     reasoning.append(
         f"score={score:.1f}/100 sobre {weight_available:.0f}/100 de peso disponible "
-        f"({len(available)}/{len(groups)} grupos instrumentados)"
+        f"({len(scoring)}/{len(groups)} grupos aportan, {len(families)} familia(s) independiente(s))"
     )
     if (not ambiguous and score > settings.corr_band_medium_max
-            and len(available) < settings.corr_min_groups_for_high):
+            and len(families) < settings.corr_min_evidence_families_for_high):
         reasoning.append(
-            f"band limitada a 'medium': {len(available)} grupo(s) disponible(s), "
-            f"'high' exige {settings.corr_min_groups_for_high} (P3)"
+            f"band limitada a 'medium': {len(families)} familia(s) de evidencia "
+            f"({', '.join(sorted(families))}), 'high' exige "
+            f"{settings.corr_min_evidence_families_for_high} (P3)"
         )
     if ambiguous:
         reasoning.append(

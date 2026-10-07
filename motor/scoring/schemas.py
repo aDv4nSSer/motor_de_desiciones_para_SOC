@@ -31,6 +31,10 @@ class GroupScore(BaseModel):
     score: float = 0.0          # solo significativo si available=True
     weight: float = 0.0         # peso máximo configurado del grupo (0-100)
     detail: str = ""            # explicación corta, para reasoning[]/logs
+    # False si el grupo está disponible pero no aporta al score ni al
+    # desacuerdo: evidencia unilateral sin señal (context con recidivismo 0,
+    # H53). Un grupo no disponible tampoco aporta, con o sin este flag.
+    contributes: bool = True
 
 
 class CorroborationResult(BaseModel):

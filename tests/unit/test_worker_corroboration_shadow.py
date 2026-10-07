@@ -30,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "motor"))
 from response.config import ResponseSettings
 from response.schemas import (
     ActionType,
+    AlertLookupResult,
+    AlertMatch,
     BlockResult,
     EnrichmentResult,
     ResponseTask,
@@ -101,11 +103,25 @@ SCENARIOS = [
 ]
 
 
-def _run(mocker, tier, src_ip, stale, count, overrides, corr_patch=None):
+NEUTRAL_ALERT = AlertLookupResult(status="no_match")
+EXTREME_ALERT = AlertLookupResult(status="match", match=AlertMatch(
+    category="A Network Trojan was detected", classtype="trojan-activity",
+    classtype_override=True, attack_mapped=True, attack_technique_id="T1071",
+    signature="ET TROJAN prueba", signature_id=1, severity=1,
+    alert_timestamp="2026-10-07T19:00:00Z",
+))
+
+
+def _run(mocker, tier, src_ip, stale, count, overrides, corr_patch=None,
+         alert=NEUTRAL_ALERT, recidivism=0):
     """Corre process_task con todas las dependencias con IO mockeadas y
-    devuelve (record, llamadas observables, payload auditado)."""
+    devuelve (record, llamadas observables, payload auditado). `alert` y
+    `recidivism` son los insumos de los grupos signature/context (H53)."""
     settings = _settings(**overrides)
     rdb = mocker.MagicMock(**{"get.return_value": None})
+    # Pipeline del acumulador de recidivismo: [ZCOUNT, ZADD, ZREM, ZREM, EXPIRE]
+    rdb.pipeline.return_value.execute.return_value = [recidivism, 1, 0, 0, True]
+    mocker.patch("response.worker.lookup_suricata_alert", return_value=alert)
     enforcer = mocker.MagicMock(name="dry_run")
     mocker.patch(
         "response.worker.enrich",
@@ -155,6 +171,7 @@ def _run(mocker, tier, src_ip, stale, count, overrides, corr_patch=None):
 _VOLATILE = {
     "corroboration_score", "corroboration_band", "corroboration_ambiguous",
     "corroboration_groups", "processed_at", "event_age_seconds",
+    "alert_lookup", "correlated_alert", "recidivism_count",  # insumos de sombra (H53)
 }
 
 
@@ -178,7 +195,7 @@ class TestInvariancia:
         mocker.stopall()
         forced, forced_calls, _ = _run(
             mocker, tier, src_ip, stale, count, overrides,
-            corr_patch={"return_value": EXTREME},
+            corr_patch={"return_value": EXTREME}, alert=EXTREME_ALERT, recidivism=50,
         )
 
         assert _decision(forced) == _decision(real)
@@ -186,6 +203,31 @@ class TestInvariancia:
         # El parche realmente se aplicó (si no, el test no probaría nada):
         assert forced.corroboration_band == "high"
         assert forced.corroboration_score == 100.0
+
+    @pytest.mark.parametrize(
+        "tier,src_ip,stale,count,overrides",
+        [s[1:] for s in SCENARIOS], ids=[s[0] for s in SCENARIOS],
+    )
+    def test_signature_y_context_extremos_no_cambian_la_decision_real(
+        self, mocker, tier, src_ip, stale, count, overrides,
+    ) -> None:
+        """H53: con el score REAL, una alerta T3 + ATT&CK correlacionada y un
+        recidivismo saturado cambian el score y la banda, pero no la decisión:
+        R2 sigue leyendo solo corroboration_count y task.classtype."""
+        neutral, neutral_calls, _ = _run(mocker, tier, src_ip, stale, count, overrides)
+        mocker.stopall()
+        extreme, extreme_calls, _ = _run(
+            mocker, tier, src_ip, stale, count, overrides, alert=EXTREME_ALERT, recidivism=50,
+        )
+
+        assert _decision(extreme) == _decision(neutral)
+        assert extreme_calls == neutral_calls
+        if tier >= 3:  # la correlación solo corre para T3 (llega a R2)
+            sig = next(g for g in extreme.corroboration_groups if g["name"] == "signature")
+            assert sig["available"] is True and sig["score"] == 1.0
+            assert extreme.correlated_alert["classtype"] == "trojan-activity"
+        if src_ip == PUBLIC_IP:
+            assert extreme.recidivism_count == 50
 
     @pytest.mark.parametrize(
         "tier,src_ip,stale,count,overrides",
@@ -199,10 +241,18 @@ class TestInvariancia:
         assert record.corroboration_band in {"low", "medium", "high", "ambiguous"}
         assert 0.0 <= record.corroboration_score <= 100.0
         assert [g["name"] for g in record.corroboration_groups] == ["ml", "ti", "signature", "context"]
-        # g_sig / g_ctx sin instrumento en producción (H50, sin acumulador):
+        # Sin alerta correlacionada -> signature no disponible. context:
+        # disponible con recidivismo 0 ("primera vez", no aporta) para IP
+        # pública; no disponible para IP propia/privada (H53).
         by_name = {g["name"]: g for g in record.corroboration_groups}
         assert by_name["signature"]["available"] is False
-        assert by_name["context"]["available"] is False
+        if src_ip == PUBLIC_IP:
+            assert by_name["context"]["available"] is True
+            assert by_name["context"]["contributes"] is False
+            assert record.recidivism_count == 0
+        else:
+            assert by_name["context"]["available"] is False
+            assert record.recidivism_count is None
         assert audited["corroboration_band"] == record.corroboration_band
         assert audited["corroboration_score"] == record.corroboration_score
         assert audited["corroboration_groups"] == record.corroboration_groups
