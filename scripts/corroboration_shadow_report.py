@@ -46,6 +46,19 @@ H25_EXCLUDED = {"gte": "2026-08-18T00:00:00-03:00", "lt": "2026-09-05T00:00:00-0
 PAGE = 1000
 
 
+def expected_r2_options(payload: dict, settings) -> list[tuple[str, str | None]]:
+    """Resultados admisibles de expected_r2(). event_age_seconds se audita
+    redondeado a 0.1 s y el worker compara la edad sin redondear: si quedó a
+    <= 0.05 s del umbral stale, no se puede saber de qué lado cayó y se
+    aceptan ambas ramas."""
+    age = payload.get("event_age_seconds")
+    limit = settings.stale_event_max_age_seconds
+    if age is None or abs(age - limit) > 0.05:
+        return [expected_r2(payload, settings)]
+    return [expected_r2({**payload, "event_age_seconds": limit + 1}, settings),
+            expected_r2({**payload, "event_age_seconds": limit - 1}, settings)]
+
+
 def expected_r2(payload: dict, settings) -> tuple[str, str | None]:
     """(accion_recomendada, block_action) que produce process_task() para
     este registro, recalculado desde los insumos guardados. Para el caso
@@ -127,10 +140,14 @@ def main() -> int:
         rec_action = block.get("action", "absent")
         dist[(d.get("tier"), rec_accion, rec_action, block.get("enforced"))] += 1
 
-        exp_accion, exp_action = expected_r2(p, settings)
-        ok = rec_accion == exp_accion and (exp_action is None or rec_action == exp_action)
-        if exp_action is None:  # corroborado: coherencia interna con respond_block
-            ok = ok and rec_action in (ActionType.BLOCK.value, ActionType.BLOCK_SKIPPED.value)
+        ok = False
+        options = expected_r2_options(p, settings)
+        for exp_accion, exp_action in options:
+            match = rec_accion == exp_accion and (exp_action is None or rec_action == exp_action)
+            if exp_action is None:  # corroborado: coherencia interna con respond_block
+                match = match and rec_action in (ActionType.BLOCK.value, ActionType.BLOCK_SKIPPED.value)
+            ok = ok or match
+        exp_accion, exp_action = options[0]
         if rec_action != "absent":  # enforced solo si hubo bloqueo real (enforcer.respond_block)
             ok = ok and bool(block.get("enforced")) == (rec_action == ActionType.BLOCK.value)
         if not ok:
