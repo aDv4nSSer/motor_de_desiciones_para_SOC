@@ -146,6 +146,15 @@ class ResponseRecord(BaseModel):
     rules_fired: list[str] = Field(default_factory=list)
     reasoning: list[str] = Field(default_factory=list)
     rules_total_weight: float = 0.0
+    # corroboration_*: score de corroboración ponderado (scoring/
+    # corroboration.py) en MODO SOMBRA -- se calcula para T2+ y se audita
+    # junto al gate real (enrichment.corroboration_count), pero NO decide
+    # nada: R2 no lo lee. Defaults si tier < 2 o si el cálculo falló
+    # (degradación con gracia). Ver H52 en docs/BITACORA_TECNICA.md.
+    corroboration_score: float = 0.0
+    corroboration_band: str = ""
+    corroboration_ambiguous: bool = False
+    corroboration_groups: list[dict] = Field(default_factory=list)  # GroupScore.model_dump()
     processed_at: float = 0.0
     # Segundos entre la detección (task.ts) y el inicio del procesamiento.
     # None si la tarea no trae marca de tiempo (ver worker.process_task).

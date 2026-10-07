@@ -24,6 +24,7 @@ import logging
 import time
 
 import redis
+from attck_mapping import attack_fields
 from response.approvals import create_pending_approval, expire_stale_approvals
 from response.cases import open_case
 from response.config import get_settings
@@ -41,6 +42,7 @@ from response.schemas import (
     ResponseTask,
 )
 from rules.engine import evaluate
+from scoring.corroboration import compute_corroboration
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,6 +157,36 @@ def process_task(
             f"abuse={e.abuseipdb_score} rdns={e.reverse_dns} "
             f"cached={e.cached} avail={e.abuseipdb_available}"
         )
+
+    # ── Corroboración ponderada en MODO SOMBRA (H52) ────────────────────
+    # Calcula el score 0-100 de scoring/corroboration.py con los insumos ya
+    # disponibles (risk_score, classtype, R1) y SOLO lo guarda en el record
+    # para compararlo contra el gate real. No decide nada: la rama R2 de
+    # abajo sigue usando corroboration_count. Mismo gate de tier que
+    # rules.yaml. Degradación con gracia: si attack_fields() o el cálculo
+    # fallan, los campos quedan en su default y R2 sigue igual.
+    if task.tier >= 2:
+        try:
+            attack_mapped = attack_fields(task.classtype).get("attack_technique_id") is not None
+            corr = compute_corroboration(
+                risk_score=task.risk_score,
+                classtype=task.classtype,
+                classtype_override=task.classtype_override,
+                attack_mapped=attack_mapped,
+                enrichment=record.enrichment,
+                settings=settings,
+            )
+            record.corroboration_score = corr.score
+            record.corroboration_band = corr.band
+            record.corroboration_ambiguous = corr.ambiguous
+            record.corroboration_groups = [g.model_dump() for g in corr.groups]
+            log.info(
+                f"[{task.trace_id[:8]}] corroboración sombra score={corr.score} "
+                f"band={corr.band} ambiguous={corr.ambiguous} "
+                f"count={record.enrichment.corroboration_count if record.enrichment else 0}"
+            )
+        except Exception as e:  # noqa: BLE001 — la sombra nunca debe tumbar la decisión
+            log.error(f"[{task.trace_id[:8]}] corroboración sombra falló, sin score: {e}")
 
     # ── T2: alertar + crear caso automático (tabla sección 4, origen Red) ──
     # Solo T2 exacto -- T3 tiene su propia rama abajo, T0/T1 no generan
