@@ -2301,7 +2301,61 @@ Mínimo **72 h** continuas (tres ciclos día/noche y tres resets diarios de cuot
 
 ---
 
+## H53 — Score de corroboración completo en modo sombra: P3 por familias, grupo `signature` (correlación con `suricata-alerts-*`) y grupo `context` (recidivismo acotado)
+
+**Fecha:** 2026-10-07 (-03). Código: `4fa5898`, `9ec5c7d`, `1a12a48`, `ea9198e`. **Todo sigue en modo sombra:** el gate real de R2 sigue siendo `corroboration_count >= 2` y la rama R2 de `worker.py` no lee ningún insumo nuevo.
+
+### Diseño final
+
+- **P3, diversidad de evidencia (`corroboration.py:_band`):** `band` nunca es `"high"` con menos de `corr_min_evidence_families_for_high` (= 2) **familias** de evidencia entre los grupos que aportan. Las familias son `ml` (incluye `context`), `ti` y `signature`. Con una sola familia, el máximo es `"medium"` y queda una línea `(P3)` en `reasoning`. Es una regla independiente del desacuerdo (`corr_disagreement_threshold`): un grupo con peso menor a `corr_min_weight_for_disagreement` no entra al desacuerdo pero sí cuenta para la diversidad, y si dos grupos discrepan manda `"ambiguous"`.
+- **`signature`, correlación del worker con `suricata-alerts-*` (`enrichment.py:lookup_suricata_alert`):** solo para tareas T3 sin classtype, que son las que llegan a R2. 3-tupla `src_ip/dst_ip/dst_port` en los dos sentidos sobre los subcampos `.keyword`, ventana asimétrica `[ts − 300 s, ts + 30 s]`, prioridad a la alerta más severa. `category` (la descripción del classtype) se resuelve a nombre corto con `classtype_attack.yaml`, y de ahí salen `T3_CLASSTYPES` (movido a `motor/constants.py`, sin cambios de contenido) y ATT&CK. Usa `httpx.Client` sync (el worker no tiene event loop; misma excepción que H41) con timeout de 1 s de conexión y 1,5 s de lectura, y 60 s de cooldown tras una falla. Nunca lanza: los estados son `match`, `no_match`, `unavailable` y `skipped`. No se tocó Vector: la correlación queda en el motor y flows y alertas siguen separados.
+- **`context`, recidivismo acotado (`response/recidivism.py`):** sorted set `risk:ip:{ip}` donde miembro y score son el inicio del bucket horario. Cuenta **horas distintas** con un incidente T2+ en los 30 días previos, sin contar el bucket del propio evento. Usa la hora del evento, no la de procesamiento. Una sola ida y vuelta a Redis con `ZCOUNT`, `ZADD`, `ZREMRANGEBYSCORE` (ventana), `ZREMRANGEBYRANK` (tope de 64) y `EXPIRE 30d`. Quedan **excluidas** las IPs propias, privadas y de la safelist. El IO lo hace el worker y `corroboration.py` sigue siendo pura (recibe `recidivism_count`). Normaliza contra `corr_context_recidivism_saturation` = 5, valor inicial sujeto a calibración. **Recidivismo 0:** el grupo queda `available=True, score=0.0, contributes=False`, es decir, "primera vez" queda auditado pero no entra al promedio ni al desacuerdo (opción "solo suma", decidida el 7-oct). Kill-chain queda fuera: es una extensión futura del mismo acumulador y necesita que `signature` tenga cobertura real primero.
+- **Auditoría:** `ResponseRecord` suma `alert_lookup`, `correlated_alert` y `recidivism_count`. `GroupScore` suma `contributes`. El indexer extrae como campos top-level `corroboration_groups_available`, `correlated_classtype`, `correlated_attack_technique_id`, `alert_lookup` y `recidivism_count`. El reporte de sombra suma la sección 4 (disponibilidad real por grupo y tier).
+
+### Tres supuestos del plan que no se sostuvieron (medidos en `.140` antes de implementar)
+
+1. **Fuente de alertas.** `soc-alerts-*` y `wazuh-alerts-*` **no existen** en el OpenSearch de `.140`. Las alertas de Suricata están en `suricata-alerts-*`, las indexa Vector directo (no Wazuh), y las IPs están como `text` con subcampo `.keyword`. El `ResponseTask` no trae `src_port` ni protocolo. La **alerta precede al flow entre 36 y 68 s**, porque Suricata emite el flow al cerrarse: una ventana de ±30 s no encontraba ninguna. La cobertura esperable es **~5%** (6/100 T2+ recientes con alerta correlacionable; ~206 alertas/h contra ~7.900 T2+/h). Resolución: 3-tupla y ventana asimétrica, sin tocar el Fast Path.
+2. **Circularidad del recidivismo.** Contar incidentes T2+ es contar decisiones pasadas del mismo ML, así que no es evidencia independiente. Si `ml + context` contaran como dos grupos para P3, el bastion `.139` (2.274 eventos T2+/día) volvía a `"high"` sin TI. Resolución: `ml` y `context` son **una sola familia** para P3.
+3. **Saturación y memoria.** Un `ZADD` por `trace_id` saturaba de inmediato: la mediana es de 3 eventos T2+ por IP por día y el p90 de 162, y 4 de las 5 IPs con más eventos eran hosts propios (`10.10.10.3`, `10.10.10.1`, `10.30.30.2`, `200.54.12.139`; la quinta, `95.40.160.2`). A 96.281 eventos T2+/día por 30 días eran millones de miembros, con **Redis en 805 MB de 1 GB y `allkeys-lru`**: el acumulador podía desalojar streams, aprobaciones o bloqueos. Resolución: buckets horarios, tope de miembros, `EXPIRE`, y exclusión de IPs propias y privadas.
+
+**Tests:** `pytest tests/` **598 → 647 passed** (P3 +6; `test_suricata_alert_correlation.py` y `test_recidivism_context.py` nuevos; invariancia ampliada con una alerta T3 + ATT&CK forzada y recidivismo saturado en los 13 escenarios). Los 103 tests de corroboración pasan también en `.140`. `ruff` limpio, bandit del pre-commit sin hallazgos.
+
+### Deploy a `.140`
+
+- **Línea base** (16:42 -03, código de H52, última hora): 8.560 docs, invariancia 8.560/8.560, T3 pendiente 99,1% (2.013/2.032). Bandas T3: `high` 1.299 (63,9%), `ambiguous` 732 (36,0%), `medium` 1.
+- `git pull --ff-only`: `233407e` → `ea9198e` (16:42:53 -03). **`PUT soc-responses-2026.10.07/_mapping`** aditivo con los 5 campos nuevos: `200 {"acknowledged":true}`, de 25 a 30 propiedades, `dynamic` sigue en `false`, 79.966 docs sin tocar. `.env`: `OS_USER`/`OS_PASS` existentes; `OS_HOST` usa el default, igual que el indexer.
+- **Restarts (Antonio, sudo interactivo), 16:43:54 -03:** `response-audit-indexer` (PID 82509) y `response-worker` (PID 82515), `NRestarts=0`. `motor-soc` no se reinició: `main.py` solo importa `T3_CLASSTYPES` desde `constants.py`, con el mismo contenido.
+
+### Verificación (16:57 -03, ~13 min de tráfico, 1.482 docs T2+)
+
+- **INVARIANCIA: 1.482/1.482** coinciden con la rama R2 recalculada. T3 pendiente: 339/342 = **99,1%**, igual que la línea base. El recálculo de score, `ambiguous` y `band` desde los grupos guardados también da 1.482/1.482.
+- **Crítico 1, ninguna familia sola llega a `"high"`:** 199 docs cuya única familia es `ml`, **los 199 en `"medium"`, 0 violaciones**. El caso concreto **`ml + context` aportando sin `ti` ni `signature` no apareció en tráfico real (0 docs)**: TI estuvo disponible en el 99,7% de los T3, y todos los que tenían recidivismo > 0 tenían también TI. Por ahora ese caso está cubierto solo por los tests unitarios y por la regla de familias, cuyo recálculo coincide en el 100% de los docs.
+- **Crítico 2, recidivismo 0:** **1.018/1.018** con `available=True, score=0.0, contributes=False`. Atacantes nuevos con TI fuerte (≥ 0,8) y ML ≥ 0,7: **232 `high`, 3 `ambiguous`**. Los 3 `ambiguous` son las 3 correlaciones con alerta `misc-attack` (ver abajo), no el recidivismo 0. Por construcción, un grupo con `contributes=False` no entra al desacuerdo, y el recálculo lo confirma.
+- **Disponibilidad real de los grupos:** T3 (n=342): `ml` 100%, `ti` 99,7%, **`signature` 0,9%** (3 match / 339 no_match / 0 unavailable), **`context` 99,1% disponible, 24,9% aportando**. T2 (n=1.140): `ti` 82,6%, `context` 82,5% disponible y 15,5% aportando (sin lookup de alertas). Recidivismo: 1.018 en 0, 262 en 1-4, 202 sin dato (IPs propias o privadas).
+- **Ejemplos:**
+  - Signature: `4fbd1775-c706-4aac-8739-b9c92ced24a0` (`85.217.149.2`, `misc-attack`, `chain_seq 1524509`).
+  - Recidivismo 0 con TI: `63375da4-7c71-4993-bff1-5493396d3731` (`chain_seq 1524749`).
+- **Cadena:** `verify_chain` sobre `soc-responses-2026.10.07` completo (81.556 docs, `1443196 → 1524751`): **0 problemas**. Empalme del restart `1523257 → 1523258` con `prev_hash` correcto.
+- **Logs del worker** desde `Response worker iniciando` (16:43:56): 1.490 líneas de score sombra; **0** `sombra falló`, `recidivismo sombra falló`, `correlación … falló`, `alert_lookup_unavailable`, `acumulador … no disponible`, `Traceback` y `ERROR`. Solo aparecen 13 WARNING de `ReadTimeout` de OTX, que es comportamiento previo. Indexer: `pending 0`, `lag 0` (el journal sigue sin poder leerse sin sudo).
+- **Redis:** de **809 MB a 812 MB**, `evicted_keys` **0 → 0**. 611 claves `risk:*` que ocupan ~63,5 KB en total, todas con TTL (≈ 30 d, 0 sin TTL). El máximo es de 2 miembros por clave, porque a los 13 min nadie acumuló más de 2 horas. **El tope de 64 todavía no se ejerció en producción** (hace falta que una IP sume más de 64 horas distintas, ~2,7 días de actividad continua); por ahora lo cubre el test `test_tope_de_miembros`. **Los hosts de mayor volumen no tienen clave** (`risk:ip:10.10.10.3`, `10.10.10.1`, `10.30.30.2`, `200.54.12.139`: `exists=0`), así que la exclusión funciona.
+
+### Efecto lateral medido (no cambia decisiones; queda para decidir)
+
+Las bandas T3 pasaron de **63,9% `high` / 36,0% `ambiguous`** (línea base) a **46,8% / 52,9%**. Atribución de cada `ambiguous` post-deploy, sacando un grupo a la vez:
+- `ml` contra `ti` (ya existía): 207.
+- **`context` con recidivismo 1 (score 0,2) contra ML/TI altos: 154** (56 T3 y 98 T2).
+- **`signature` `misc-attack` (0,3) contra TI 1,0: 3.**
+
+Haber visto la IP en **una** hora previa es evidencia positiva débil, pero con desacuerdo bilateral cuenta como contradicción. Lo mismo pasa con una alerta no crítica: correlacionar una alerta de Suricata **baja** la confianza en vez de subirla. Es la misma lógica de "evidencia unilateral" que ya se aplicó al recidivismo 0. **Decisión pendiente (Antonio):** sacar `context` y `signature` del chequeo de desacuerdo (que solo sumen), recalibrar la saturación, o mantenerlo. No se cambió nada.
+
+**Estado: GRUPOS `signature` Y `context` + P3 DESPLEGADOS Y VERIFICADOS EN MODO SOMBRA. Gate de R2 intacto.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
+
+- **Desacuerdo de grupos unilaterales (H53):** el recidivismo bajo (score 0,2) y las alertas no críticas (`misc-attack`, 0,3) disparan `ambiguous` contra ML/TI altos: 154 + 3 de los `ambiguous` en los primeros 13 min. Decidir si `context`/`signature` salen del chequeo de desacuerdo antes de usar las bandas para algo.
+- **Tope de 64 miembros del acumulador sin ejercer en producción (H53):** re-medir `ZCARD` máximo de `risk:*` y `used_memory` cuando haya ≥ 3 días de acumulación.
 
 - **⚠️ CONDICIÓN FORMAL (H52): `band == "high"` no puede ser gate de R2** mientras AbuseIPDB siga sin cuota y no haya un segundo proveedor de TI redundante. Salida: TI disponible en ≥ 95% de los T3 y período de sombra repetido con esa TI. Ver H52 y la especificación ampliada, sección 9, punto 14.
 - **Rotar la API key de AbuseIPDB (H52), BLOQUEANTE del período de sombra:** misma huella en el `.env` y en todos los backups de `.140` desde el 2026-09-03; marcada como expuesta desde el 2026-07-06.
