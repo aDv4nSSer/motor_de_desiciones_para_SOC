@@ -2765,7 +2765,9 @@ Las IPs que AbuseIPDB nunca vio llevan un score imputado por Monte Carlo (40 sor
   - Se actualizaron los tests de cupo no decisivo y de TTL.
   - Suite: **706 → 722 passed**, pre-commit limpio.
 
-### Diseño C (token bucket con ráfaga, D2): implementado en el working tree, pendiente de revisión de Antonio
+### Diseño C (token bucket con ráfaga, D2): commiteado en la rama `feature/d2-bucket-rafaga` (`a2afcac`), SIN deploy, trabajo futuro
+
+**Decisión (Antonio, 8-oct):** D2 queda como trabajo futuro (ROADMAP_2027). Va en una rama propia para que el pull del corte del 9-oct no lo active: la capacidad por defecto es 288.
 
 **Por qué no un bucket clásico.** Uno que arranca lleno permite capacidad + tasa × 24 h = 288 + 864 = 1.152 por día. Uno que arranca vacío en cada reset garantiza ≤ 864, pero **con este tráfico no aporta nada**: la demanda siempre supera la recarga y los tokens no se acumulan. La mejora de pendientes que se mostró antes venía de un bucket que arrancaba lleno.
 
