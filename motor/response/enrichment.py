@@ -15,6 +15,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import math
 import socket
 import ssl
 import time
@@ -26,7 +27,9 @@ import redis
 
 from attck_mapping import AttckMappingLoadError, lookup
 from constants import (
+    ABUSEIPDB_EXTERNAL_DROP_WARN,
     ABUSEIPDB_NON_DECISIVE_SHARE,
+    ABUSEIPDB_QUOTA_GAUGE_KEY,
     ABUSEIPDB_RATE_KEY_PREFIX,
     ABUSEIPDB_RATE_WINDOW_SECONDS,
     ALERT_CORRELATION_LOOKAHEAD_SECONDS,
@@ -123,10 +126,93 @@ def quota_reset_seconds(resp: httpx.Response, now: float | None = None) -> int:
     return int(min(QUOTA_MAX_SECONDS, max(QUOTA_MIN_SECONDS, seconds)))
 
 
-def abuseipdb_window_budget(settings: ResponseSettings) -> int:
+def abuseipdb_window_budget(settings: ResponseSettings, daily_quota: int | None = None) -> int:
     """Consultas a la API de AbuseIPDB permitidas por ventana del token
-    bucket, derivadas de la cuota diaria configurada (ver constants.py)."""
-    return max(1, (settings.abuseipdb_daily_quota * ABUSEIPDB_RATE_WINDOW_SECONDS) // SECONDS_PER_DAY)
+    bucket, derivadas de la cuota diaria configurada (ver constants.py).
+    `daily_quota` permite usar la cuota real informada por la API (H55)."""
+    daily = settings.abuseipdb_daily_quota if daily_quota is None else daily_quota
+    return max(1, (daily * ABUSEIPDB_RATE_WINDOW_SECONDS) // SECONDS_PER_DAY)
+
+
+# ── Cuota REAL de AbuseIPDB (H55) ───────────────────────────────────────────
+# El token bucket de H52 solo cuenta lo gastado por este proceso, en Redis:
+# no sabe cuánto se gastó antes de existir (deploy a media jornada), fuera de
+# él (otros consumidores de la misma cuenta) ni antes de un desalojo/FLUSHDB.
+# La fuente de verdad es AbuseIPDB: cada respuesta trae X-RateLimit-Limit /
+# -Remaining / -Reset. Se guarda el último estado visto en Redis (compartido,
+# sobrevive reinicios) y en el proceso (sobrevive a un FLUSHDB), y el ritmo de
+# las consultas se ajusta a lo que REALMENTE queda hasta el reset.
+_quota_seen: dict | None = None
+_quota_limit_warned = False
+# Consultas propias emitidas desde el último gauge. Un timeout de lectura SÍ
+# consume cuota (H55: 136 OK + 20 timeouts + 1 manual = 157 gastadas a las
+# 21:07:48 -03 del 7-oct) pero no trae headers: sin este contador, una racha de
+# timeouts se leería como consumo externo.
+_calls_since_seen = 0
+
+
+def _parse_quota_headers(resp: httpx.Response, now: float) -> dict | None:
+    """{remaining, limit, reset (epoch)} desde los headers, o None si falta
+    X-RateLimit-Remaining (sin él no hay nada que sincronizar)."""
+    try:
+        remaining = max(0, int(resp.headers["X-RateLimit-Remaining"]))
+    except (KeyError, ValueError):
+        return None
+    try:
+        limit: int | None = int(resp.headers["X-RateLimit-Limit"])
+    except (KeyError, ValueError):
+        limit = None
+    return {"remaining": remaining, "limit": limit, "reset": now + quota_reset_seconds(resp, now)}
+
+
+def _record_quota_gauge(
+    rdb: redis.Redis, settings: ResponseSettings, resp: httpx.Response, now: float,
+) -> None:
+    """Guarda el estado real de la cuota tras una respuesta de AbuseIPDB (200
+    o 429). Nunca lanza: sin gauge se vuelve al bucket local."""
+    global _quota_seen, _quota_limit_warned, _calls_since_seen
+    gauge = _parse_quota_headers(resp, now)
+    if gauge is None:
+        return
+    prev, own = _quota_seen, max(1, _calls_since_seen)
+    _calls_since_seen = 0
+    if prev is not None and prev["reset"] > now and prev["remaining"] - gauge["remaining"] > own + ABUSEIPDB_EXTERNAL_DROP_WARN:
+        log.warning(
+            f"AbuseIPDB cuota real: restaban {prev['remaining']} y ahora {gauge['remaining']} tras {own} consulta(s) "
+            "propia(s): consumo externo de la misma cuenta (otro cliente con la misma key o cuenta)"
+        )
+    _quota_seen = gauge
+    log.info(f"AbuseIPDB cuota real: restan {gauge['remaining']}/{gauge['limit']} (reset en {int(gauge['reset'] - now)}s)")
+    if gauge["limit"] and gauge["limit"] != settings.abuseipdb_daily_quota and not _quota_limit_warned:
+        _quota_limit_warned = True
+        log.warning(
+            f"AbuseIPDB informa un límite diario de {gauge['limit']}, distinto de abuseipdb_daily_quota="
+            f"{settings.abuseipdb_daily_quota}: se usa el menor para el presupuesto."
+        )
+    try:
+        rdb.setex(ABUSEIPDB_QUOTA_GAUGE_KEY, max(1, int(gauge["reset"] - now)), json.dumps(gauge))
+    except redis.RedisError as e:
+        log.warning(f"gauge de cuota de AbuseIPDB no escribible: {e}")
+
+
+def _read_quota_gauge(rdb: redis.Redis, now: float) -> dict | None:
+    """Último estado real de la cuota, o None si no hay uno vigente (nunca
+    visto, o ya pasó su reset). Entre Redis y la copia del proceso toma el
+    menor `remaining`: la lectura más conservadora."""
+    seen: list[dict] = []
+    try:
+        raw = rdb.get(ABUSEIPDB_QUOTA_GAUGE_KEY)
+        if raw:
+            seen.append(json.loads(raw))
+    except (redis.RedisError, ValueError, TypeError):
+        pass
+    if _quota_seen is not None:
+        seen.append(_quota_seen)
+    fresh = [
+        g for g in seen
+        if isinstance(g, dict) and isinstance(g.get("remaining"), int) and g.get("reset", 0) > now
+    ]
+    return min(fresh, key=lambda g: g["remaining"]) if fresh else None
 
 
 def _abuseipdb_rate_key(now: float) -> str:
@@ -149,12 +235,35 @@ def _take_abuseipdb_token(
         auditoría. Si Redis falla, no consulta: proteger la cuota es más
         barato que un 429 que corta la fuente hasta el día siguiente.
     """
-    budget = abuseipdb_window_budget(settings)
-    limit = budget if decisive else int(budget * ABUSEIPDB_NON_DECISIVE_SHARE)
     key = _abuseipdb_rate_key(now)
     try:
         used = int(rdb.get(key) or 0)
+        gauge = _read_quota_gauge(rdb, now)
+        daily = settings.abuseipdb_daily_quota
+        if gauge and gauge.get("limit"):
+            daily = min(daily, gauge["limit"])  # plan real menor que el configurado
+        budget = abuseipdb_window_budget(settings, daily)
+        limit = budget if decisive else int(budget * ABUSEIPDB_NON_DECISIVE_SHARE)
+        pace_binds = False
+        if gauge is not None:
+            remaining = gauge["remaining"]
+            if remaining <= 0:
+                return f"cuota real agotada (X-RateLimit-Remaining 0 de {gauge.get('limit') or '?'})"
+            # Ritmo según lo que de verdad queda: lo restante repartido en las
+            # ventanas hasta el reset. `+ used` recupera lo que esta ventana ya
+            # gastó (el remaining visto ya lo descuenta). Si un desalojo borró
+            # el contador local, remaining sigue siendo real: el error es
+            # hacia consultar menos, nunca hacia pasarse.
+            window_start = int(now // ABUSEIPDB_RATE_WINDOW_SECONDS) * ABUSEIPDB_RATE_WINDOW_SECONDS
+            windows_left = max(1, math.ceil((gauge["reset"] - window_start) / ABUSEIPDB_RATE_WINDOW_SECONDS))
+            pace = math.ceil((remaining + used) / windows_left)
+            pace_limit = pace if decisive else int(pace * ABUSEIPDB_NON_DECISIVE_SHARE)
+            if pace_limit < limit:
+                limit, pace_binds = pace_limit, True
         if used >= limit:
+            if pace_binds:
+                return (f"ritmo según cuota real: restan {remaining} para {windows_left} ventanas "
+                        f"({used}/{limit} en {ABUSEIPDB_RATE_WINDOW_SECONDS}s)")
             kind = "presupuesto de la ventana agotado" if decisive else "cupo no decisivo de la ventana agotado"
             return f"{kind} ({used}/{budget} en {ABUSEIPDB_RATE_WINDOW_SECONDS}s)"
         rdb.incr(key)
@@ -178,6 +287,7 @@ def _abuseipdb_lookup(
     `decisive` = OTX ya corrobora, así que AbuseIPDB puede cambiar la
     decisión de R2 (ver _take_abuseipdb_token).
     """
+    global _calls_since_seen
     result = EnrichmentResult(src_ip=ip)
 
     if not _is_public_ip(ip):
@@ -236,6 +346,7 @@ def _abuseipdb_lookup(
         return result
 
     # 6) Consulta API
+    _calls_since_seen += 1  # cuenta aunque termine en timeout: también gasta cuota
     try:
         resp = httpx.get(
             ABUSEIPDB_URL,
@@ -244,6 +355,7 @@ def _abuseipdb_lookup(
             timeout=settings.abuseipdb_timeout,
         )
         resp.raise_for_status()
+        _record_quota_gauge(rdb, settings, resp, time.time() if now is None else now)
         payload = resp.json().get("data", {})
         result.abuseipdb_score = payload.get("abuseConfidenceScore")
         result.abuseipdb_total_reports = payload.get("totalReports")
@@ -270,6 +382,7 @@ def _abuseipdb_lookup(
         if code == 429:
             wait = quota_reset_seconds(e.response)
             _set_negative(rdb, _abuseipdb_quota_key(settings), wait, "HTTP 429")
+            _record_quota_gauge(rdb, settings, e.response, time.time() if now is None else now)
             log.warning(f"AbuseIPDB cuota agotada: sin consultas por {wait}s")
         else:
             _set_negative(rdb, _neg_key(settings, "abuseipdb", ip), settings.ti_negative_cache_ttl, f"HTTP {code}")

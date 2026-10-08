@@ -62,6 +62,14 @@ RECIDIVISM_MAX_MEMBERS = 64
 SECONDS_PER_DAY = 86400
 ABUSEIPDB_RATE_WINDOW_SECONDS = 600
 ABUSEIPDB_RATE_KEY_PREFIX = "ti:rate:abuseipdb:"
+# H55: el bucket solo cuenta lo que ESTE proceso gastó; la cuota real vive en
+# AbuseIPDB (headers X-RateLimit-*). Último estado visto, para ajustar el ritmo
+# a lo que de verdad queda hasta el reset de las 00:00 UTC.
+ABUSEIPDB_QUOTA_GAUGE_KEY = "ti:quota:abuseipdb:gauge"
+# Un solo worker consulta con esta key: entre dos respuestas seguidas el
+# remaining baja ~1 por consulta propia. Una caída mayor a este umbral es
+# consumo de otro cliente de la misma cuenta (p. ej. un cron de etiquetado).
+ABUSEIPDB_EXTERNAL_DROP_WARN = 5
 # Fracción del presupuesto de cada ventana que pueden usar las consultas que
 # NO pueden cambiar la decisión de R2 (OTX no corrobora: AbuseIPDB llevaría
 # count como máximo a 1). El resto queda reservado para las decisivas (OTX
