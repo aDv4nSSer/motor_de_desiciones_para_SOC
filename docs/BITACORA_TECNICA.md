@@ -2765,27 +2765,28 @@ Las IPs que AbuseIPDB nunca vio llevan un score imputado por Monte Carlo (40 sor
   - Se actualizaron los tests de cupo no decisivo y de TTL.
   - Suite: **706 → 722 passed**, pre-commit limpio.
 
-### Diseño C (token bucket con ráfaga): propuesto, no implementado
+### Diseño C (token bucket con ráfaga, D2): implementado en el working tree, pendiente de revisión de Antonio
 
-Un bucket clásico que arranca lleno permite capacidad + tasa × 24 h = 288 + 864 = 1.152. **Con el bucket vacío en cada reset la garantía es estricta, pero con este tráfico no aporta nada:** la demanda siempre supera la recarga y los tokens no se acumulan (cap=288 da lo mismo que cap=6).
+**Por qué no un bucket clásico.** Uno que arranca lleno permite capacidad + tasa × 24 h = 288 + 864 = 1.152 por día. Uno que arranca vacío en cada reset garantiza ≤ 864, pero **con este tráfico no aporta nada**: la demanda siempre supera la recarga y los tokens no se acumulan (cap=288 da igual que cap=6). La mejora de pendientes que se mostró antes venía de un bucket que arrancaba lleno.
 
-**Diseño D2:**
-- El bucket arranca lleno (288) en cada reset (00:00Z) y recarga 0,6/min.
-- **Techo diario duro aparte:** `usadas_hoy < 864 − R·(1 − fracción_del_día)`, con R = 432. Garantiza ≤ 864 por día de cuota y deja una cola de ≥ 18 consultas/h al final del día.
-- `usadas_hoy = max(contador Redis, X-RateLimit-Limit − X-RateLimit-Remaining)` (gauge de H55, también en memoria). Si se desaloja el contador, se reconstruye desde la cuota real.
-- Si la cuota real va peor que la local, no hay ráfaga: rige el ritmo de H55.
+**D2:**
+- El bucket arranca lleno (`abuseipdb_burst_capacity` = 288) en cada día UTC y recarga 864/día.
+- **Techo duro aparte:** `usadas_hoy < 864 − 432·(1 − f)`, con f = fracción del día **UTC**. Garantiza ≤ 864 por día de cuota y deja que el techo crezca 18/h hacia el final del día.
+- `usadas_hoy = max(contador propio, Limit − Remaining del gauge de H55)`.
+- Si la cuota real marca más de 5 usadas por encima del bucket, este se **re-sincroniza con la real, sin ráfaga** (`tokens = 0`).
+- Con capacidad **0** vuelven las ventanas fijas de H52: es el interruptor, por `.env`.
 
-**Simulación de D2:**
+**Bug encontrado y corregido en la implementación:**
+- La primera versión, ante la discrepancia con el gauge, delegaba en las ventanas de H52.
+- Con desalojo de Redis **y** reinicio del worker a la vez, eso daba **1.000 consultas en el día**: las ventanas reparten 864 desde cero y no respetan el techo.
+- Con la re-sincronización da ≤ 865.
 
-| Escenario | Consultas en la ventana | 429 | Otros resultados |
-|---|---|---|---|
-| Tráfico real | 461 | 0 | 452 IPs bloqueadas (contra 397 con el bucket fijo); 456 pendientes/día (contra 4.966) |
-| Campaña 3x | 785 | 0 | Últimas horas con 18/h |
-| Saturación sostenida | 785 | 0 | Últimas horas con 18/h |
-| Deploy a media jornada (716 ya gastadas) | 239 | 0 | — |
-| Desalojo | Sin cambios | 0 | — |
-
-La ventana del simulador cubre 19,6 h, no el día completo.
+**Tests:** `test_abuseipdb_burst_bucket.py` (10).
+- Cubren: interruptor; ráfaga del reset; agotamiento y recarga; reserva de cola; f sobre el día UTC; el gauge manda (el caso del 8-oct: 716 reales, 0 consultas); un día completo saturado (≤ 864, 0 respuestas 429, ≥ 17/h en las últimas 4 h); desalojo; desalojo + reinicio.
+- **Mutaciones:** sin techo, 6 tests fallan; con f en hora local, fallan 5.
+- Los tests de H52/H55 fijan `abuseipdb_burst_capacity = 0` (prueban ese modo).
+- `tests/unit/conftest.py` resetea el estado de proceso de `enrichment` entre tests.
+- Suite: **732 passed**, pre-commit limpio.
 
 ### Auditoría de Cowrie (solo lectura)
 
@@ -2811,14 +2812,49 @@ La ventana del simulador cubre 19,6 h, no el día completo.
   - El corpus del etiquetador (`.139`, 2,8 GB) tiene 284.169 flows a 22/2223. **El 86% está etiquetado como benigno** (`sin_alerta+…+ip_limpia`), consecuencia del etiquetador sin AbuseIPDB desde agosto (H55): es ruido de etiqueta, no circularidad.
   - El LightGBM v7.1 (20-jun) pudo ver hasta 9.106 flows de Cowrie, de un corpus que hasta esa fecha tenía 22% etiquetados como ataque. Joaquín tiene que confirmar si entraron a la muestra de 308k.
   - El IF se reentrena todos los domingos con una **copia congelada del 20-jun** en `.140`. Ahí los flows de Cowrie son el 0,08% de los benignos de entrenamiento y el **7,6% de los ataques con los que se evalúa** su recall: la métrica del IF está algo inflada por el honeypot.
-- **Recomendación: mantener Cowrie, sin cambio en el corte del 9-oct.**
+- **Decisión (Antonio, 8-oct): se mantiene Cowrie, sin cambio en el corte del 9-oct.** Hechos aparte y sin deploy: `HONEYPOT_PORTS = {22, 2223}` en el dashboard (`917abc5`) y la propuesta de hardening `infra/systemd/propuestas/cowrie-hardening.conf` (`9dc45bb`). Lo del corpus y el recall del IF lo habla Antonio con Joaquín.
+- **Recomendación original: mantener Cowrie, sin cambio en el corte del 9-oct.**
   - Apagarlo no mejora ninguna predicción post-deploy (no llega a T3) y quita una fuente de corpus para el reentrenamiento de noviembre. Además, el puerto 22 pasaría a rechazar conexiones, lo que cambia la forma de los flows.
   - Sí conviene, en cambio aparte y con OK: (1) hardening del unit (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `CapabilityBoundingSet=` vacío); (2) etiquetar el tráfico a 2223 como `honeypot` en las métricas de la tesis y reportar con y sin él; (3) corregir `HONEYPOT_PORTS = {22}` del dashboard (el tráfico llega como 2223); (4) que Joaquín re-etiquete los flows de honeypot del corpus y los evalúe por separado.
   - Si se apagara: sería un corte de régimen solo para T2, registrado en la sección 6 de PENDIENTES con su hora.
 
+### `campana_automatica.sh` en `.140` (auditoría de solo lectura)
+
+**Corrección a lo informado antes en esta sesión:** había dicho que la campaña lanza hydra contra el SSH real. El script lo intenta, pero **no ocurre**.
+- **Origen:** `~/tesis/ataques/campana_automatica.sh` es de `aiayala`, mtime 2026-06-13 02:38, sin repositorio git (no está en el repo). Corre por la crontab de `aiayala` en `.140` (`0 2 * * *`). Hay 118 logs, del 13-jun al 8-oct.
+- **Lo que hace de verdad:**
+  - `nmap -sS` falla sin root (`QUITTING!`, ya en el primer log del 13-jun).
+  - hydra no tiene diccionario: `/usr/share/wordlists/john.lst` no existe y **0 de 118 logs mencionan hydra**.
+  - Solo corre `nmap -sV` contra `.139` en los puertos 80, 443, 8080 y 8888.
+- **Peso:** ~40 docs T2+/día en la ventana 02:00–02:05 -03, incluidos **~2 T3/día** por el puerto 80. En total, `10.10.10.3` aparece en 25.052 docs T2+ en 7 días (3,2%), casi todo tráfico del propio pipeline (API de Wazuh por 55000, OTX vía CloudFront, 8081).
+- **Métricas del período:** quedan fuera, porque los scripts de sombra filtran IPs públicas (`is_global`). Los T3 de `10.10.10.3` (43 en 7 días) terminan en `block_skipped`.
+- **¿R2 puede bloquear al motor?** No con la config actual, por doble protección:
+  - `10.10.10.3` está en `OWN_INFRA`/`DEFAULT_SAFELIST`;
+  - `is_safelisted()` exime todo rango privado.
+- **Si ocurriera** (safelist rota, por ejemplo): `firewall-drop` con `WAZUH_TARGET_AGENTS=all`.
+  - Si el AR llega al manager (`.139`), cortaría `.140` del bastion por el TTL del AR (30 min): Vector → motor (Fast Path caído), las llamadas del worker a la API de Wazuh (sin desbloqueo por API), el SSH por jump a `.140` y los sinks de OpenSearch.
+  - En `.138` el efecto es menor.
+  - No verifiqué si `all` incluye al agente 000; requiere la API con rol de lectura.
+- **Opciones, sin aplicar:**
+  1. Pausar la entrada de crontab durante el período 2. El script no cumple su objetivo desde junio y agrega ~2 T3/día de infraestructura propia.
+  2. Etiquetar como sintético el tráfico de `10.10.10.3` 02:00–02:05 en las métricas.
+  3. Mantener la allowlist actual. Ya protege; como defensa adicional, un test que falle si `10.10.10.3` sale de la safelist.
+
+### Reentrenamiento semanal del Isolation Forest (solo lectura)
+
+- **Cuándo:** cron de `.140`, `0 4 * * 0` (hora local -03). El próximo es el **domingo 11-oct a las 04:00 -03, dentro del período 2**.
+- **Promoción automática:** si `f1_nuevo ≥ 0,95 · f1_actual` hace backup, sobrescribe `isolation_forest.pkl` y **reinicia `motor-soc`**. El `anomaly_score` entra al `risk_score` (0,30), así que afecta tiers y el grupo `ml` de C.
+- **Hoy es idempotente:** entrena con la copia **congelada del 20-jun** del corpus y `random_state=42`. Los backups del 13, 20 y 27-sep y del 4-oct tienen el **mismo hash** (`4958eb4b…`) y F1 0,6021 en cada corrida.
+- **Efecto real del domingo:** un restart de `motor-soc` (~15 s sin Fast Path) con el mismo modelo.
+- **Qué registrar:**
+  - la hora del restart, como **evento** del período 2 (no como corte de régimen);
+  - verificar después que el hash de `isolation_forest.pkl` siga en `4958eb4b…`;
+  - si cambia (alguien actualizó la copia del corpus), **es un corte de régimen**.
+  - Antes del domingo, verificar que la copia del corpus de `.140` siga con mtime del 20-jun.
+- **Congelar el cron** queda como opción para Antonio; no se tocó.
+
 ### Hallazgos colaterales (no tocados)
 
-- `.140` corre `campana_automatica.sh` todos los días a las 02:00: nmap a `.139` y **hydra contra el SSH real (2222)** durante 60 s. Genera tráfico propio de ataque cada noche y puede gatillar fail2ban.
 - El repo desplegado en `.139` está en `708c21b` (5-sep), con `vector.production.toml` modificado localmente (timeout 2 → 6 s, H35): drift no commiteado.
 
 ### Predicciones falsables post-deploy de la Fase 3 A (reabrir H56 si alguna falla)
@@ -2826,10 +2862,15 @@ La ventana del simulador cubre 19,6 h, no el día completo.
 1. **T2 = 0 llamadas reales:** `grep "AbuseIPDB API tier=2"` = 0.
 2. **Consultas ≤ ~500/día y 0 respuestas 429**, una vez editado el TTL del `.env`; sin esa edición, hasta ~760/día.
 3. **TI (OTX o AbuseIPDB) disponible en ≥ 95% de las horas** en los T3 no stale.
-4. **IPs T3 sin campaña auto-bloqueadas: 21–75%.** El piso es medido; el 70% depende de la imputación. Si queda cerca del piso, la imputación estaba sesgada.
+4. **Afirmación central: las IPs T3 auto-bloqueadas sin campaña son ≥ 50% en el período 2.**
+   - El piso medido el 8-oct es **21%** (53/247, solo scores observados). La predicción del contrafactual es 70%, pero el 69% de esas IPs tiene score imputado (53 observadas + 120 imputadas).
+   - Se reporta **siempre** la fracción de scores observados contra imputados.
+   - Si queda por debajo del 50%, la imputación (P ≥ 50 = 0,84 para IPs sin clasificar) estaba sesgada y la afirmación se cae.
 5. **Pendientes por día a la baja.**
 
 Todas son predicciones hasta medirlas.
+
+**Período 1 (7-oct 20:40 → 9-oct 21:00, ~49 h):** registrado como **no válido para decidir el gate** por la regla de 72 h de la sección 2 de `PENDIENTES_MODO_SOMBRA.md`. Queda como evidencia de diagnóstico con TI sin cuota.
 
 ---
 
