@@ -298,12 +298,15 @@ def lookup_responses(trace_ids: list[str]) -> dict:
 
 # ── Categorización de puertos (verificado 2026-07-07, ver bitácora) ────────
 INFRA_PORTS = {2222, 8000, 55000, 443}
-HONEYPOT_PORTS = {22}
+# Cowrie escucha en 2223: el REDIRECT 22 -> 2223 de .139 (H34) ocurre antes de
+# NFQUEUE, así que Suricata (y el motor) ven el puerto 2223. El 22 queda por
+# los pocos flows que llegan sin redirigir (H56).
+HONEYPOT_PORTS = {22, 2223}
 
 PORT_NAMES = {
     0: "ICMP (ping/traceroute)",
     2222: "SSH admin", 8000: "Motor FastAPI", 55000: "Wazuh API", 443: "Wazuh Dashboard",
-    22: "SSH (honeypot)", 23: "Telnet", 3389: "RDP", 1433: "SQL Server", 5060: "SIP",
+    22: "SSH (honeypot)", 2223: "SSH (honeypot Cowrie)", 23: "Telnet", 3389: "RDP", 1433: "SQL Server", 5060: "SIP",
     8728: "MikroTik API", 88: "Kerberos", 53: "DNS", 67: "DHCP", 123: "NTP",
     80: "HTTP", 8080: "HTTP-alt", 8081: "HTTP-alt", 8443: "HTTPS-alt", 81: "HTTP-alt",
 }
