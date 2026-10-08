@@ -2666,6 +2666,171 @@ El bucket solo no puede prevenir el 8-oct: no sabe lo que se gastó antes de exi
 
 **Por qué H55 y no ampliación de H54:** H54 es el incidente de tráfico de infraestructura propia y del desalojo de Redis, cerrado con sus efectos residuales medidos. Esto es otra causa raíz (deploy del bucket con la cuota del día ya gastada), otra capa (rate-limiting de TI) y un cambio de código con tests propios. H54 queda con el puntero en "Efectos residuales".
 
+## H56 — Política de gasto de AbuseIPDB y evidencia para el gate: solo T3 decisivos (implementado), el score ponderado queda en sombra, y auditoría de Cowrie
+
+**Por qué H56 y no ampliación de H55:** H55 cerró una causa raíz puntual (deploy del bucket con la cuota ya gastada). Esto es otra pregunta: dónde gastar una cuota que el fix de H55 no agranda, y si la TI disponible permite subir la autonomía de R2. Tiene mediciones propias, un contrafactual, una decisión de alcance sobre el gate, un cambio de código con tests y la auditoría de Cowrie.
+
+**Datos y método (8-oct, solo lectura).**
+- **Fuentes:** `soc-responses-2026.10.07/08` (198.932 docs T2+, payload completo); `soc-responses-2026.10.02…08` (788.515 docs, campos mínimos); `worker.log` de `.140` (consultas reales a AbuseIPDB desde jul-2026 y a OTX desde el 6-oct); `suricata-alerts-2026.10.0*`; DNS inverso, FCrDNS y ASN (Team Cymru) consultados desde la Mac.
+- **No se consultó AbuseIPDB.** Redis no se leyó.
+- **Lo que no sale de OpenSearch:** la cantidad de consultas reales (`cached` mezcla OTX y AbuseIPDB). Sale de `worker.log`.
+- **Población:** T3 públicos y no stale desde el inicio del período: **504 IPs y 175 /24**. El 82% de los docs viene de `91.92.42.0/24` (TechTies, 256 IPs) y el 13% de `95.40.160.2`. El 100% va a `200.54.12.139:80`.
+- **Sensibilidad "sin campaña"** (sin esas dos fuentes): **247 IPs, 173 /24, 874 docs T3** desde el 8-oct 00:00Z.
+
+### Resultados medidos
+
+1. **La cuota se iba a T2.** De las 1.000 consultas reales del 8-oct UTC:
+   - sin bucket, el 76% fue a T2, que nunca bloquea, y el 20% llevó un T3 a `count = 2`;
+   - bajo el bucket, el 86% fue a T2 y el 12% llevó un T3 a `count = 2`.
+2. **Demanda decisiva:** IPs T3 con OTX corroborando y no vistas en las 6 h previas. Mediana 16/h, p90 194/h, en ráfagas cuando la /24 rota. Son 985 en 19 h, contra un bucket de 36/h.
+3. **Repetición:** de 4.999 consultas (3-oct a 8-oct), el 14% re-consultó una IP entre 6 y 24 h después y el 18% entre 1 y 7 días después (cota inferior: la ventana se corta).
+4. **AbuseIPDB casi no mueve el score ponderado C.**
+   - Reconstruí C igual al almacenado en 19.119 de 19.119 docs.
+   - De 7.451 docs con AbuseIPDB, solo 18 cambian de banda al quitarlo (Δ medio −0,01 puntos).
+   - La causa es estructural: con ≥ 5 pulses, OTX satura `g_ti` en 1,0, y la fusión `max + 0,3·resto` no deja que AbuseIPDB lo suba ni lo baje.
+   - "high" es, en la práctica, ML + OTX (+ contexto, que es la misma familia que ML).
+5. **OTX no discrimina maldad: es cobertura de feeds.**
+   - Corrobora el 98,1% de los T3.
+   - Pulses en los T3 sin campaña: p25 = 1, p50 = 28; el 65% satura en 5.
+   - Las 190 IPs con AbuseIPDB = 0 tienen mediana de 50 pulses.
+   - AUC de los pulses para separar AbuseIPDB ≥ 50 de < 50: 0,37 en crudo y 0,55 saturado.
+   - Salud: 0 respuestas 429 en ~25.000 consultas y 8,4% de timeouts. La tasa de timeouts es mayor de noche, con menos volumen, así que no hay indicio de rate limit.
+   - La latencia no está instrumentada: H23 sigue abierto en ese punto.
+6. **Suricata aporta poco y casi todo es reputación.**
+   - El 97% de las alertas de esas IPs es `Misc Attack` de listas (ET COMPROMISED, ET DROP Dshield, Spamhaus DROP, CINS).
+   - Tienen alguna alerta 2 de las 257 IPs de la campaña y 98 de las 247 sin campaña. La correlación del worker encuentra 79 de esas 98.
+   - **La cobertura baja viene de que Suricata no dispara, no de la correlación.**
+   - Con la config actual, una firma no crítica (0,3 × peso 35) **baja** C.
+   - El confusor de `HOME_NET` no afecta a los T3: todos van a `.139`, dentro de `200.54.12.136/29`. Hay que verificarlo con `sudo grep HOME_NET` (Antonio).
+   - **Categorías de reglas a revisar, sin activarlas:** el tráfico de la campaña es HTTP a `.139:80`. Habría que ver si están habilitadas ET WEB_SERVER, ET WEB_SPECIFIC_APPS, ET SCAN, ET EXPLOIT y ET ATTACK_RESPONSE (`suricata-update`/`disable.conf`), y cruzarlo con los paths reales del `access.log` de nginx.
+   - El SSH de administración (2222) queda fuera de NFQUEUE por diseño (H34).
+7. **Independencia (hipótesis para Joaquín, no conclusión).**
+   - AbuseIPDB y OTX coinciden en el 96,3% de los docs con ambas fuentes: las "2 fuentes" del gate binario son casi una.
+   - P(T3 | AbuseIPDB ≥ 50) = 0,31 contra 0,007; con OTX, 0,28 contra 0,022.
+   - Es coherente con H3 (parte real del corpus etiquetada por AbuseIPDB ≥ 40), pero está confundido por la campaña.
+
+### Clasificación de las IPs `high` y política de falsos positivos
+
+Clasifiqué las IPs por FCrDNS y ASN en tres clases: (a) crawler verificado por FCrDNS; (b) scanner de investigación (Censys, Onyphe, Modat, Shodan, Shadowserver, Driftnet, Stretchoid, Silent Push, Criminal IP, BitSight, TUM); (c) desconocido.
+- **`high` sin campaña: 110 IPs.** (a) 0, (b) 23, (c) 87. Los `*.bc.googleusercontent.com` son VMs de Google Cloud, no Googlebot: van en (c).
+- Los únicos crawlers verificados son 3 msnbot. AbuseIPDB les da 0, OTX no los corrobora y nunca llegan a `high`.
+- **AbuseIPDB casi no veta scanners en T3:** 22 de 23 tienen score ≥ 50.
+- **Política (decisión de Antonio, 8-oct):** en este ciclo, bloquear un scanner de investigación **no** cuenta como falso positivo (es reconocimiento no autorizado y el bloqueo de IP es reversible y de bajo radio). Se reportan siempre las dos cifras.
+- El veto gratuito de scanners por FCrDNS/ASN queda descrito como alternativa, no implementado.
+- **Hoja de revisión manual:** `reports/h56_revision_ips_high_sin_campania.csv` (110 IPs, gitignored). Faltan los paths HTTP: `access.log` de `.139` requiere el grupo `adm`.
+
+### Contrafactual (re-juego del 8-oct 00:00Z → 19:37Z)
+
+El simulador reproduce bucket, cuota, caché, bloqueo de 30 min extendido y gate binario. Validación: 288 IPs con `count = 2` simuladas contra 284 reales, con 284 en común.
+
+Las IPs que AbuseIPDB nunca vio llevan un score imputado por Monte Carlo (40 sorteos) con la tasa empírica de su clase:
+
+| Clase | P(AbuseIPDB ≥ 50) usada |
+|---|---|
+| (c) desconocido | 0,84 |
+| (b) scanner | 0,92 |
+| (a) crawler | 0,33 |
+
+"Pendientes/día" son **decisiones T3** que terminan en `alertar_pendiente_aprobacion`. No son aprobaciones: las aprobaciones se deduplican por IP (H38) y son muchas menos.
+
+| Política (sin campaña; todo el tráfico entre paréntesis) | Consultas/día | Horas con TI ≥ 95% | IPs auto-bloqueadas (observadas + imputadas) | % IPs T3 | Pérdidas correctas vs hoy | FP si scanner ≠ FP (cota 95%) | FP si scanner = FP | Pendientes/día |
+|---|---|---|---|---|---|---|---|---|
+| (0) actual | 866 (866) | 0/20 (0/20) | 20 + 8 (236 + 5) | 11% (48%) | — | 0 (≤ 12%) | 32% (≤ 52%) | 936 (13.784) |
+| (1) solo T3 | 336 (758) | 20/20 (4/20) | 53 + 120 (284 + 43) | 70% (65%) | 0 (−1) | 0 (≤ 2,1%) | 22% (≤ 30%) | 450 (9.608) |
+| (3) + no decisivas 0 + TTL 24 h | 247 (489) | 20/20 (13/20) | 53 + 120 (294 + 88) | 70% (76%) | 0 (0) | 0 (≤ 2,1%) | 22% (≤ 30%) | 450 (4.885) |
+| (5a) gate = band `high` + veto AbuseIPDB* | 134 (414–424) | 20/20 | ~98 (331–358) | 39% (66–71%) | **−8 (−5)** | 0 (≤ 3,7%) | 22% | 607 (676–5.004) |
+
+\* Cambia el gate. No se propone.
+
+**Lectura:**
+- **Las cifras de autonomía sin campaña son en su mayoría imputadas:** solo 53 de 173 IPs tienen score observado. El rango defendible va de 21% (piso medido: todo lo no observado < 50) a 70% (con la imputación).
+- **(5a) pierde 8 bloqueos correctos** (IPs `medium` que hoy se bloquean). Viola la métrica de seguridad.
+- **Decisión de Antonio (8-oct):** el gate binario se mantiene en este ciclo. El score ponderado queda como explicativo/sombra y **no** se propone reemplazar el gate.
+- Fail-open/fail-closed no aplica.
+- **El "97% `high`" no es una mejora de autonomía demostrada.** En este tráfico casi todas las señales coinciden (OTX 98,1%; AbuseIPDB-OTX 96,3%) y que el score deje fuera lo benigno **no está probado**.
+- **Plan pago y blacklist:**
+  - Con las palancas baratas la demanda diaria cabe en 864 (247–561/día). El plan Basic ($25/mes, 10.000/día) solo serviría como margen ante campañas más grandes.
+  - La blacklist gratuita (Standard) trae 10.000 IPs con `confidenceMinimum` = 100 por defecto, y cambiarlo es función de suscriptor (docs.abuseipdb.com, sección Blacklist). No se evaluó su cobertura sobre estas IPs, porque haría falta descargarla.
+
+### Implementado: Fase 3 A (`724cbb8`, sin deploy)
+
+- **`worker.py`:** pasa `tier=task.tier` a `enrich()`. Es el único cambio en el worker; no toca el gate.
+- **`enrich()`:** debajo de `r2_min_tier`, AbuseIPDB solo lee la caché, con nota `omitido (tier < r2_min_tier …)`.
+- **`ABUSEIPDB_NON_DECISIVE_SHARE`:** de 0,5 a 0, con nota `no decisiva (OTX no corrobora …)`.
+- **TTL asimétrico (3b):** `abuseipdb_cache_ttl` = 86400 para score ≥ umbral y `abuseipdb_cache_ttl_below_threshold` = 21600. El `.env` de `.140` fija `ABUSEIPDB_CACHE_TTL=21600` explícito: hasta editarlo, el TTL alto sigue en 6 h. Esa edición va con OK aparte en el deploy.
+- **Log por tier:** cada llamada real escribe `AbuseIPDB API tier=N decisiva=… (proceso: T3=n …)`.
+- **Tests:** `test_abuseipdb_tier_policy.py` (13).
+  - T2 sin API pero con lectura de caché; borde de `r2_min_tier` (incluido `tier=None` legado); stale; log por tier; el worker pasa el tier.
+  - **Invariancia** sobre 180 docs reales del 8-oct (`tests/fixtures/h56_replay_docs.json`): misma decisión de R2 con y sin el cambio, menos consultas. La mutación `<` → `<=` hace fallar el test.
+  - Se actualizaron los tests de cupo no decisivo y de TTL.
+  - Suite: **706 → 722 passed**, pre-commit limpio.
+
+### Diseño C (token bucket con ráfaga): propuesto, no implementado
+
+Un bucket clásico que arranca lleno permite capacidad + tasa × 24 h = 288 + 864 = 1.152. **Con el bucket vacío en cada reset la garantía es estricta, pero con este tráfico no aporta nada:** la demanda siempre supera la recarga y los tokens no se acumulan (cap=288 da lo mismo que cap=6).
+
+**Diseño D2:**
+- El bucket arranca lleno (288) en cada reset (00:00Z) y recarga 0,6/min.
+- **Techo diario duro aparte:** `usadas_hoy < 864 − R·(1 − fracción_del_día)`, con R = 432. Garantiza ≤ 864 por día de cuota y deja una cola de ≥ 18 consultas/h al final del día.
+- `usadas_hoy = max(contador Redis, X-RateLimit-Limit − X-RateLimit-Remaining)` (gauge de H55, también en memoria). Si se desaloja el contador, se reconstruye desde la cuota real.
+- Si la cuota real va peor que la local, no hay ráfaga: rige el ritmo de H55.
+
+**Simulación de D2:**
+
+| Escenario | Consultas en la ventana | 429 | Otros resultados |
+|---|---|---|---|
+| Tráfico real | 461 | 0 | 452 IPs bloqueadas (contra 397 con el bucket fijo); 456 pendientes/día (contra 4.966) |
+| Campaña 3x | 785 | 0 | Últimas horas con 18/h |
+| Saturación sostenida | 785 | 0 | Últimas horas con 18/h |
+| Deploy a media jornada (716 ya gastadas) | 239 | 0 | — |
+| Desalojo | Sin cambios | 0 | — |
+
+La ventana del simulador cubre 19,6 h, no el día completo.
+
+### Auditoría de Cowrie (solo lectura)
+
+- **Dónde corre:** en `.139` (el bastion), como servicio systemd nativo `cowrie.service`. Usuario `cowrie` (UID 1010, sin sudo, grupos `cowrie` y `users`), venv de Python, sin contenedor.
+- **Redirección:** H34 documenta el REDIRECT `tcp dpt:22 → 2223`. No lo re-verifiqué: la tabla `nat` requiere sudo.
+- **Aislamiento:**
+  - El filesystem está bien: el home de `aiayala` es 750 y los secretos son 600. El grupo `users` no da acceso a nada de `aiayala`.
+  - Pero el unit **no tiene hardening de systemd** (`NoNewPrivileges`, `ProtectSystem`, `ProtectHome` y `PrivateTmp` desactivados, capability set completo).
+  - Comparte host, kernel y red con el bastion, Suricata y el Wazuh Manager.
+  - `eve.json` es 644: `cowrie` puede leer toda la metadata de red.
+- **Cómo entra al pipeline:**
+  - **Solo vía Suricata.** Vector (config desplegada) no ingiere `cowrie.json`, ni Wazuh tampoco. Los flows a `.139:2223` llegan al motor como cualquier otro.
+  - El contenido de sesión (credenciales, comandos) no se usa en ninguna parte del pipeline.
+- **Peso (7 días):**
+  - **33.294 docs T2 (5,3% de los T2) y 0 T3.** Son 1.285 IPs, el 4,4% de las IPs T2.
+  - 61 IPs T3 (3,7%) tocaron Cowrie alguna vez, pero llegaron a T3 por otros puertos.
+  - Solapamiento: 0 con la campaña; 18 con las 504 IPs T3; 13 con las 110 `high` sin campaña.
+  - **Cuota de AbuseIPDB:** el 1,1% de las consultas reales (56 de 4.999). Con la política (1), 0.
+- **Sesgo:**
+  - Como **nunca llega a T3**, no infla nada de R2, del gate ni de las políticas (1)-(3). Precisión proxy en T3: 94,9% con las IPs de Cowrie y 95,0% sin ellas.
+  - En T2 infla el proxy en +0,8 pp (41,8% contra 41,0%; Cowrie sola da 92,1%).
+- **Corpus y circularidad:**
+  - El corpus del etiquetador (`.139`, 2,8 GB) tiene 284.169 flows a 22/2223. **El 86% está etiquetado como benigno** (`sin_alerta+…+ip_limpia`), consecuencia del etiquetador sin AbuseIPDB desde agosto (H55): es ruido de etiqueta, no circularidad.
+  - El LightGBM v7.1 (20-jun) pudo ver hasta 9.106 flows de Cowrie, de un corpus que hasta esa fecha tenía 22% etiquetados como ataque. Joaquín tiene que confirmar si entraron a la muestra de 308k.
+  - El IF se reentrena todos los domingos con una **copia congelada del 20-jun** en `.140`. Ahí los flows de Cowrie son el 0,08% de los benignos de entrenamiento y el **7,6% de los ataques con los que se evalúa** su recall: la métrica del IF está algo inflada por el honeypot.
+- **Recomendación: mantener Cowrie, sin cambio en el corte del 9-oct.**
+  - Apagarlo no mejora ninguna predicción post-deploy (no llega a T3) y quita una fuente de corpus para el reentrenamiento de noviembre. Además, el puerto 22 pasaría a rechazar conexiones, lo que cambia la forma de los flows.
+  - Sí conviene, en cambio aparte y con OK: (1) hardening del unit (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `CapabilityBoundingSet=` vacío); (2) etiquetar el tráfico a 2223 como `honeypot` en las métricas de la tesis y reportar con y sin él; (3) corregir `HONEYPOT_PORTS = {22}` del dashboard (el tráfico llega como 2223); (4) que Joaquín re-etiquete los flows de honeypot del corpus y los evalúe por separado.
+  - Si se apagara: sería un corte de régimen solo para T2, registrado en la sección 6 de PENDIENTES con su hora.
+
+### Hallazgos colaterales (no tocados)
+
+- `.140` corre `campana_automatica.sh` todos los días a las 02:00: nmap a `.139` y **hydra contra el SSH real (2222)** durante 60 s. Genera tráfico propio de ataque cada noche y puede gatillar fail2ban.
+- El repo desplegado en `.139` está en `708c21b` (5-sep), con `vector.production.toml` modificado localmente (timeout 2 → 6 s, H35): drift no commiteado.
+
+### Predicciones falsables post-deploy de la Fase 3 A (reabrir H56 si alguna falla)
+
+1. **T2 = 0 llamadas reales:** `grep "AbuseIPDB API tier=2"` = 0.
+2. **Consultas ≤ ~500/día y 0 respuestas 429**, una vez editado el TTL del `.env`; sin esa edición, hasta ~760/día.
+3. **TI (OTX o AbuseIPDB) disponible en ≥ 95% de las horas** en los T3 no stale.
+4. **IPs T3 sin campaña auto-bloqueadas: 21–75%.** El piso es medido; el 70% depende de la imputación. Si queda cerca del piso, la imputación estaba sesgada.
+5. **Pendientes por día a la baja.**
+
+Todas son predicciones hasta medirlas.
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)
@@ -2680,6 +2845,7 @@ El bucket solo no puede prevenir el 8-oct: no sabe lo que se gastó antes de exi
 - **Cuota de AbuseIPDB, agotamiento del 8-oct (H55): causa confirmada** = deploy del bucket con 716 ya gastadas (transitoria; el cron de `.139` cobra 0 de esa cuenta). Pendiente: desplegar el gauge a `.140`, verificar que el 9-oct no se agote, y que Antonio revoque la key vieja (`0170c4a5f8`).
 - **Etiquetador de `.139` sin scores de AbuseIPDB desde ≥ 10-ago (H55, colateral):** el 100% de las muestras devuelve `-1` y la key de la crontab (`54032bf755`) no es la del motor. Afecta las etiquetas del corpus de reentrenamiento, no el período de sombra. Además hay una key en texto plano en `.139:~/.bash_history`.
 - **Período de modo sombra (H52):** seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`.
+- **H56, pendientes:** deploy de la Fase 3 A (`724cbb8`) en el corte del 9-oct a las 21:00 -03 + edición de `ABUSEIPDB_CACHE_TTL` en el `.env` de `.140` (OK aparte); diseño C (D2) a revisión; hardening de `cowrie.service`; `HOME_NET` y paths HTTP para cerrar E2; revisión manual de las 110 IPs `high`; `campana_automatica.sh` contra el SSH real; drift de Vector en `.139`.
 - **H51 sin documentar** (número reservado, trabajo de otra sesión).
 
 - **Fuente de classtype para el Fast Path (H50):** hoy no existe. Decidir si se construye (Vector agrega `flow_id` a los flows y lleva las alertas al motor, que las guarda en Redis `alert:{flow_id}` con TTL para un lookup O(1)) sabiendo que activa el override T3 en producción con `enforce`, o si en la tesis se declara que el override y ATT&CK operan solo cuando el classtype llega. `category` de las alertas trae la descripción; `attck_mapping.lookup()` ya la acepta.
