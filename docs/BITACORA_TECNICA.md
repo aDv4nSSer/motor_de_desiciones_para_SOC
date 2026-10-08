@@ -2554,11 +2554,22 @@ La primera medición del volumen hizo un `GET` de los ~780.000 casos **en un sol
 - **Lo que se perdió:**
   - **El stream `soc:response:audit` con su consumer group.** El worker lo recreó en su siguiente `XADD` (primer id 03:32:45Z), pero el grupo `response-audit-indexer` no existe y **el indexador no persiste nada en `soc-responses-*` desde las 03:32:41Z**.
   - Al reiniciarlo, `start()` recrea el grupo desde `id="0"` y retoma la cadena desde la cabeza en OpenSearch: se recupera todo lo posterior a 03:32:45Z.
-  - Se pierden los registros no indexados entre 03:32:41,99Z y el desalojo (segundos). **Queda un hueco de auditoría pequeño pero real**, a documentar como tal en la cadena.
+  - Se pierden los registros no indexados entre 03:32:41,99Z y el desalojo (segundos). **Queda un hueco de auditoría pequeño pero real**, documentado abajo.
   - Probable: casi toda la caché L1 de TI (quedan 3 claves `ti:*`) y parte de los acumuladores de recidivismo `risk:ip:*` (quedan 2.149). Esto último baja el grupo `context` del score de sombra para las IPs afectadas desde las 03:32Z. Hay que mencionarlo en el checkpoint.
 - **Lo que no se perdió:** `soc-decisions` siguió al día (grupo `opensearch-indexer` con lag 0) y el worker conserva su grupo sobre `soc:response:tasks`.
 - **Corrección a lo informado antes:** los 72.205 desalojos y las 55.147 entradas huérfanas los presenté como desgaste previo de LRU. Lo más probable es que los haya causado esta consulta.
 - **Lección:** en `.140`, nunca leer una colección grande de Redis en una sola respuesta. El script de limpieza usa `SSCAN` en lotes de 2.000.
+
+**Recuperación y cierre (2026-10-08 01:20:46 -03).**
+- Antonio reinició `response-audit-indexer` (PID 161864). Recreó el grupo desde `0` y reindexó el stream recreado: a las 01:23:58 -03 iba por 04:20:57Z con lag 249 y bajando.
+- **Hay 18 documentos con `event_time` posterior al reinicio:** el indexador escribe otra vez en `soc-responses-*`.
+- **`verify_chain`** sobre todo lo indexado desde 03:00Z más el eslabón ancla previo: **7.097 eslabones (seq 1566121 → 1573217), 0 saltos de secuencia, 0 problemas.**
+- **Empalme del hueco:** seq 1568910 (03:32:41,987Z, `stream_id` 1791430361987-0, último del stream desalojado) → seq 1568911 (03:32:45,538Z, `stream_id` 1791430365538-0, primero del stream recreado), con `prev_hash` = hash anterior.
+- **El hueco es una pérdida real de registros, no una corrupción ni un fallo de verificación.** Los registros que el worker escribió en el stream viejo después de 03:32:41,987Z y antes del desalojo nunca se indexaron. Por eso nunca recibieron `chain_seq` y la cadena es continua sin ellos.
+  - Consecuencia: **la hash-chain prueba la integridad de lo persistido, no la completitud del stream.** Esta pérdida no la detecta `verify_chain` y queda registrada solo acá.
+  - **Cuántos se perdieron no se puede determinar.** El intervalo es de 3,55 s. A la tasa media (~80 registros/min) serían ~5, pero en la misma ventana hay separaciones normales de hasta 8,7 s sin pérdida, así que el rango honesto es 0 a ~5.
+  - Las decisiones correspondientes sí están en `soc-decisions` (otra cadena, no afectada), pero no su registro R1/R2.
+- **Incidente cerrado** en cuanto a la persistencia de auditoría. Siguen abiertos el efecto sobre la caché de TI (se repuebla sola) y sobre `risk:ip:*` (recidivismo subestimado para las IPs desalojadas, a mencionar en el checkpoint del período de sombra).
 
 ### Limpieza de Redis (2026-10-08 01:02 -03)
 
@@ -2573,12 +2584,12 @@ Script: `scripts/mantenimiento/h54_limpiar_casos_infra.py`. Simula por defecto; 
 
 ### Pendientes que deja H54
 
-1. **Reiniciar `response-audit-indexer`** (requiere `sudo` de Antonio) y verificar que reindexe desde 03:32:45Z con la cadena íntegra (`verify_chain`). El stream tiene `maxlen` 100k a ~80 registros/min: hay unas 20 h de margen antes de perder entradas.
+1. ~~Reiniciar `response-audit-indexer` y verificar la cadena.~~ Hecho: 01:20:46 -03, `verify_chain` 0 problemas (ver "Recuperación y cierre").
 2. **Dedup/TTL de casos:** siguen entrando unos 58.000 casos/día de IPs públicas. Al ritmo actual, Redis vuelve a acercarse al límite en días.
 3. Para Antonio (infra): `HOME_NET` en Suricata, BPF opcional del control-plane, scrape de `.138` a IPs viejas.
 4. `motor/redis_client.py` tiene `REDIS_HOST` con default `200.54.12.140` (topología vieja). En producción lo pisa el `.env`, pero el default está desactualizado.
 
-**Estado: FIX DESPLEGADO Y VERIFICADO EN `.140`. LIMPIEZA HECHA. INDEXADOR DE AUDITORÍA DETENIDO DESDE 03:32:41Z, PENDIENTE DE RESTART.**
+**Estado: FIX DESPLEGADO Y VERIFICADO EN `.140`. LIMPIEZA HECHA. INDEXADOR DE AUDITORÍA RECUPERADO (01:20:46 -03), CADENA ÍNTEGRA; HUECO DE 0 A ~5 REGISTROS ENTRE 03:32:41,987Z Y 03:32:45,538Z, DOCUMENTADO COMO PÉRDIDA REAL.**
 
 ---
 
