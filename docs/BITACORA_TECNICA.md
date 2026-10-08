@@ -2574,7 +2574,7 @@ La primera medición del volumen hizo un `GET` de los ~780.000 casos **en un sol
 
 **Efectos residuales (medidos el 8-oct a las 13:57 -03, ~13 h después).** Sin desalojos nuevos: `evicted_keys` sigue en 72.205.
 - **Caché de TI: sin efecto residual.** Hay 2.580 entradas OTX (`soc:enrich:otx:<ip>`) con TTL de 6 h: cualquier entrada desalojada ya habría vencido igual, así que la caché se renovó entera.
-  - La caché por IP de AbuseIPDB está en 0, pero **no por el desalojo**: está activa la marca `soc:enrich:abuseipdb:quota_exhausted` hasta el reset de 00:00 UTC (TTL ~7 h). Afecta el criterio P2 (TI disponible) del período y hay que mirarlo en el checkpoint. Con el token bucket (~864 consultas/día de presupuesto) la cuota no debería agotarse: queda abierto por qué se agotó.
+  - La caché por IP de AbuseIPDB está en 0, pero **no por el desalojo**: está activa la marca `soc:enrich:abuseipdb:quota_exhausted` hasta el reset de 00:00 UTC (TTL ~7 h). Afecta el criterio P2 (TI disponible) del período y hay que mirarlo en el checkpoint. Con el token bucket (~864 consultas/día de presupuesto) la cuota no debería agotarse: queda abierto por qué se agotó. **→ Resuelto en H55:** causa confirmada con `worker.log`. El motor gastó 716 en los 56 min previos al deploy del bucket y el bucket gastó las 284 restantes hasta el 429 de las 05:40 -03. No fue el desalojo.
 - **Recidivismo (`risk:ip:*`): efecto residual real y acotado.** Hay 5.701 claves (contra 2.149 en el incidente), pero perdieron su historial las IPs desalojadas.
   - **Método:** se compara el `recidivism_count` máximo de cada IP entre el inicio del período (23:40Z) y el desalojo con el mínimo posterior. Dentro de horas el conteo solo puede crecer, así que si bajó, la clave se desalojó.
   - **Resultado:** 967 IPs tienen dato en ambos tramos y **235 bajaron** (típicamente de 9 a 0). De esas, 135 se vieron en la última hora y **36 siguen por debajo** de su valor previo.
@@ -2604,6 +2604,70 @@ Script: `scripts/mantenimiento/h54_limpiar_casos_infra.py`. Simula por defecto; 
 
 ---
 
+## H55 — La cuota de AbuseIPDB se agotó a las 05:40 -03 del 8-oct con el token bucket activo: el motor ya había gastado 716 antes del deploy del bucket (causa confirmada, transitoria); el ritmo pasa a seguir los headers `X-RateLimit-*`
+
+**Contexto:** el 8-oct a las 13:57 -03 estaba activa `soc:enrich:abuseipdb:quota_exhausted` hasta el reset de 00:00 UTC, aunque el bucket de H52 (6 por ventana de 10 min, 864/día) debería dejar 136 de margen. H54 lo dejó abierto. Una primera sesión, sin acceso a los servidores, dejó un borrador con causa "probable, no confirmada" y el código del gauge. **Esta sección reemplaza ese borrador con lo verificado en `.139`/`.140` el 8-oct entre 15:06 y 15:40 -03** (solo lectura, más una única consulta a AbuseIPDB que devolvió 429 y no consumió cuota).
+
+### Causa confirmada: deploy del bucket a media jornada (hipótesis A). El motor solo gastó las 1.000
+
+La cuenta se reconstruye desde `worker.log` de `.140` (líneas `httpx` de `api.abuseipdb.com`: `200 OK`, `429` y `ReadTimeout`). Día de cuota = día UTC = 21:00 -03 del día anterior a 21:00 -03.
+
+**Calibración: los timeouts de lectura SÍ consumen cuota.** A las 21:07:48 -03 del 7-oct, la verificación manual de P1 (H52) leyó `X-RateLimit-Remaining: 843`, es decir 157 gastadas. Hasta ese segundo, el worker registra **136 `200 OK` + 20 `ReadTimeout`** (todos entre 21:00:03 y 21:01:29, en la ráfaga del reset), más **1** de la llamada manual: 136 + 20 + 1 = **157, exacto**. AbuseIPDB procesa y cobra la consulta aunque el cliente corte por timeout (4 s).
+
+**Línea de tiempo del día de cuota 2026-10-08 (UTC), en hora -03:**
+
+| Tramo | Fuente | Consultas cobradas |
+|---|---|---|
+| 21:00:00 – 21:56:08 (56 min, **sin bucket**) | motor: 695 `200 OK` + 20 timeouts | 715 |
+| 21:07:48 | verificación manual de P1 (H52) | 1 |
+| **= N_pre (antes del deploy)** | | **716** |
+| 21:56:08 – 05:40:26 (**bajo el bucket**) | motor: 284 `200 OK`, 0 timeouts. Exactamente 36/h (6 por ventana): 6 + 36 × 7 + 26 | 284 |
+| 03:41:58 – 03:47:06 | cron `etiquetador_diario.py` de `.139`: 900 intentos | **0** (ver B) |
+| **Total** | | **1.000 = `X-RateLimit-Limit`** |
+| **05:40:28 (`08:40:28Z`)** | primer `429`; `quota_exhausted` con TTL 55.171 s, hasta las 21:00 -03 | — |
+
+- **Margen sin explicar: 0.** Con el bucket quedaban 1.000 − 716 = 284, que a 36/h duran 7,9 h: agotamiento esperado a las ~05:49 -03, observado a las **05:40:28**.
+- **Corrección al borrador:** no fue `N_pre ≈ 424` con agotamiento a media jornada. Fue **`N_pre = 716`** (~12,8/min promedio en esos 56 min) y el agotamiento ocurrió de madrugada. A las 13:57 se veía "agotada" porque la marca dura hasta el reset.
+- **Disponibilidad medida (`soc-responses-2026.10.08`, docs `response` T2+, por hora -03):** después del 429, `abuseipdb_available = true` siguió solo por la caché de 6 h de las IPs consultadas antes: 2.013 (05h), 752 (06h), ~600/h hasta las 09h, 171 (10h), 4 (11h) y **0 desde las 12h**. Del lado de la demanda, `omitido por throttling` presupuesto/no decisivo entre 22h y 05h (pico 2.165 + 1.134 a las 03h) y `cuota diaria agotada` desde las 05h (~5.000/h desde las 09h).
+- **Qué NO se puede derivar de `soc-responses`:** el número de consultas reales a la API. `payload` no está indexado (`enabled: false`), así que hay que recorrer el `_source`, y `available = true` no distingue caché de consulta nueva (`cached` mezcla OTX y AbuseIPDB). **La cuenta de consultas sale de `worker.log`**; `soc-responses` solo da la disponibilidad y la demanda por hora.
+- **Días anteriores (sin bucket), misma cuenta:** 5-oct UTC 997 OK + 3 timeouts, 429 a las 21:25:15 -03. 6-oct: 995 + 5, 429 a las 21:30:18. 7-oct: 987 + 13, 429 a las 22:51:53. **Las tres suman 1.000 exactas**, todas con la key vieja (`0170c4a5f8`).
+- **Es transitoria: solo el día del deploy.** Desde el 9-oct el bucket arranca con el día: ≤ 864 cobradas (el token se toma antes de la consulta, así que los timeouts también cuentan en el bucket). **Predicción verificable:** el 9-oct UTC no hay `429`.
+
+### Hipótesis descartadas, con el dato
+
+- **B — Cron `etiquetador_diario.py` de `.139` (`30 3 * * *`, `MAX_API_CALLS = 900`): no consume la cuota del motor.** El 8-oct corrió la fase AbuseIPDB entre 03:41:58 y 03:47:06 -03 con 900 intentos. Mientras tanto, el motor siguió en 36/h en la hora 03 y el día cierra en 1.000 sin faltante. Si el cron hubiera cobrado aunque fuera las ~60 que quedaban, el motor habría recibido el 429 a las 03:4x, no a las 05:40. La crontab usa otra key: huella **`54032bf755`**, distinta de `0170c4a5f8` (motor vieja) y de `e7ebe17561` (motor nueva). El `~/tesis/ataques/.env` y el historial de shell de `.139` tienen una cuarta, **`1d9cb73eb2`**.
+- **C — Key vieja sin revocar usada por terceros: sin consumo medible.** Los días 5, 6 y 7-oct UTC, el motor con la key vieja cierra en 1.000 exactas, y el 8-oct, con la nueva, también. Si alguien más gastara de la misma cuenta, el motor tendría menos de 1.000 cobradas antes del 429. La documentación oficial **no dice** si el límite es por cuenta o por key: la sección "API Daily Rate Limits" de https://docs.abuseipdb.com/ habla de "your daily limit" por plan. Para este incidente no hace falta saberlo: en los dos casos el faltante es 0. **Revocar la key vieja sigue pendiente igual** (estuvo expuesta).
+- **D — Desalojo de `ti:rate:abuseipdb:*` (incidente H54, 00:32 -03 = 03:32Z): descartado con datos.** La hora 00 -03 tiene exactamente 36 consultas, como todas las demás bajo el bucket, así que no hubo ventana con el presupuesto reabierto. `evicted_keys` sigue en **72.205** a las 15:10 -03 (sin desalojos nuevos).
+- **E — Otras fugas del motor: descartadas.** Un solo proceso consulta: `response-worker` (PID 155587, `WorkingDirectory=~/tesis/repo/motor`, `NRestarts=0` desde el restart de H54 a las 00:54:49 -03). Ese restart no reprocesó backlog con consultas: la hora 00 -03 tiene 36. No hay `ABUSEIPDB_DAILY_QUOTA` ni otros overrides en el `.env` real. Los otros clientes de `api.abuseipdb.com` en los árboles desplegados son copias o `.bak` de `enrichment.py` (`~/tesis/motor/`, no ejecutadas por ningún servicio) y los scripts de etiquetado de `.139`: `etiquetador_diario.py`, `re_labeler.py` y `resolver_pendientes.py`, sin usos recientes en el historial. Igual, la cuenta cerrada en 1.000 excluye cualquier consumidor adicional de esa cuenta.
+
+### Hallazgo colateral (no es la causa): el etiquetador de `.139` no obtiene ningún score de AbuseIPDB desde al menos el 10-ago
+
+En los 40 reportes de `~/tesis/ataques/logs/` con 900 consultas (10–19-ago y 9-sep–8-oct), **cada muestra de progreso** (`ultimo score`, 1 de cada 100 consultas) es **`-1`**. `query_abuse()` devuelve `-1` ante cualquier excepción (401, 429, timeout) y no registra el código. "Consultas completadas: 900" cuenta **intentos**, no éxitos. La caché `abuseipdb_cache.json` tiene 13.166 IPs. Si tuviera éxitos diarios, crecería ~900/día. La causa (key `54032bf755` inválida o revocada, o cuenta agotada) no se verificó: haría falta una consulta con esa key, fuera del alcance acordado. **Efecto:** las etiquetas por AbuseIPDB del corpus de reentrenamiento salen solo de esa caché vieja. Es para Joaquín/Antonio (Camino E), no para el período de sombra. Además, `.139:~/.bash_history` tiene una key de AbuseIPDB en texto plano (4 líneas, huella `1d9cb73eb2`).
+
+### Qué se cambió: gauge de la cuota real (`enrichment.py`, `constants.py`)
+
+El bucket solo no puede prevenir el 8-oct: no sabe lo que se gastó antes de existir. El gauge sí. Con él, la primera respuesta después del deploy habría informado `remaining ≈ 283` para 137 ventanas, y el ritmo habría bajado a `ceil(283/137) = 3` por ventana, sin llegar al 429.
+- **Gauge.** Cada respuesta de AbuseIPDB (200 o 429) guarda `{remaining, limit, reset}` desde `X-RateLimit-*` en Redis (`ti:quota:abuseipdb:gauge`, TTL hasta el reset) y en memoria del proceso. La copia en memoria sobrevive a un desalojo o `FLUSHDB`, y la de Redis a un reinicio. Se toma el menor `remaining` vigente. `reset`: `Retry-After`, si no `X-RateLimit-Reset` (epoch, confirmado en el 429 de hoy: `1791504000` = 9-oct 00:00Z), y si no, la próxima medianoche UTC.
+- **Ritmo.** El tope por ventana es `min(presupuesto local, ceil((remaining + usado en la ventana) / ventanas hasta el reset))`. **En régimen normal no cambia nada:** arrancando el día con el bucket, `ceil((1000 − 6k)/(144 − k)) ≥ 7 > 6` para todo `k`, así que manda el presupuesto local de H52. El gauge solo actúa si la cuota real va peor que el bucket: arranque a media jornada, consumo externo, plan menor o desalojo. Con `remaining = 0` se corta sin consultar. El cupo no decisivo conserva su fracción.
+- **Corrección a la versión borrador (esta sesión):** el aviso de consumo externo comparaba dos respuestas seguidas asumiendo **una** consulta propia entre ellas. Un timeout cobra cuota y no trae headers, así que una racha de timeouts (el 8-oct hubo 20 seguidos) se habría leído como "consumo externo". Ahora se cuentan las consultas propias emitidas desde el último gauge (`_calls_since_seen`, incluidos los timeouts), y el WARNING salta solo si la caída supera `propias + ABUSEIPDB_EXTERNAL_DROP_WARN (5)`. Hay test de regresión: 8 timeouts y luego un 200 no avisan, y falla con el código del borrador.
+- **Sin headers** (o Redis caído, o gauge vencido): mismo comportamiento que H52.
+- **Notas de auditoría nuevas**, distinguibles de las de H52: `omitido por throttling (cuota real agotada …)` y `omitido por throttling (ritmo según cuota real: restan R para W ventanas …)`.
+- **Log:** `AbuseIPDB cuota real: restan R/L (reset en Ns)` en cada consulta real (INFO). Hay WARNING `consumo externo` solo ante caídas no explicadas y WARNING único si `X-RateLimit-Limit` ≠ `abuseipdb_daily_quota`.
+
+**Tests:** `tests/unit/test_abuseipdb_quota_gauge.py` (13): gauge desde 200 y 429, sin headers (H52 intacto), gauge vencido, `remaining = 0`, ritmo por debajo del presupuesto, flush de Redis, plan menor, consumo externo sí/no, **timeouts propios no son consumo externo**, y las dos simulaciones de arranque a media jornada. Suite completa: **706 passed** en la Mac. `pre-commit` (detect-secrets, bandit, ruff y hooks básicos): **limpio**.
+
+**Límites conocidos:**
+- Tras un flush, la ventana puede conceder otra vez el *ritmo* (no el presupuesto entero): sobregasto acotado a una ventana.
+- El gauge solo se actualiza con consultas propias. Si otro cliente gasta entre dos, se ve recién en la respuesta siguiente, y el 429 sigue siendo el respaldo final.
+- Un timeout gasta cuota sin actualizar el gauge. En la ventana en curso, el ritmo puede sobreestimar en tantas consultas como timeouts haya habido, y se corrige con la siguiente respuesta.
+- `GET` + `INCR` no atómico: sin efecto con un único `response-worker` secuencial.
+
+**Qué mirar después del reset de las 21:00 -03 de hoy (día de cuota 9-oct UTC):** (1) `worker.log` sin `429` ni `cuota agotada` hasta las 21:00 -03 del 9-oct. (2) `200 OK` + timeouts ≤ 864 en el día. (3) Con el gauge desplegado: líneas `AbuseIPDB cuota real: restan R/L`, con `R` bajando ~1 por consulta y ≥ ~136 al final del día, y **0** WARNING `consumo externo`. Si el 9-oct se agota, la causa es otra y H55 se reabre.
+
+**Por qué H55 y no ampliación de H54:** H54 es el incidente de tráfico de infraestructura propia y del desalojo de Redis, cerrado con sus efectos residuales medidos. Esto es otra causa raíz (deploy del bucket con la cuota del día ya gastada), otra capa (rate-limiting de TI) y un cambio de código con tests propios. H54 queda con el puntero en "Efectos residuales".
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - ~~**Desacuerdo de grupos unilaterales (H53)**~~ → **resuelto con P4** (`a90df02`): solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%.
@@ -2613,6 +2677,8 @@ Script: `scripts/mantenimiento/h54_limpiar_casos_infra.py`. Simula por defecto; 
 - **⚠️ CONDICIÓN FORMAL (H52): `band == "high"` no puede ser gate de R2** mientras AbuseIPDB siga sin cuota y no haya un segundo proveedor de TI redundante. Salida: TI disponible en ≥ 95% de los T3 y período de sombra repetido con esa TI. Ver H52 y la especificación ampliada, sección 9, punto 14.
 - ~~**Rotar la API key de AbuseIPDB (H52), BLOQUEANTE del período de sombra**~~ → **hecho 2026-10-07** (`0170c4a5f8` → `e7ebe17561`, `200` a las 21:07:48 -03, ver H52). Falta que Antonio **revoque la key vieja** en el panel de abuseipdb.com.
 - **Cuota de AbuseIPDB estructuralmente insuficiente (H52):** 1.000/día; sin control se agotaba ~50 min después del reset. **Mitigado con el token bucket** (`5114223`): reparto de 864/día en ventanas de 10 min, con prioridad a los cupos decisivos. La cuota sigue siendo baja para el volumen (~2.800 IPs públicas/h): el plan pago queda como alternativa si el reparto no alcanza para P2.
+- **Cuota de AbuseIPDB, agotamiento del 8-oct (H55): causa confirmada** = deploy del bucket con 716 ya gastadas (transitoria; el cron de `.139` cobra 0 de esa cuenta). Pendiente: desplegar el gauge a `.140`, verificar que el 9-oct no se agote, y que Antonio revoque la key vieja (`0170c4a5f8`).
+- **Etiquetador de `.139` sin scores de AbuseIPDB desde ≥ 10-ago (H55, colateral):** el 100% de las muestras devuelve `-1` y la key de la crontab (`54032bf755`) no es la del motor. Afecta las etiquetas del corpus de reentrenamiento, no el período de sombra. Además hay una key en texto plano en `.139:~/.bash_history`.
 - **Período de modo sombra (H52):** seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`.
 - **H51 sin documentar** (número reservado, trabajo de otra sesión).
 
