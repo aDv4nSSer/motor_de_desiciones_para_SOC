@@ -70,3 +70,11 @@ El gate binario queda como está. En la tesis se reporta el modo sombra como res
 ## 6. Checkpoints del período
 
 _(Se anexan acá, uno por día, con la salida de `shadow_period_checkpoint.py`.)_
+
+| Momento | Evento | Efecto en la medición |
+|---|---|---|
+| 2026-10-07 20:40 -03 (`2026-10-07T23:40:00Z`) | Inicio formal del período | — |
+| 2026-10-07 21:07 -03 | P1 cerrado: key de AbuseIPDB rotada y `200` verificado | — |
+| **2026-10-07 21:56:08 -03 (`2026-10-08T00:56:08Z`)** | **CORTE DE RÉGIMEN:** deploy del token bucket de AbuseIPDB (6 cada 10 min, OTX primero, prioridad a decisivas; `5114223`, H52) | **P2 y la disponibilidad de AbuseIPDB se evalúan solo desde el corte:** `shadow_period_checkpoint.py --since 2026-10-08T00:56:08Z`. Antes y después no son comparables. Los criterios 1-3 (/24, count ≥ 2, invariancia) siguen usando la ventana completa desde 23:40Z, pero el conteo de T3 con count ≥ 2 se reporta también separado por tramo |
+
+**Para el checkpoint de mañana (~20:40 -03):** correr el script dos veces. Una con la ventana completa (default) para los criterios 1-3 y las horas, y otra con `--since 2026-10-08T00:56:08Z` para P2 (fila "TI disponible" y "OTX / AbuseIPDB por separado"). Anotar las dos.
