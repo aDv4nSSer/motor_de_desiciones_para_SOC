@@ -175,3 +175,24 @@ class TestInvarianciaSombra:
         monkeypatch.setattr(rep, "T2_OWN_INFRA_CUT", 1_000.0)
         p = {**self._payload(2_000.0, ACCION_ALERTAR_CREAR_CASO), "src_ip": "10.30.30.50"}
         assert rep.matches_r2(p, _settings())
+
+
+class TestLimpiezaH54:
+    """scripts/mantenimiento/h54_limpiar_casos_infra.py: qué se borra y qué no."""
+
+    @staticmethod
+    def _case(host: str, kind="network_t2_unconfirmed", state="abierto", history=1) -> str:
+        import json
+        return json.dumps({"case_id": "c", "kind": kind, "host": host, "state": state,
+                           "history": [{"state": state}] * history})
+
+    def test_clasificacion(self) -> None:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "mantenimiento"))
+        from h54_limpiar_casos_infra import classify
+        assert classify(None) == "indice_huerfano"
+        assert classify(self._case("10.10.10.1")) == "infra_propia"
+        assert classify(self._case("45.141.233.81")) is None          # pública: queda para dedup
+        assert classify(self._case("10.30.30.50")) is None            # privada no listada: señal real
+        assert classify(self._case("10.10.10.1", history=2)) is None  # alguien la movió
+        assert classify(self._case("10.10.10.1", state="en_revision")) is None
+        assert classify(self._case("10.10.10.1", kind="quarantine_file")) is None
