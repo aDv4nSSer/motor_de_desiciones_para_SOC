@@ -2452,7 +2452,17 @@ Hoy las ventanas de 7 y 30 días dan los mismos números, porque no hay score an
 - 3 nuevos en `frontend/operativo/src/test/compliance.test.tsx`: tarjeta con datos, aviso sin OpenSearch y texto pasado el período. El frontend pasa 41/41.
 - `tsc -b`, `oxlint` y `ruff` limpios.
 
-**Verificación visual:** se hizo con el frontend en local (Vite + Chromium headless) y el bloque `corroboracion_sombra` real que devolvió `.140`, a 1440 px, 1024 px en modo oscuro y 390 px. No hubo texto recortado ni scroll horizontal. **Pendiente: desplegar a `.140`** (`deploy_operativo.sh` + restart de `motor-soc`) y mirarlo con una sesión CISO real.
+**Verificación visual:** se hizo con el frontend en local (Vite + Chromium headless) y el bloque `corroboracion_sombra` real que devolvió `.140`, a 1440 px, 1024 px en modo oscuro y 390 px. No hubo texto recortado ni scroll horizontal.
+
+**Deploy a `.140` (`1018ec4`, 2026-10-08 00:03 -03):**
+- `git pull`, restart de `motor-soc` (PID 144281, `NRestarts=0`, `/health` ok con el modelo real) y `deploy_operativo.sh` (bundle `index-wPzX9-oy.js`).
+- **Ojo:** `motor-soc` corría desde el 7-oct 11:34 con `ecd42b9`, es decir, antes de H52 y H53. El restart cargó también lo acumulado desde entonces en lo que importa: `T3_CLASSTYPES` movido a `constants.py` con contenido idéntico, y campos nuevos con default en `response/config.py` y `response/schemas.py`, que el `response-worker` ya cargaba con el mismo `.env`. El Fast Path no cambia de comportamiento.
+- **Verificación:**
+  - 183 decisiones y 100 respuestas en el primer minuto después del restart.
+  - La consulta desplegada da 98,3 % (4.032 de 4.103 T3 desde el inicio del período).
+  - El bundle público contiene "No determina bloqueos reales".
+  - `GET /api/v1/dashboard/compliance` sin token devuelve 401.
+- **Pendiente:** mirarlo con una sesión CISO real.
 
 ---
 
