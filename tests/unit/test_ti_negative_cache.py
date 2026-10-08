@@ -103,14 +103,16 @@ class TestNegativeCachePorIP:
         _otx_lookup("5.6.7.8", _settings(), rdb)
         assert get.call_count == 2
 
-    def test_exito_no_deja_negative_cache_y_sigue_cacheando_6h(self, mocker) -> None:
+    @pytest.mark.parametrize("score,ttl", [(88, 86400), (50, 86400), (49, 21600), (0, 21600)])
+    def test_exito_no_deja_negative_cache_y_cachea_con_ttl_asimetrico(self, mocker, score, ttl) -> None:
+        """H56 (3b): 24 h si el score es malicioso (>= umbral), 6 h si no."""
         mocker.patch("response.enrichment.httpx.get",
-                     return_value=_resp(200, {"data": {"abuseConfidenceScore": 88, "totalReports": 4}}))
+                     return_value=_resp(200, {"data": {"abuseConfidenceScore": score, "totalReports": 4}}))
         rdb = TTLRedis()
         r = _abuseipdb_lookup(IP, _settings(), rdb)
-        assert r.abuseipdb_score == 88
+        assert r.abuseipdb_score == score
         assert not any(k.startswith("soc:enrich:neg:") for k in rdb.kv)
-        assert rdb.ttl[f"soc:enrich:{IP}"] == 21600
+        assert rdb.ttl[f"soc:enrich:{IP}"] == ttl
 
     def test_cache_positivo_gana_al_negativo(self, mocker) -> None:
         get = mocker.patch("response.enrichment.httpx.get")

@@ -94,7 +94,11 @@ class ResponseSettings(BaseSettings):
 
     # ── R1: AbuseIPDB ──────────────────────────────────────────────────
     abuseipdb_api_key: str = ""          # OBLIGATORIO rotar (estuvo expuesta)
-    abuseipdb_cache_ttl: int = 21600     # 6h — respeta límite 900 req/día
+    # TTL asimétrico (H56): un score malicioso es estable y re-consultarlo a
+    # las 6 h gastaba ~14% de la cuota en IPs ya conocidas; uno bajo puede
+    # subir (IP recién reportada), así que se revisa antes.
+    abuseipdb_cache_ttl: int = 86400               # score >= abuseipdb_malicious_threshold
+    abuseipdb_cache_ttl_below_threshold: int = 21600  # score < umbral (o sin score)
     # Cuota diaria del plan (X-RateLimit-Limit = 1000, verificado 2026-10-07).
     # De acá sale el presupuesto por ventana del token bucket (constants.py):
     # si cambia el plan, se cambia solo este valor.

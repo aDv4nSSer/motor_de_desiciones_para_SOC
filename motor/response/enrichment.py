@@ -19,6 +19,7 @@ import math
 import socket
 import ssl
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -76,6 +77,10 @@ def _is_public_ip(ip: str) -> bool:
 
 
 STALE_NOTE = "no disponible (evento stale, solo caché)"
+# H56: debajo de r2_min_tier AbuseIPDB no puede cambiar ninguna acción (T2
+# nunca bloquea): solo se lee la caché, sin gastar cuota.
+BELOW_R2_NOTE = "omitido (tier < r2_min_tier: no puede cambiar R2, solo caché)"
+NON_DECISIVE_NOTE = "no decisiva (OTX no corrobora: no puede cambiar R2)"
 
 
 QUOTA_MIN_SECONDS = 60
@@ -149,6 +154,9 @@ _quota_limit_warned = False
 # 21:07:48 -03 del 7-oct) pero no trae headers: sin este contador, una racha de
 # timeouts se leería como consumo externo.
 _calls_since_seen = 0
+# Consultas reales a la API por tier, acumuladas en el proceso (H56): permite
+# verificar en el log, después del deploy, que T2 hace 0 llamadas.
+_api_calls_by_tier: Counter = Counter()
 
 
 def _parse_quota_headers(resp: httpx.Response, now: float) -> dict | None:
@@ -235,6 +243,8 @@ def _take_abuseipdb_token(
         auditoría. Si Redis falla, no consulta: proteger la cuota es más
         barato que un 429 que corta la fuente hasta el día siguiente.
     """
+    if not decisive and ABUSEIPDB_NON_DECISIVE_SHARE <= 0:
+        return NON_DECISIVE_NOTE
     key = _abuseipdb_rate_key(now)
     try:
         used = int(rdb.get(key) or 0)
@@ -276,7 +286,7 @@ def _take_abuseipdb_token(
 
 def _abuseipdb_lookup(
     ip: str, settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
-    decisive: bool = True, now: float | None = None,
+    decisive: bool = True, now: float | None = None, tier: int | None = None,
 ) -> EnrichmentResult:
     """
     Consulta AbuseIPDB con cache. Devuelve EnrichmentResult parcial.
@@ -285,7 +295,8 @@ def _abuseipdb_lookup(
     La consulta a la API (no la caché) gasta un cupo del token bucket
     (H52): sin cupo se omite para ESTE evento, sin esperar ni reintentar.
     `decisive` = OTX ya corrobora, así que AbuseIPDB puede cambiar la
-    decisión de R2 (ver _take_abuseipdb_token).
+    decisión de R2 (ver _take_abuseipdb_token). `tier` (H56): debajo de
+    r2_min_tier solo se lee la caché; None conserva el comportamiento previo.
     """
     global _calls_since_seen
     result = EnrichmentResult(src_ip=ip)
@@ -336,6 +347,12 @@ def _abuseipdb_lookup(
         result.notes.append(f"abuseipdb {STALE_NOTE}")
         return result
 
+    # 4b) Tier que no llega a R2 (H56): la consulta no cambia ninguna acción
+    if tier is not None and tier < settings.r2_min_tier:
+        result.abuseipdb_available = False
+        result.notes.append(f"abuseipdb: {BELOW_R2_NOTE}")
+        return result
+
     # 5) Token bucket (H52): reparto de la cuota diaria. Nota distinta de
     # "cuota agotada" (429) y de un timeout, para poder separarlas al revisar
     # el período de sombra.
@@ -347,6 +364,9 @@ def _abuseipdb_lookup(
 
     # 6) Consulta API
     _calls_since_seen += 1  # cuenta aunque termine en timeout: también gasta cuota
+    _api_calls_by_tier[f"T{tier}" if tier is not None else "T?"] += 1
+    log.info(f"AbuseIPDB API tier={tier} decisiva={decisive} "
+             f"(proceso: {' '.join(f'{k}={v}' for k, v in sorted(_api_calls_by_tier.items()))})")
     try:
         resp = httpx.get(
             ABUSEIPDB_URL,
@@ -363,9 +383,11 @@ def _abuseipdb_lookup(
 
         # cachear
         try:
+            malicious = (result.abuseipdb_score is not None
+                         and result.abuseipdb_score >= settings.abuseipdb_malicious_threshold)
             rdb.setex(
                 cache_key,
-                settings.abuseipdb_cache_ttl,
+                settings.abuseipdb_cache_ttl if malicious else settings.abuseipdb_cache_ttl_below_threshold,
                 json.dumps({
                     "score": result.abuseipdb_score,
                     "reports": result.abuseipdb_total_reports,
@@ -573,6 +595,7 @@ def count_corroborating_sources(
 
 def enrich(
     src_ip: Optional[str], settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
+    tier: int | None = None,
 ) -> EnrichmentResult:
     """
     Punto de entrada de R1. Enriquece una IP de origen con DNS + reputación
@@ -585,6 +608,9 @@ def enrich(
     no refresca CrowdSec ni resuelve DNS. Lo que falte queda "no disponible
     (evento stale)": una detección que no va a ejecutar ninguna acción no
     gasta cuota de API en tiempo real.
+
+    tier (H56): el tier de la tarea. Debajo de r2_min_tier, AbuseIPDB solo
+    lee la caché (OTX y CrowdSec no cambian). None = comportamiento previo.
     """
     if not src_ip:
         r = EnrichmentResult()
@@ -600,7 +626,7 @@ def enrich(
         otx_result.otx_available and otx_result.otx_pulse_count is not None
         and otx_result.otx_pulse_count >= settings.otx_min_pulse_count
     )
-    result = _abuseipdb_lookup(src_ip, settings, rdb, cache_only, decisive=decisive)
+    result = _abuseipdb_lookup(src_ip, settings, rdb, cache_only, decisive=decisive, tier=tier)
     result.otx_pulse_count = otx_result.otx_pulse_count
     result.otx_available = otx_result.otx_available
     result.notes.extend(otx_result.notes)

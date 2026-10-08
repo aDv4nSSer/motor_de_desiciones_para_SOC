@@ -74,4 +74,6 @@ ABUSEIPDB_EXTERNAL_DROP_WARN = 5
 # NO pueden cambiar la decisión de R2 (OTX no corrobora: AbuseIPDB llevaría
 # count como máximo a 1). El resto queda reservado para las decisivas (OTX
 # corrobora: AbuseIPDB puede llevar count de 1 a 2 y habilitar el bloqueo).
-ABUSEIPDB_NON_DECISIVE_SHARE = 0.5
+# H56: 0. Con el gate binario una consulta no decisiva nunca cambia R2, y en
+# el contrafactual bajar de 0.5 a 0 no perdió ningún bloqueo.
+ABUSEIPDB_NON_DECISIVE_SHARE = 0.0

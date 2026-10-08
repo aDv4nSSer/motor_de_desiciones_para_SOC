@@ -133,14 +133,23 @@ class TestPrioridad:
 
     @pytest.mark.parametrize("ti", [FakeTI(pulses=0), FakeTI(otx_error=httpx.ReadTimeout("lento"))],
                              ids=["otx_sin_pulses", "otx_timeout"])
-    def test_otx_no_corrobora_consulta_si_hay_cupo_no_decisivo(self, mocker, clock, ti) -> None:
-        r = _run(mocker, "1.2.3.4", FakeRedis(), ti)
-        assert ti.calls["abuseipdb"] == 1
-        assert r.abuseipdb_available is True
+    def test_otx_no_corrobora_no_gasta_cuota(self, mocker, clock, ti) -> None:
+        """H56: ABUSEIPDB_NON_DECISIVE_SHARE = 0. Si OTX no corrobora, AbuseIPDB
+        llevaría count a 1 como máximo: no cambia R2 y no se consulta."""
+        assert ABUSEIPDB_NON_DECISIVE_SHARE == 0
+        rdb = FakeRedis()
+        r = _run(mocker, "1.2.3.4", rdb, ti)
+        assert ti.calls["abuseipdb"] == 0
+        assert r.abuseipdb_available is False
+        assert any("no decisiva" in n for n in r.notes)
+        assert not any(k.startswith("ti:rate:") for k in rdb.kv)  # tampoco toca el bucket
 
     def test_cupo_no_decisivo_agotado_reserva_el_resto_para_decisivas(self, mocker, clock) -> None:
+        """Mecanismo de reserva (H52), con un share > 0 forzado: sigue
+        disponible si se vuelve a habilitar el cupo no decisivo."""
+        mocker.patch("response.enrichment.ABUSEIPDB_NON_DECISIVE_SHARE", 0.5)
         budget = abuseipdb_window_budget(_settings())
-        share = int(budget * ABUSEIPDB_NON_DECISIVE_SHARE)
+        share = int(budget * 0.5)
         rdb = FakeRedis()
         weak = FakeTI(pulses=0)
         for i in range(share + 2):
