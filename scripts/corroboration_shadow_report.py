@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "motor"))
@@ -52,9 +53,10 @@ PAGE = 1000
 
 #: Corte de régimen de H54 (epoch de payload.processed_at): desde acá, una T2
 #: no stale cuyo origen está en config.OWN_INFRA registra
-#: ACCION_NINGUNA_INFRA_PROPIA en vez de abrir caso. None = todavía no
-#: desplegado (se espera la regla vieja para todos los docs).
-T2_OWN_INFRA_CUT: float | None = None
+#: ACCION_NINGUNA_INFRA_PROPIA en vez de abrir caso. Es el restart de
+#: response-worker con 3243c0d: 2026-10-08 00:54:49 -03 (PID 155587).
+#: None = regla vieja para todos los docs (solo en tests).
+T2_OWN_INFRA_CUT: float | None = datetime(2026, 10, 8, 3, 54, 49, tzinfo=timezone.utc).timestamp()
 
 
 def _own_infra_rule_applies(payload: dict) -> bool:

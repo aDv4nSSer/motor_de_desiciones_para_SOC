@@ -39,7 +39,27 @@ from dashboard import _get_redis
 from response.cases import CASES_INDEX_KEY, CASES_KEY_PREFIX
 from response.enforcer import is_own_infra
 
-CHUNK = 5000
+# Lotes chicos y SSCAN en vez de SMEMBERS: una sola respuesta con los ~780k
+# casos (un pipeline de GETs) llevó used_memory a 1,35 GB > maxmemory y
+# allkeys-lru desalojó 72.205 claves, entre ellas soc:response:audit (H54).
+CHUNK = 2000
+
+
+def batches(rdb, size: int):
+    """Recorre soc:cases:index con SSCAN en lotes de `size` ids. SSCAN puede
+    devolver un elemento más de una vez: se deduplica para no contar doble."""
+    seen: set[str] = set()
+    batch: list[str] = []
+    for cid in rdb.sscan_iter(CASES_INDEX_KEY, count=size):
+        if cid in seen:
+            continue
+        seen.add(cid)
+        batch.append(cid)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def classify(raw: str | None) -> str | None:
@@ -65,13 +85,12 @@ def main() -> int:
         ap.error(f"{args.export} ya existe: no se sobrescribe un export previo")
 
     rdb = _get_redis()
-    ids = list(rdb.smembers(CASES_INDEX_KEY))
+    total = rdb.scard(CASES_INDEX_KEY)
     reasons: Counter = Counter()
     hosts: Counter = Counter()
     with contextlib.ExitStack() as stack:
         out = stack.enter_context(gzip.open(args.export, "wt", encoding="utf-8")) if args.export else None
-        for i in range(0, len(ids), CHUNK):
-            chunk = ids[i:i + CHUNK]
+        for chunk in batches(rdb, CHUNK):
             raws = rdb.mget([f"{CASES_KEY_PREFIX}{c}" for c in chunk])
             doomed = []
             for cid, raw in zip(chunk, raws):
@@ -93,7 +112,7 @@ def main() -> int:
                 pipe.srem(CASES_INDEX_KEY, *doomed)
                 pipe.execute()
 
-    print(f"{'BORRADO' if args.apply else 'SIMULACIÓN'} sobre {len(ids)} entradas de {CASES_INDEX_KEY}")
+    print(f"{'BORRADO' if args.apply else 'SIMULACIÓN'} sobre {total} entradas de {CASES_INDEX_KEY}")
     for k, v in reasons.most_common():
         print(f"  {k:16} {v}")
     print("  por host:", hosts.most_common(10))

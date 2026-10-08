@@ -2466,6 +2466,122 @@ Hoy las ventanas de 7 y 30 días dan los mismos números, porque no hay score an
 
 ---
 
+## H54 — Tráfico de la propia infraestructura abría un caso T2 por flow, sin dedup; safelist desconectado de la rama T2 y desactualizado
+
+**Fecha:** 2026-10-08 (-03). Código: `3243c0d` (fix), `4e3fdb4` y siguientes (script de limpieza, corte de régimen). **No se tocaron** el gate de R2, `corroboration.py`, el modelo ni la rama de bloqueo de T3.
+
+### Hallazgo
+
+La vista Alertas mostraba decenas de T2 "medio" desde `10.10.10.1`, una cada ~2 s, todas con "Alertar y crear caso". `response/cases.py:open_case()` no tiene dedup ni TTL: cada T2 abría un caso nuevo con UUID propio en `soc:cases:*`. `approvals.py` sí agrupa por host desde el 5-oct.
+
+Volumen real en `.140` (2026-10-08 ~00:30 -03):
+- **779.999 casos** en `soc:cases:index`, creciendo unos 70.000 por día desde el 30-sep (`5a8001c`).
+- **175.005** eran de infraestructura propia: `10.10.10.1` 117.225, `10.10.10.3` 25.819, `10.30.30.2` 17.817, `200.54.12.139` 14.111.
+- **549.845** eran de IPs públicas.
+- Ningún caso de red había sido tocado por un analista.
+- En 24 h hubo 80.778 T2, de las cuales 70.790 abrieron caso. Las T2 de infra fueron 11.908 por día (~15%).
+
+### Causa raíz
+
+1. **El safelist no estaba conectado a la rama T2.** `is_safelisted()` (`enforcer.py`) se usaba en las ramas de R2, pero la rama T2 que abre casos (`worker.py`, agregada en `5a8001c`) nunca lo consultaba. La infra propia nunca se bloqueaba, pero abría un caso cada vez que aparecía.
+2. **`DEFAULT_SAFELIST` estaba desactualizada.** Seguía con las IPs públicas de la topología plana (200.54.12.137–.142). Las IPs de VLAN quedaban cubiertas solo por la exención genérica de rango privado.
+
+### Investigación de red: por qué el motor ve `10.10.10.1`
+
+No es ruteo erróneo ni tráfico reflejado: es el control-plane del propio SOC.
+
+- `10.10.10.1` es `eno2.10` de `.139` (`ip -br addr`). Los gateways de VLAN son subinterfaces de `.139`: `10.20.20.1` en `eno2.20`, `10.30.30.1` en `eno2.30`.
+- `ss -tnp` en `.139` muestra a **Vector (pid 1819)** con `10.10.10.1 → 10.10.10.3:8000` (`POST /api/v1/decide`) y `→ :9201` (indexa `suricata-alerts-*`). Config real: `pipeline-ingesta/configs/vector.production.toml`. `/etc/vector/vector.yaml` es el demo.
+- Suricata captura en `af-packet: interface: eno2`, el **trunk padre**, y ve también el tráfico que `.139` origina por sus subinterfaces. Vector le envía al motor los flows de sus propios envíos al motor: un bucle, acotado por keep-alive.
+- **T2 de infra en 24 h**, muestra de 2.000 por (origen, puerto destino):
+
+  | Origen | Puerto | T2 | Qué es |
+  |---|---|---|---|
+  | `.140` | 55000 | 875 | API de Wazuh en `.139` |
+  | `10.10.10.1` | 9201 | 494 | Vector → OpenSearch |
+  | `10.10.10.1` | 8000 | 227 | Vector → `/decide` |
+  | `200.54.12.139` | 53 | 150 | DNS de `.139` |
+  | `.138` | 9100 | 94 | — |
+  | `10.10.10.1` | 2222 | 25 | sesiones SSH vía bastion |
+
+- **Sin `tcpdump`:** en `.139` requiere `sudo` con contraseña y el `sudoers` sin contraseña no lo incluye. La evidencia es `ss` + config de Suricata y Vector + `soc-responses-*`. La muestra de `eve.json` no sirvió: el archivo pesa 24 GB y tiene bytes nulos (patrón de `copytruncate`).
+- **Segmentación:** no hace falta tocarla para este bug. Quedan para Antonio (infra):
+  - **`HOME_NET` sigue en `[200.54.12.136/29]`.** Después del NAT, el tráfico a `.138` llega como `10.30.30.2`, fuera de `$HOME_NET`, y las firmas `-> $HOME_NET` no disparan para esos hosts. Puede explicar parte de la cobertura de 0,7% del grupo `signature` (H53).
+  - Opcionalmente, un BPF en Suricata que excluya el control-plane `.139`↔`.140`.
+  - `.138` sigue consultando `200.54.12.138:9100` y `200.54.12.140:9100`, IPs públicas que ya no existen.
+
+### Decisión de alcance (Antonio, 8-oct)
+
+- **`is_own_infra()` nueva** (`enforcer.py`), acotada a la lista explícita `config.OWN_INFRA` y **sin** exención por rango privado. La usa **solo** la rama T2: un host comprometido de una VLAN que no esté en la lista sigue abriendo caso.
+  - Compara como dirección, así la forma IPv6 expandida de Suricata (`2002:c836:0c8b:0000:…`, el 6to4 de `.139`) coincide.
+- **`is_safelisted()` no cambió:** R2, aprobaciones (`main.py`), recidivismo y `rules.yaml` R007/R009 siguen con la exención amplia. **La regla de oro de nunca bloquear la infra no se tocó.** Dato que la sostiene: `10.30.30.1` (`.139`→`.138`) tuvo 930 T3 en 7 días y hoy no se bloquea solo por el rango privado.
+- **`OWN_INFRA`** (topología VLAN del 1-sep, gateway upstream verificado con `ip route`): `200.54.12.137`, `200.54.12.139`, el 6to4 de `.139`, `10.10.10.1`, `10.20.20.1`, `10.30.30.1`, `10.10.10.3`, `10.30.30.2`, `10.10.10.254` (switch) y loopback.
+- **`DEFAULT_SAFELIST`** (nunca bloquear) = `OWN_INFRA` + `200.54.12.141`/`.142`. Son terceros que siguen con IP pública: no se bloquean, pero no son infra propia y abren caso.
+  - Salen `200.54.12.138` y `.140`, que ya no existen desde la migración.
+  - `RESPONSE_SAFELIST_EXTRA` en `.140` está vacía.
+- **Acción:** `ACCION_NINGUNA_INFRA_PROPIA = "ninguna_infra_propia"`. Es un valor nuevo, distinto de `ninguna`, para medir en el dashboard cuánto ruido interno se descarta. El frontend la muestra como "Sin acción (infra propia)" (`lib/format.ts`).
+- **`rules.yaml`:**
+  - R003 ("se abre caso automático") ahora exige `is_own_infra: false`.
+  - R012 (nueva) explica la T2 de infra propia. Ambas son mutuamente excluyentes.
+- **Rama stale:** no se tocó. Una T2 stale de infra sigue registrando `alertar_crear_caso` sin abrir caso, como antes.
+
+### Corte de régimen y período de sombra
+
+El criterio 3 del período (invariancia, `shadow_period_checkpoint.py`) recalcula **todas las T2+** con `expected_r2()`, que esperaba `alertar_crear_caso` para cualquier T2. Sin ajuste, el arreglo habría producido unas 12.000 discrepancias falsas por día.
+
+- `expected_r2()` aplica la regla nueva solo si `payload.processed_at >= T2_OWN_INFRA_CUT`.
+- **Corte:** restart de `response-worker` con `3243c0d`, **2026-10-08 00:54:49 -03 (`2026-10-08T03:54:49Z`, epoch 1791431689, PID 155587)**.
+- Anotado en `PENDIENTES_MODO_SOMBRA.md`, sección 6.
+- No toca T3, R2, el gate ni el score.
+- **Error de procedimiento (corregido):** el primer epoch del corte lo escribí a mano y estaba corrido +2 h 05 min. Ahora la constante se calcula desde la fecha (`datetime(...).timestamp()`), no se tipea.
+
+### Verificación posterior al corte (stream `soc:response:audit`, ~4 min)
+
+- 276 registros.
+- **77 T2 de infra → `ninguna_infra_propia`, 0 con `case_id`.** Disparan R012 y R009, no R003.
+- 131 T2 de otras IPs → `alertar_crear_caso` con caso.
+- En Redis, **0 casos de infra con `opened_at` posterior al corte**. El último es de 03:54:44Z.
+- `pytest` en `.140`: los 86 tests de las áreas tocadas pasan con el Python de producción.
+
+### Incidente durante la investigación: desalojo masivo de Redis causado por una consulta mía
+
+La primera medición del volumen hizo un `GET` de los ~780.000 casos **en un solo pipeline**: una respuesta de unos 580 MB en el buffer del cliente.
+
+- `used_memory_peak` llegó a **1,35 GB** con `maxmemory` de 1 GB, y `allkeys-lru` desalojó **72.205 claves**.
+- Evidencia de causalidad:
+  - Esa consulta encontró 0 casos sin documento. La siguiente encontró 55.147 entradas huérfanas en el índice y el contador de desalojos en 72.205.
+  - Desde ahí el contador no se movió, con lecturas en bloques de 5.000.
+- **Lo que se perdió:**
+  - **El stream `soc:response:audit` con su consumer group.** El worker lo recreó en su siguiente `XADD` (primer id 03:32:45Z), pero el grupo `response-audit-indexer` no existe y **el indexador no persiste nada en `soc-responses-*` desde las 03:32:41Z**.
+  - Al reiniciarlo, `start()` recrea el grupo desde `id="0"` y retoma la cadena desde la cabeza en OpenSearch: se recupera todo lo posterior a 03:32:45Z.
+  - Se pierden los registros no indexados entre 03:32:41,99Z y el desalojo (segundos). **Queda un hueco de auditoría pequeño pero real**, a documentar como tal en la cadena.
+  - Probable: casi toda la caché L1 de TI (quedan 3 claves `ti:*`) y parte de los acumuladores de recidivismo `risk:ip:*` (quedan 2.149). Esto último baja el grupo `context` del score de sombra para las IPs afectadas desde las 03:32Z. Hay que mencionarlo en el checkpoint.
+- **Lo que no se perdió:** `soc-decisions` siguió al día (grupo `opensearch-indexer` con lag 0) y el worker conserva su grupo sobre `soc:response:tasks`.
+- **Corrección a lo informado antes:** los 72.205 desalojos y las 55.147 entradas huérfanas los presenté como desgaste previo de LRU. Lo más probable es que los haya causado esta consulta.
+- **Lección:** en `.140`, nunca leer una colección grande de Redis en una sola respuesta. El script de limpieza usa `SSCAN` en lotes de 2.000.
+
+### Limpieza de Redis (2026-10-08 01:02 -03)
+
+Script: `scripts/mantenimiento/h54_limpiar_casos_infra.py`. Simula por defecto; `--apply` exige `--export` y no sobrescribe un export previo. Recorre con `SSCAN` deduplicado y borra solo casos `network_t2_unconfirmed` de `OWN_INFRA` sin tocar por un analista, más las entradas del índice sin documento.
+
+- **Borrados: 175.410 casos de infra propia + 55.147 entradas huérfanas = 230.557.**
+  - Son 50 casos más que los 175.360 de la simulación anterior: casos abiertos entre esa simulación y el corte, todos con `opened_at` previo a 03:54:49Z.
+- **Conservados: 551.040**, casos de IPs públicas y los 2 `quarantine_file`. Son señal real y quedan para la tarea de dedup/TTL de casos.
+- **Export:** `~/tesis/backups/h54_casos_infra_20261008.jsonl.gz` en `.140` (11 MB, 230.557 líneas con `case_id`, motivo, host, `opened_at` y `trace_id`).
+- **Redis:** `used_memory` bajó de 645 MB a 510 MB, sin desalojos nuevos. `SCARD` pasó a 551.061.
+- **`case_id` colgantes en `soc-responses-*` (esperado, no es anomalía):** `soc-responses-*` es append-only con hash-chain y no se toca. Los registros de auditoría de esas T2 conservan su `case_id`, que ya no existe en Redis. El export permite reconstruir qué se borró, cuándo y por qué.
+
+### Pendientes que deja H54
+
+1. **Reiniciar `response-audit-indexer`** (requiere `sudo` de Antonio) y verificar que reindexe desde 03:32:45Z con la cadena íntegra (`verify_chain`). El stream tiene `maxlen` 100k a ~80 registros/min: hay unas 20 h de margen antes de perder entradas.
+2. **Dedup/TTL de casos:** siguen entrando unos 58.000 casos/día de IPs públicas. Al ritmo actual, Redis vuelve a acercarse al límite en días.
+3. Para Antonio (infra): `HOME_NET` en Suricata, BPF opcional del control-plane, scrape de `.138` a IPs viejas.
+4. `motor/redis_client.py` tiene `REDIS_HOST` con default `200.54.12.140` (topología vieja). En producción lo pisa el `.env`, pero el default está desactualizado.
+
+**Estado: FIX DESPLEGADO Y VERIFICADO EN `.140`. LIMPIEZA HECHA. INDEXADOR DE AUDITORÍA DETENIDO DESDE 03:32:41Z, PENDIENTE DE RESTART.**
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - ~~**Desacuerdo de grupos unilaterales (H53)**~~ → **resuelto con P4** (`a90df02`): solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%.
