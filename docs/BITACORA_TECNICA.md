@@ -2555,7 +2555,8 @@ La primera medición del volumen hizo un `GET` de los ~780.000 casos **en un sol
   - **El stream `soc:response:audit` con su consumer group.** El worker lo recreó en su siguiente `XADD` (primer id 03:32:45Z), pero el grupo `response-audit-indexer` no existe y **el indexador no persiste nada en `soc-responses-*` desde las 03:32:41Z**.
   - Al reiniciarlo, `start()` recrea el grupo desde `id="0"` y retoma la cadena desde la cabeza en OpenSearch: se recupera todo lo posterior a 03:32:45Z.
   - Se pierden los registros no indexados entre 03:32:41,99Z y el desalojo (segundos). **Queda un hueco de auditoría pequeño pero real**, documentado abajo.
-  - Probable: casi toda la caché L1 de TI (quedan 3 claves `ti:*`) y parte de los acumuladores de recidivismo `risk:ip:*` (quedan 2.149). Esto último baja el grupo `context` del score de sombra para las IPs afectadas desde las 03:32Z. Hay que mencionarlo en el checkpoint.
+  - Parte de los acumuladores de recidivismo `risk:ip:*` (quedaban 2.149). Esto baja el grupo `context` del score de sombra para las IPs afectadas desde las 03:32Z. Medido abajo, en "Efectos residuales".
+  - ~~Probable: casi toda la caché L1 de TI (quedan 3 claves `ti:*`)~~ **Corrección (8-oct, 13:57 -03):** esa afirmación estaba mal. `ti:*` solo contiene las claves del token bucket de AbuseIPDB. La caché L1 de TI vive en `soc:enrich:*` (`enrich_cache_prefix`) y nunca se midió en el momento del incidente.
 - **Lo que no se perdió:** `soc-decisions` siguió al día (grupo `opensearch-indexer` con lag 0) y el worker conserva su grupo sobre `soc:response:tasks`.
 - **Corrección a lo informado antes:** los 72.205 desalojos y las 55.147 entradas huérfanas los presenté como desgaste previo de LRU. Lo más probable es que los haya causado esta consulta.
 - **Lección:** en `.140`, nunca leer una colección grande de Redis en una sola respuesta. El script de limpieza usa `SSCAN` en lotes de 2.000.
@@ -2569,7 +2570,17 @@ La primera medición del volumen hizo un `GET` de los ~780.000 casos **en un sol
   - Consecuencia: **la hash-chain prueba la integridad de lo persistido, no la completitud del stream.** Esta pérdida no la detecta `verify_chain` y queda registrada solo acá.
   - **Cuántos se perdieron no se puede determinar.** El intervalo es de 3,55 s. A la tasa media (~80 registros/min) serían ~5, pero en la misma ventana hay separaciones normales de hasta 8,7 s sin pérdida, así que el rango honesto es 0 a ~5.
   - Las decisiones correspondientes sí están en `soc-decisions` (otra cadena, no afectada), pero no su registro R1/R2.
-- **Incidente cerrado** en cuanto a la persistencia de auditoría. Siguen abiertos el efecto sobre la caché de TI (se repuebla sola) y sobre `risk:ip:*` (recidivismo subestimado para las IPs desalojadas, a mencionar en el checkpoint del período de sombra).
+- **Incidente cerrado** en cuanto a la persistencia de auditoría.
+
+**Efectos residuales (medidos el 8-oct a las 13:57 -03, ~13 h después).** Sin desalojos nuevos: `evicted_keys` sigue en 72.205.
+- **Caché de TI: sin efecto residual.** Hay 2.580 entradas OTX (`soc:enrich:otx:<ip>`) con TTL de 6 h: cualquier entrada desalojada ya habría vencido igual, así que la caché se renovó entera.
+  - La caché por IP de AbuseIPDB está en 0, pero **no por el desalojo**: está activa la marca `soc:enrich:abuseipdb:quota_exhausted` hasta el reset de 00:00 UTC (TTL ~7 h). Afecta el criterio P2 (TI disponible) del período y hay que mirarlo en el checkpoint. Con el token bucket (~864 consultas/día de presupuesto) la cuota no debería agotarse: queda abierto por qué se agotó.
+- **Recidivismo (`risk:ip:*`): efecto residual real y acotado.** Hay 5.701 claves (contra 2.149 en el incidente), pero perdieron su historial las IPs desalojadas.
+  - **Método:** se compara el `recidivism_count` máximo de cada IP entre el inicio del período (23:40Z) y el desalojo con el mínimo posterior. Dentro de horas el conteo solo puede crecer, así que si bajó, la clave se desalojó.
+  - **Resultado:** 967 IPs tienen dato en ambos tramos y **235 bajaron** (típicamente de 9 a 0). De esas, 135 se vieron en la última hora y **36 siguen por debajo** de su valor previo.
+  - El conteo se recupera a razón de una hora distinta por hora de actividad, y el grupo `context` satura en 5 (`corr_context_recidivism_saturation`). El sesgo desaparece para cada IP después de 5 horas distintas de actividad posteriores al desalojo.
+  - **No afecta la invariancia de R2**, que no usa recidivismo, pero **sí subestima `context`** para esas IPs en el score de sombra desde las 03:32Z. Queda anotado en `PENDIENTES_MODO_SOMBRA.md`, sección 6.
+- **Auditoría:** el hueco de 0 a ~5 registros es permanente y no se puede repoblar.
 
 ### Limpieza de Redis (2026-10-08 01:02 -03)
 

@@ -201,6 +201,8 @@ graduada" de R2) y ya tiene su propio slot protegido arriba.
 | Revisión cruzada completa del documento (Antonio revisa lo de Joaquín y viceversa) | Ambos | Lista de correcciones cerrada |
 | Generar versión de PDF/Word final para revisión de Miguel | Antonio | Archivo entregado |
 | Enviar tesis completa a Miguel para revisión final | Antonio | Confirmación de envío |
+| ✅ **[R1 — H54] T2 de infraestructura propia sin caso + safelist a la topología VLAN** (cerrado 8-oct) | Antonio + Claude Code | `3243c0d` desplegado (corte 00:54:49 -03), limpieza de 230.557 entradas de `soc:cases:*`, incidente del indexador de auditoría cerrado con `verify_chain` íntegra. Detalle en `docs/BITACORA_TECNICA.md` H54 |
+| **[R1 — sigue de H54] Dedup/TTL de casos automáticos** (`response/cases.py` no agrupa ni vence: ~58.000 casos/día de IPs públicas, 551.040 abiertos el 8-oct, Redis en 679 MB de 1 GB) — requisito antes de desestubar `CasesView.tsx` | Antonio | Casos agrupados por host con TTL, como `approvals.py`, y `soc:cases:index` estable en el tiempo; medición en bitácora |
 | **[R2 — corroboración ponderada, H52] Cerrar prerrequisitos del modo sombra** (rotar key de AbuseIPDB, TI disponible en ≥ 95% de los T3, decidir el comportamiento sin TI) y recién entonces correr el período de 72 h | Antonio | Seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`. **`band == "high"` no se usa como gate mientras los prerrequisitos sigan abiertos.** Si no se llega antes del 16-oct, se reporta como limitación y el gate binario queda como está |
 
 ---
