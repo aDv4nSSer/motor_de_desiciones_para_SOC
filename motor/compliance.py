@@ -64,6 +64,14 @@ TRENDS_CACHE_SECONDS = 60.0
 H25_EXCLUDED_FROM = datetime(2026, 8, 18, 19, 13, tzinfo=timezone.utc)
 H25_EXCLUDED_TO = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)  # fin del 04-sep, hora local (-03)
 
+# Score de corroboración de 4 grupos (H52/H53): en modo sombra, no decide
+# ningún bloqueo. Período de validación acordado el 2026-10-07 (mismo que
+# scripts/shadow_period_checkpoint.py): 20:40 -03 -> 2026-10-10 20:40 -03.
+SHADOW_PERIOD_START = datetime(2026, 10, 7, 23, 40, tzinfo=timezone.utc)
+SHADOW_PERIOD_END = datetime(2026, 10, 10, 23, 40, tzinfo=timezone.utc)
+CORROBORATION_BANDS = ("high", "medium", "low", "ambiguous")
+CORROBORATION_GROUPS = ("ml", "ti", "signature", "context")
+
 LEGAL_NOTE = ("Artículos, literales y plazos verificados contra el texto oficial de la Ley 21.663 "
               "(LeyChile/BCN, idNorma 1202434, versión del 08-04-2024). El Art. 8 obliga a los "
               "operadores de importancia vital; el Art. 9, a todas las instituciones del Art. 4. "
@@ -120,6 +128,83 @@ def response_counts(since: datetime, request: OsRequest = _os_request) -> dict[s
         "acciones": {k: buckets.get(k, {}).get("doc_count", 0) for k in ACTION_FILTERS},
         "accesos": {b["key"]: b["doc_count"] for b in acc},
         "cobertura_desde": aggs.get("primero", {}).get("value_as_string"),
+    }
+
+
+def _pct(part: int, total: int) -> float | None:
+    return round(100 * part / total, 1) if total else None
+
+
+def corroboration_shadow(since: datetime, request: OsRequest = _os_request) -> dict[str, Any]:
+    """Score de corroboración de 4 grupos sobre las T3 de soc-responses-*.
+
+    Solo reporte: el score sigue en modo sombra (H52/H53) y el gate de R2
+    usa corroboration_count, no la banda. `eligible` = band "high" y no
+    ambiguo, lo que habilitaría autobloqueo si el score reemplazara al gate.
+
+    El cálculo arranca en max(since, SHADOW_PERIOD_START): antes del período
+    el score corrió con reglas previas (H52 sin signature/context, H53 antes
+    de P4) y sus bandas no son comparables (H53, "Cómo comparar"). Las T3 de
+    la ventana que quedan antes de ese inicio, o sin score, se cuentan en
+    `excluded`, nunca en el denominador.
+
+    Denominadores separados, nunca mezclados:
+    - `scored`: T3 con score (corroboration_band) desde `from`.
+    - `groups.evaluated`: T3 con corroboration_groups_available desde `from`.
+
+    Args:
+        since: inicio de la ventana (la misma que el resto del reporte).
+        request: cliente OpenSearch inyectable (tests).
+
+    Returns:
+        {"available", "shadow", "from", "clamped", "t3_total", "scored",
+         "excluded", "eligible", "eligible_pct", "bands",
+         "groups": {"evaluated", "available_pct"}, "validation": {"start", "end"}}.
+    """
+    calc_from = max(since, SHADOW_PERIOD_START)
+    body = {
+        "size": 0,
+        "track_total_hits": True,
+        "query": {"bool": {"filter": [
+            {"term": {"event_type": "response"}}, {"term": {"tier": 3}},
+            {"range": {"event_time": {"gte": since.isoformat()}}}]}},
+        "aggs": {"period": {"filter": {"range": {"event_time": {"gte": calc_from.isoformat()}}}, "aggs": {
+            "scored": {"filter": {"exists": {"field": "corroboration_band"}}, "aggs": {
+                "bands": {"terms": {"field": "corroboration_band", "size": 10}},
+                "eligible": {"filter": {"bool": {"filter": [
+                    {"term": {"corroboration_band": "high"}},
+                    {"term": {"corroboration_ambiguous": False}}]}}},
+            }},
+            "grouped": {"filter": {"exists": {"field": "corroboration_groups_available"}}, "aggs": {
+                "groups": {"terms": {"field": "corroboration_groups_available", "size": 10}},
+            }},
+        }}},
+    }
+    base = {"shadow": True, "from": calc_from.isoformat(), "clamped": calc_from > since,
+            "validation": {"start": SHADOW_PERIOD_START.isoformat(), "end": SHADOW_PERIOD_END.isoformat()}}
+    result = request("POST", f"/{RESPONSES_PATTERN}/_search", body)
+    if result is None:
+        return {"available": False, **base}
+    period = result.get("aggregations", {}).get("period", {})
+    t3_total = result.get("hits", {}).get("total", {}).get("value", 0)
+    scored_agg = period.get("scored", {})
+    scored = scored_agg.get("doc_count", 0)
+    band_counts = {b["key"]: b["doc_count"] for b in scored_agg.get("bands", {}).get("buckets", [])}
+    eligible = scored_agg.get("eligible", {}).get("doc_count", 0)
+    grouped = period.get("grouped", {})
+    evaluated = grouped.get("doc_count", 0)
+    group_counts = {b["key"]: b["doc_count"] for b in grouped.get("groups", {}).get("buckets", [])}
+    return {
+        "available": True,
+        **base,
+        "t3_total": t3_total,
+        "scored": scored,
+        "excluded": t3_total - scored,
+        "eligible": eligible,
+        "eligible_pct": _pct(eligible, scored),
+        "bands": {b: band_counts.get(b, 0) for b in CORROBORATION_BANDS},
+        "groups": {"evaluated": evaluated,
+                   "available_pct": {g: _pct(group_counts.get(g, 0), evaluated) for g in CORROBORATION_GROUPS}},
     }
 
 
@@ -266,6 +351,8 @@ def compliance_report(window_minutes: int, nodes_overall: str, rdb: redis.Redis 
         "latencia_avg_ms": stats.get("latencia_avg_ms"),
         "latencia_p95_ms": stats.get("latencia_p95_ms"),
         "precision_bloqueos": precision,
+        # Reemplaza a precision_bloqueos en la vista (H52/H53, modo sombra).
+        "corroboracion_sombra": corroboration_shadow(since, request),
         # H43.
         "decisiones": {"available": stats.get("available", False), "total": total,
                        "por_tier": stats.get("por_tier", {})},

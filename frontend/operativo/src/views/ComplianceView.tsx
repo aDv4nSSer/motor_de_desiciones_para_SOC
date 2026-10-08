@@ -1,8 +1,8 @@
-import { useCallback, useState } from 'react'
+import { Fragment, useCallback, useState } from 'react'
 import { CheckCircle, Info, MinusCircle, SealCheck, SealWarning, WarningCircle, XCircle } from '@phosphor-icons/react'
 import type { Icon } from '@phosphor-icons/react'
 import { apiFetch } from '../api/client'
-import type { ChecklistStatus, ComplianceReport } from '../api/types'
+import type { ChecklistStatus, ComplianceReport, CorroborationBand, CorroborationGroup, CorroborationShadow } from '../api/types'
 import { ErrorNotice, Freshness, TableSkeleton } from '../components/common'
 import { formatTime } from '../lib/format'
 import { usePolling } from '../lib/usePolling'
@@ -34,6 +34,49 @@ function ms(v: number | null | undefined): string {
   return typeof v === 'number' ? `${v.toLocaleString('es-CL', { maximumFractionDigits: 1 })} ms` : 'sin dato'
 }
 
+const BAND_LABEL: Record<CorroborationBand, string> = {
+  high: 'Alta (sin ambigüedad)',
+  medium: 'Media',
+  low: 'Baja',
+  ambiguous: 'Ambigua (grupos en desacuerdo)',
+}
+
+const GROUP_LABEL: Record<CorroborationGroup, string> = {
+  ml: 'ML (riesgo del modelo)',
+  ti: 'Inteligencia de amenazas (AbuseIPDB, OTX)',
+  signature: 'Firma Suricata (classtype, ATT&CK)',
+  context: 'Contexto (recidivismo de la IP)',
+}
+
+const shadowDateFmt = new Intl.DateTimeFormat('es-CL', {
+  day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/Santiago',
+})
+
+/** "10 oct, 20:40" en hora de Chile: el período se acordó en hora local. */
+function shadowDate(iso: string): string {
+  return shadowDateFmt.format(new Date(iso)).replace(/\./g, '').replace(/^(\d+) /, '$1\u00a0')
+}
+
+function n(v: number | undefined): string {
+  return (v ?? 0).toLocaleString('es-CL')
+}
+
+/** Línea fija de la tarjeta de corroboración: el score no decide bloqueos.
+ *  Va aparte del número principal y no depende de que haya datos.
+ *  `generatedAt` (hora del reporte, del servidor) decide si el período cerró. */
+function ShadowNotice({ c, generatedAt }: { c: CorroborationShadow; generatedAt: string }) {
+  const end = c.validation.end
+  const closed = Date.parse(generatedAt) >= Date.parse(end)
+  return (
+    <p className="kpi-shadow">
+      <Info size={14} weight="bold" aria-hidden="true" />
+      {closed
+        ? `No determina bloqueos reales: validación cerrada el ${shadowDate(end)}, el gate actual sigue vigente hasta que se decida reemplazarlo.`
+        : `No determina bloqueos reales: período de validación hasta el ${shadowDate(end)}.`}
+    </p>
+  )
+}
+
 function ComplianceBody({ minutes }: { minutes: number }) {
   const fetcher = useCallback(() => apiFetch<ComplianceReport>(`/api/v1/dashboard/compliance?window_minutes=${minutes}`), [minutes])
   const poll = usePolling(fetcher)
@@ -52,7 +95,7 @@ function ComplianceBody({ minutes }: { minutes: number }) {
   const chainsOk = chains.responses.ok === true && chains.decisions.ok === true
   const chainsBad = chains.responses.ok === false || chains.decisions.ok === false
   const counts = r.checklist.reduce<Record<string, number>>((acc, i) => ({ ...acc, [i.status]: (acc[i.status] ?? 0) + 1 }), {})
-  const prec = r.precision_bloqueos
+  const corr = r.corroboracion_sombra
   const acciones = r.respuestas.acciones ?? {}
 
   return (
@@ -77,13 +120,14 @@ function ComplianceBody({ minutes }: { minutes: number }) {
           <span className="kpi-note">Fast Path, promedio {ms(r.latencia_avg_ms)}. Tiempo de respuesta humana: no medido todavía.</span>
         </div>
         <div className="kpi">
-          <dt>Bloqueos corroborados por AbuseIPDB</dt>
-          <dd>{prec.available ? pct(prec.corroborated?.precision_pct) : 'sin dato'}</dd>
+          <dt className="kpi-head">Corroboración multi-fuente de T3 <span className="badge st-warn">modo sombra</span></dt>
+          <dd>{corr.available ? pct(corr.eligible_pct) : 'sin dato'}</dd>
           <span className="kpi-note">
-            {prec.available
-              ? `${prec.corroborated?.high_score_count ?? 0} de ${prec.corroborated?.count ?? 0} con score ≥ ${prec.corroborated?.threshold ?? 40}; ${prec.uncorroborated?.count ?? 0} sin fuente disponible (aparte).`
-              : 'Redis no respondió.'}
+            {corr.available
+              ? `${n(corr.eligible)} de ${n(corr.scored)} T3 ${corr.clamped ? `desde el inicio de la validación (${shadowDate(corr.from)})` : 'de la ventana'}: banda alta y sin ambigüedad, el criterio de autobloqueo si el score fuera el gate.`
+              : 'OpenSearch no respondió.'}
           </span>
+          <ShadowNotice c={corr} generatedAt={r.generated_at} />
         </div>
       </dl>
 
@@ -166,6 +210,45 @@ function ComplianceBody({ minutes }: { minutes: number }) {
           <p className="muted small mt3">Reporte ANCI en PDF: {r.exportacion_pdf.detail}</p>
         </div>
       </div>
+
+      {corr.available && corr.bands && corr.groups && (
+        <section className="panel panel-pad mt3" aria-labelledby="corr-shadow-title">
+          <h3 id="corr-shadow-title" className="mb2">
+            Corroboración multi-fuente de T3 <span className="badge st-warn">modo sombra</span>
+          </h3>
+          <div className="chart-grid">
+            <div>
+              <p className="muted small mb2">Bandas del score, sobre {n(corr.scored)} T3 con score desde el {shadowDate(corr.from)}</p>
+              <dl className="kv">
+                {(Object.keys(BAND_LABEL) as CorroborationBand[]).map((b) => (
+                  <Fragment key={b}>
+                    <dt>{BAND_LABEL[b]}</dt>
+                    <dd className="mono">{n(corr.bands?.[b])} ({pct(corr.scored ? (100 * (corr.bands?.[b] ?? 0)) / corr.scored : null)})</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </div>
+            <div>
+              <p className="muted small mb2">Disponibilidad de cada grupo, sobre {n(corr.groups.evaluated)} T3 con detalle por grupo</p>
+              <dl className="kv">
+                {(Object.keys(GROUP_LABEL) as CorroborationGroup[]).map((g) => (
+                  <Fragment key={g}>
+                    <dt>{GROUP_LABEL[g]}</dt>
+                    <dd className="mono">{pct(corr.groups?.available_pct[g])}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </div>
+          </div>
+          <p className="muted small mt3">
+            {corr.clamped
+              ? `Calculado desde el inicio del período de validación (${shadowDate(corr.from)}): antes, el score corrió con reglas previas (H52 y H53 sin P4) y sus bandas no son comparables. `
+              : 'Calculado sobre la ventana elegida. '}
+            {corr.excluded ? `${n(corr.excluded)} T3 de la ventana quedan fuera del cálculo (anteriores al período o sin score). ` : ''}
+            Es informativo: el gate de R2 sigue decidiendo con el conteo de fuentes corroborantes y este score no ejecuta ni bloquea nada.
+          </p>
+        </section>
+      )}
     </>
   )
 }

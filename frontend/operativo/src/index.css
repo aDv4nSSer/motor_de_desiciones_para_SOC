@@ -368,6 +368,13 @@ a { color: var(--brand); }
 .kpi dt { font-size: 12.5px; color: var(--text-muted); }
 .kpi dd { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
 .kpi .kpi-note { font-size: 12.5px; color: var(--text-muted); }
+.kpi-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
+.kpi .kpi-shadow {
+  display: flex; align-items: flex-start; gap: 6px; margin-top: var(--s1);
+  padding: 6px var(--s2); border-radius: var(--radius); border-left: 3px solid var(--warn);
+  background: var(--warn-bg); color: var(--warn); font-size: 12.5px; font-weight: 500; line-height: 1.35;
+}
+.kpi .kpi-shadow svg { flex: none; margin-top: 2px; }
 
 /* ── Tablas ──────────────────────────────────────────────────────────────── */
 .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-1); }

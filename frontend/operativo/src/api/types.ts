@@ -240,6 +240,27 @@ export interface ChecklistItem {
   source: string
 }
 
+export type CorroborationBand = 'high' | 'medium' | 'low' | 'ambiguous'
+export type CorroborationGroup = 'ml' | 'ti' | 'signature' | 'context'
+
+/** Score de corroboración de 4 grupos sobre T3 (H52/H53). Modo sombra: no decide bloqueos. */
+export interface CorroborationShadow {
+  available: boolean
+  shadow: true
+  validation: { start: string; end: string }
+  /** Inicio del cálculo: el más tardío entre la ventana y el inicio del período. */
+  from: string
+  clamped: boolean
+  t3_total?: number
+  scored?: number
+  /** T3 de la ventana fuera del cálculo (antes del período o sin score). */
+  excluded?: number
+  eligible?: number
+  eligible_pct?: number | null
+  bands?: Record<CorroborationBand, number>
+  groups?: { evaluated: number; available_pct: Record<CorroborationGroup, number | null> }
+}
+
 export interface ComplianceReport {
   window_minutes: number
   generated_at: string
@@ -252,6 +273,7 @@ export interface ComplianceReport {
     corroborated?: { count: number; high_score_count: number; precision_pct: number | null; threshold: number }
     uncorroborated?: { count: number }
   }
+  corroboracion_sombra: CorroborationShadow
   decisiones: { available: boolean; total: number; por_tier: Record<string, number> }
   respuestas: { available: boolean; acciones?: Record<string, number>; accesos?: Record<string, number>; cobertura_desde?: string | null }
   aprobaciones_pendientes: number | null

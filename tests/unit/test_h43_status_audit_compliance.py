@@ -325,3 +325,82 @@ class TestTendencias:
             def xrevrange(self, *a, **k):
                 raise redis.ConnectionError("caído")
         assert compliance.corroboration_sources(datetime.now(timezone.utc), R())["available"] is False
+
+
+# ── corroboración en modo sombra (H52/H53, tarjeta de Cumplimiento) ─────────
+
+class TestCorroboracionSombra:
+    WINDOW_24H = datetime(2026, 10, 7, 3, tzinfo=timezone.utc)     # antes del período
+    PERIOD_START = datetime(2026, 10, 7, 23, 40, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _os(captured: list, total=27_406, scored=3_839, eligible=3_775, evaluated=3_839):
+        def request(method, path, body=None):
+            captured.append((method, path, body))
+            return {"hits": {"total": {"value": total}}, "aggregations": {"period": {
+                "scored": {"doc_count": scored, "eligible": {"doc_count": eligible},
+                           "bands": {"buckets": [{"key": "high", "doc_count": 3_775},
+                                                 {"key": "ambiguous", "doc_count": 45},
+                                                 {"key": "medium", "doc_count": 19}]}},
+                "grouped": {"doc_count": evaluated, "groups": {"buckets": [
+                    {"key": "ml", "doc_count": 3_839}, {"key": "ti", "doc_count": 3_831},
+                    {"key": "context", "doc_count": 3_797}, {"key": "signature", "doc_count": 27}]}}}}}
+        return request
+
+    def test_query_solo_t3_de_respuesta_y_calculo_desde_el_periodo(self) -> None:
+        import compliance
+        captured: list = []
+        out = compliance.corroboration_shadow(self.WINDOW_24H, self._os(captured))
+        (method, path, body), = captured
+        assert (method, path) == ("POST", "/soc-responses-*/_search")
+        filters = body["query"]["bool"]["filter"]
+        assert {"term": {"event_type": "response"}} in filters and {"term": {"tier": 3}} in filters
+        # El total de T3 es de la ventana completa (mismo since que el resto del reporte)...
+        assert {"range": {"event_time": {"gte": self.WINDOW_24H.isoformat()}}} in filters
+        assert body["track_total_hits"] is True  # no se trunca en 10.000
+        # ...pero bandas y grupos solo desde el inicio del período (reglas comparables).
+        period = body["aggs"]["period"]
+        assert period["filter"] == {"range": {"event_time": {"gte": self.PERIOD_START.isoformat()}}}
+        elig = period["aggs"]["scored"]["aggs"]["eligible"]["filter"]["bool"]["filter"]
+        assert {"term": {"corroboration_band": "high"}} in elig
+        assert {"term": {"corroboration_ambiguous": False}} in elig  # no solo la banda
+        assert out["from"] == self.PERIOD_START.isoformat() and out["clamped"] is True
+
+    def test_ventana_posterior_al_periodo_no_se_recorta(self) -> None:
+        import compliance
+        captured: list = []
+        since = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+        out = compliance.corroboration_shadow(since, self._os(captured))
+        assert captured[0][2]["aggs"]["period"]["filter"]["range"]["event_time"]["gte"] == since.isoformat()
+        assert out["from"] == since.isoformat() and out["clamped"] is False
+
+    def test_bandas_y_porcentaje_elegible(self) -> None:
+        import compliance
+        out = compliance.corroboration_shadow(self.WINDOW_24H, self._os([]))
+        assert out["available"] is True and out["shadow"] is True
+        assert (out["t3_total"], out["scored"], out["excluded"], out["eligible"]) == (27_406, 3_839, 23_567, 3_775)
+        assert out["eligible_pct"] == 98.3  # sobre T3 con score en el período, nunca sobre el total
+        # Las bandas sin documentos aparecen en 0, no ausentes.
+        assert out["bands"] == {"high": 3_775, "medium": 19, "low": 0, "ambiguous": 45}
+        assert out["validation"]["end"] == "2026-10-10T23:40:00+00:00"
+
+    def test_disponibilidad_de_grupos_con_su_propio_denominador(self) -> None:
+        import compliance
+        out = compliance.corroboration_shadow(self.WINDOW_24H, self._os([], evaluated=3_839))
+        assert out["groups"]["evaluated"] == 3_839
+        assert out["groups"]["available_pct"] == {"ml": 100.0, "ti": 99.8, "signature": 0.7, "context": 98.9}
+
+    def test_ventana_sin_score_no_divide_por_cero(self) -> None:
+        import compliance
+        out = compliance.corroboration_shadow(
+            self.WINDOW_24H, lambda m, p, b=None: {"hits": {"total": {"value": 40}}, "aggregations": {"period": {
+                "scored": {"doc_count": 0, "eligible": {"doc_count": 0}, "bands": {"buckets": []}},
+                "grouped": {"doc_count": 0, "groups": {"buckets": []}}}}})
+        assert out["eligible_pct"] is None and out["excluded"] == 40
+        assert out["groups"]["available_pct"] == {g: None for g in ("ml", "ti", "signature", "context")}
+
+    def test_opensearch_caido_sigue_marcado_como_sombra(self) -> None:
+        import compliance
+        out = compliance.corroboration_shadow(self.WINDOW_24H, lambda *a, **k: None)
+        assert out["available"] is False and out["shadow"] is True
+        assert "end" in out["validation"]  # la vista muestra el aviso igual

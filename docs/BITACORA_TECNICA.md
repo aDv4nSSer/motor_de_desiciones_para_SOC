@@ -2410,6 +2410,50 @@ Haber visto la IP en **una** hora previa es evidencia positiva débil, pero con 
 
 **Estado: GRUPOS `signature` Y `context` + P3 + P4 DESPLEGADOS Y VERIFICADOS EN MODO SOMBRA. Gate de R2 intacto.**
 
+### Ampliación: tarjeta de Cumplimiento con el score de 4 grupos, marcada como modo sombra (2026-10-07, ~23:50 -03)
+
+Es un cambio solo de reporte. No se tocaron `corroboration.py`, `worker.py`, `config.py` ni ningún gate. La consulta lee campos que ya estaban indexados desde H52/H53.
+
+**Qué mostraba la tarjeta vieja.** Gobierno > Cumplimiento traía la tarjeta "Bloqueos corroborados por AbuseIPDB" (`dashboard.get_precision_stats`). Medía solo AbuseIPDB con el umbral viejo `score >= 40`, y solo sobre registros con `block.action == "block"` de `soc:response:audit`. En producción mostraba "sin dato" (0 de 0): casi toda T3 queda pendiente de aprobación (H52) y no hay bloqueos que contar. Además ignoraba el score de corroboración de 4 grupos.
+
+**Qué muestra la nueva** (`compliance.corroboration_shadow`, campo `corroboracion_sombra` de `GET /api/v1/dashboard/compliance`):
+- **Una sola query a `soc-responses-*`** filtrada por `event_type=response`, `tier=3` y la misma ventana de 24 h, 7 días o 30 días que las otras tres tarjetas.
+- **Número principal:** el % de T3 con `corroboration_band="high"` **y** `corroboration_ambiguous=false`. Es el criterio de autobloqueo que aplicaría el score si reemplazara al gate.
+- **Desglose:** las cuatro bandas y la disponibilidad de cada grupo (`corroboration_groups_available`). Va en un panel aparte, debajo de la tarjeta, para no saturarla.
+- **Línea separada con estilo de advertencia:** "No determina bloqueos reales: período de validación hasta el 10 oct, 20:40". Se muestra también cuando OpenSearch no responde. Pasado el 10-oct, el texto cambia a "validación cerrada… el gate actual sigue vigente".
+- **Respaldo:** la vista ya no usa `precision_bloqueos`, pero el campo sigue en la API por compatibilidad con el stub original.
+
+**Por qué el cálculo arranca en el período y no en la ventana (decisión de Antonio, 7-oct).** La ventana de 24 h mezcla tres versiones del score: H52 sin `signature`/`context`, H53 antes de P4, y P4. Sobre los mismos datos de producción (`.140`, ~23:50 -03) da:
+
+| Inicio del cálculo | T3 con score | Elegibles (high y no ambiguo) | `ambiguous` |
+|---|---|---|---|
+| Ventana completa (primer doc con score, 15:24:58 -03) | 12.474 | 70,2 % | 3.676 |
+| Restart de P4 (20:18:40 -03) | 4.275 | 98,2 % | 51 |
+| **Inicio del período (20:40 -03)** | **3.907** | **98,3 %** | **45** |
+
+Con la ventana completa, la tarjeta habría mostrado un 70 % que no corresponde a ninguna regla vigente. Es el mismo error que la sección "Cómo comparar" de arriba prohíbe. Por eso el cálculo arranca en `max(inicio de la ventana, 2026-10-07 20:40 -03)`. Las T3 de la ventana que quedan antes de ese punto, o que no traen score, se informan aparte como `excluded` y nunca entran al denominador. La tarjeta lo dice: "desde el inicio de la validación (7 oct, 20:40)".
+
+**Denominadores** (medidos en la query de verificación):
+- **Bandas:** se calculan sobre las T3 con score.
+- **Disponibilidad de grupos:** se calcula sobre las T3 con `corroboration_groups_available`, campo que existe desde H53. Desde el inicio del período, los dos denominadores coinciden (3.907).
+- **T3 sin score:** desde el primer documento con score (15:24:58 -03) hay **0**. Las 23.476 T3 excluidas de la ventana de 24 h son anteriores al despliegue de H52 o al período.
+
+**Datos reales mostrados** (24 h, ~23:50 -03):
+- 98,3 % elegibles (3.842 de 3.907).
+- Bandas: alta 3.842, media 20, baja 0, ambigua 45.
+- Disponibilidad de grupos: `ml` 100 %, `ti` 99,8 %, `signature` 0,7 %, `context` 98,9 %.
+
+Hoy las ventanas de 7 y 30 días dan los mismos números, porque no hay score antes del 7-oct.
+
+**Por qué queda marcada como informativa.** El gate real de R2 sigue siendo `corroboration_count >= 2`, y el score no ejecuta ni bloquea nada. Esta vista es evidencia de cumplimiento ante la Ley 21.663. Presentar el 98,3 % como bloqueos determinados sería inexacto, porque hoy casi todas las T3 quedan pendientes de aprobación humana. Por eso lleva el badge "modo sombra" y la línea fija de advertencia.
+
+**Tests:**
+- 6 nuevos en `tests/unit/test_h43_status_audit_compliance.py`: forma de la query, recorte al período, ventana posterior sin recorte, bandas y %, denominador de grupos, división por cero y OpenSearch caído. Pasan 38.
+- 3 nuevos en `frontend/operativo/src/test/compliance.test.tsx`: tarjeta con datos, aviso sin OpenSearch y texto pasado el período. El frontend pasa 41/41.
+- `tsc -b`, `oxlint` y `ruff` limpios.
+
+**Verificación visual:** se hizo con el frontend en local (Vite + Chromium headless) y el bloque `corroboracion_sombra` real que devolvió `.140`, a 1440 px, 1024 px en modo oscuro y 390 px. No hubo texto recortado ni scroll horizontal. **Pendiente: desplegar a `.140`** (`deploy_operativo.sh` + restart de `motor-soc`) y mirarlo con una sesión CISO real.
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)
