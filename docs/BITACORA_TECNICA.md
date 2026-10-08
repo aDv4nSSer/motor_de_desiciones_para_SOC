@@ -2767,26 +2767,37 @@ Las IPs que AbuseIPDB nunca vio llevan un score imputado por Monte Carlo (40 sor
 
 ### Diseño C (token bucket con ráfaga, D2): implementado en el working tree, pendiente de revisión de Antonio
 
-**Por qué no un bucket clásico.** Uno que arranca lleno permite capacidad + tasa × 24 h = 288 + 864 = 1.152 por día. Uno que arranca vacío en cada reset garantiza ≤ 864, pero **con este tráfico no aporta nada**: la demanda siempre supera la recarga y los tokens no se acumulan (cap=288 da igual que cap=6). La mejora de pendientes que se mostró antes venía de un bucket que arrancaba lleno.
+**Por qué no un bucket clásico.** Uno que arranca lleno permite capacidad + tasa × 24 h = 288 + 864 = 1.152 por día. Uno que arranca vacío en cada reset garantiza ≤ 864, pero **con este tráfico no aporta nada**: la demanda siempre supera la recarga y los tokens no se acumulan. La mejora de pendientes que se mostró antes venía de un bucket que arrancaba lleno.
 
 **D2:**
-- El bucket arranca lleno (`abuseipdb_burst_capacity` = 288) en cada día UTC y recarga 864/día.
-- **Techo duro aparte:** `usadas_hoy < 864 − 432·(1 − f)`, con f = fracción del día **UTC**. Garantiza ≤ 864 por día de cuota y deja que el techo crezca 18/h hacia el final del día.
+- El bucket arranca lleno (`abuseipdb_burst_capacity` = 288) y recarga 864/día.
+- **Techo duro aparte:** `usadas_hoy < 864 − 432·(1 − f)`, que garantiza ≤ 864 por día de cuota. El techo arranca en 432 y crece 18/h.
 - `usadas_hoy = max(contador propio, Limit − Remaining del gauge de H55)`.
-- Si la cuota real marca más de 5 usadas por encima del bucket, este se **re-sincroniza con la real, sin ráfaga** (`tokens = 0`).
-- Con capacidad **0** vuelven las ventanas fijas de H52: es el interruptor, por `.env`.
+- Si la cuota real marca más de 5 usadas por encima del bucket, este se re-sincroniza con la real y pierde la ráfaga.
+- Con capacidad **0** vuelven las ventanas fijas de H52: es el interruptor, por `.env` (`ABUSEIPDB_BURST_CAPACITY=0`).
 
-**Bug encontrado y corregido en la implementación:**
-- La primera versión, ante la discrepancia con el gauge, delegaba en las ventanas de H52.
-- Con desalojo de Redis **y** reinicio del worker a la vez, eso daba **1.000 consultas en el día**: las ventanas reparten 864 desde cero y no respetan el techo.
-- Con la re-sincronización da ≤ 865.
+**Respuestas a la revisión de Antonio (8-oct):**
+- **(a) Atomicidad.** Hoy `response-worker` es un solo proceso con un solo consumidor y un bucle secuencial, así que no hay carrera. Igual, la primera versión hacía `GET` → calcular → `SETEX`: un segundo proceso o hilo podía gastar el mismo token. **Ahora todo el read-modify-write corre en un script Lua (`EVAL`)**, que Redis ejecuta de forma atómica (Redis 8.0.5 en `.140`, con `cjson`).
+- **(b) Arranque conservador.** Sin estado del día, sin copia en memoria, sin gauge y sin la marca `ti:rate:abuseipdb:day:last` de un día anterior (desalojo + reinicio, o primer deploy), el bucket asume **usadas = techo actual y 0 tokens**. Así no consulta hasta que el techo crece en uno (~3 min) y la primera respuesta trae el consumo real, que reemplaza la estimación.
+  - Solo arranca lleno si la marca prueba que es un día nuevo con Redis intacto.
+  - **Consecuencia:** el día del corte (9-oct 21:00 -03 = 10-oct 00:00Z) no hay marca, así que **el primer día no hay ráfaga**: rige el ritmo base (~6 cada 10 min). La ráfaga empieza el segundo día.
+- **(c) Día de cuota.** Sale de `X-RateLimit-Reset` (epoch crudo, `reset_hdr` en el gauge) cuando el header viene en la última respuesta. Si no, 00:00 UTC. AbuseIPDB informó 00:00Z el 7 y el 8-oct.
+- **(d) Los timeouts cuentan.** El token se toma **antes** de llamar a la API, así que un timeout de lectura (que AbuseIPDB igual cobra, H55) queda contado. Hay test.
 
-**Tests:** `test_abuseipdb_burst_bucket.py` (10).
-- Cubren: interruptor; ráfaga del reset; agotamiento y recarga; reserva de cola; f sobre el día UTC; el gauge manda (el caso del 8-oct: 716 reales, 0 consultas); un día completo saturado (≤ 864, 0 respuestas 429, ≥ 17/h en las últimas 4 h); desalojo; desalojo + reinicio.
-- **Mutaciones:** sin techo, 6 tests fallan; con f en hora local, fallan 5.
-- Los tests de H52/H55 fijan `abuseipdb_burst_capacity = 0` (prueban ese modo).
-- `tests/unit/conftest.py` resetea el estado de proceso de `enrichment` entre tests.
-- Suite: **732 passed**, pre-commit limpio.
+**Bugs encontrados y corregidos en la implementación:**
+1. Ante la discrepancia con el gauge, la primera versión delegaba en las ventanas de H52. Con desalojo + reinicio daba **1.000 consultas en el día**.
+2. El estado re-sincronizado, o creado a partir del gauge, no se persistía en las ramas que rechazan la consulta. Cada llamada lo recreaba con `ts = ahora`, el bucket no recargaba nunca y la fuente quedaba muerta el resto del día.
+3. Con el gauge apenas por encima del contador (dentro de la tolerancia), las usadas no tomaban el máximo de los dos.
+
+**Tests:**
+- **Unitarios:** `test_abuseipdb_burst_bucket.py` (17). Corren sobre un emulador en Python del Lua (`tests/unit/burst_lua_emulator.py`), conectado por `tests/unit/conftest.py` solo para los `FakeRedis`. Cubren: interruptor; ráfaga del reset; agotamiento y recarga; reserva de cola; f UTC; día por header; el gauge manda; arranque conservador (desalojo + reinicio sin gauge, y primer deploy en el reset); timeouts; un día saturado (≤ 864, 0 respuestas 429, ≥ 17/h al final); desalojo; desalojo + reinicio; deploy a media jornada.
+- **Integración:** `tests/integration/test_abuseipdb_burst_lua.py` (3), contra un `redis-server` efímero local; se saltan si no hay binario.
+  - **Concurrencia:** 16 hilos y 640 pedidos dan **exactamente 288** sobre el Lua real.
+  - **Control:** la versión no atómica, con la misma carga, gasta de más.
+  - **Diferencial:** el emulador coincide con el Lua real en 400 casos aleatorios × 5 pasos.
+- **Mutaciones:** sin techo, sin persistir el estado y con f en hora local, los tests fallan.
+- Los tests que no son del bucket fijan `abuseipdb_burst_capacity = 0`.
+- Suite: **753 passed**, pre-commit limpio.
 
 ### Auditoría de Cowrie (solo lectura)
 
@@ -2835,10 +2846,15 @@ Las IPs que AbuseIPDB nunca vio llevan un score imputado por Monte Carlo (40 sor
   - Si el AR llega al manager (`.139`), cortaría `.140` del bastion por el TTL del AR (30 min): Vector → motor (Fast Path caído), las llamadas del worker a la API de Wazuh (sin desbloqueo por API), el SSH por jump a `.140` y los sinks de OpenSearch.
   - En `.138` el efecto es menor.
   - No verifiqué si `all` incluye al agente 000; requiere la API con rol de lectura.
-- **Opciones, sin aplicar:**
-  1. Pausar la entrada de crontab durante el período 2. El script no cumple su objetivo desde junio y agrega ~2 T3/día de infraestructura propia.
-  2. Etiquetar como sintético el tráfico de `10.10.10.3` 02:00–02:05 en las métricas.
-  3. Mantener la allowlist actual. Ya protege; como defensa adicional, un test que falle si `10.10.10.3` sale de la safelist.
+- **`WAZUH_TARGET_AGENTS=all` no llega al manager (agente 000), verificado en solo lectura:**
+  - el worker manda el AR sin `agents_list` (`"PUT /active-response" with parameters {}` en el `api.log` de `.139`, 470 llamadas en el archivo actual);
+  - el `active-responses.log` de `.138` tiene 1.204.435 líneas de `firewall-drop`;
+  - el del **manager** (`.139`) tiene **0 bytes desde el 1-jun**.
+  - Un bloqueo hipotético de `10.10.10.3` caería solo en `.138`, con el que el motor no habla directo. Lo descrito antes para el manager no ocurre con la config actual.
+- **Decisión (Antonio, 8-oct):**
+  - **no se pausa** durante el período 2: sus docs ya están excluidos de los scripts de sombra, y pausarlo sería otra edición de producción;
+  - se agregó el test `test_own_infra_never_blocked.py` (`ad49017`): falla si una IP crítica sale de `OWN_INFRA`/safelist (se verificó quitando `10.10.10.3`);
+  - **pendiente post-período 2:** reparar el script (`-sT` en lugar de `-sS`, un diccionario que exista) o eliminarlo.
 
 ### Reentrenamiento semanal del Isolation Forest (solo lectura)
 
@@ -2851,7 +2867,13 @@ Las IPs que AbuseIPDB nunca vio llevan un score imputado por Monte Carlo (40 sor
   - verificar después que el hash de `isolation_forest.pkl` siga en `4958eb4b…`;
   - si cambia (alguien actualizó la copia del corpus), **es un corte de régimen**.
   - Antes del domingo, verificar que la copia del corpus de `.140` siga con mtime del 20-jun.
-- **Congelar el cron** queda como opción para Antonio; no se tocó.
+- **Decisión (Antonio, 8-oct): no se congela.** Quedan dos verificaciones en `PENDIENTES_MODO_SOMBRA.md`: antes del domingo, el mtime de la copia del corpus (debe seguir siendo 20-jun); después, el hash del modelo (debe seguir siendo `4958eb4b…`). Si cambia, es corte de régimen.
+
+### Definición de métrica: `HONEYPOT_PORTS` del dashboard (`917abc5`)
+
+**Es un cambio de DEFINICIÓN, no de los datos.** Desde el corte del 9-oct a las 21:00 -03, que es cuando se despliega, el panel de puertos del dashboard clasifica el **2223** (Cowrie tras el redirect) como `honeypot` y no como `external`. Antes de esa hora, ~33.000 docs T2/semana a 2223 aparecían como "external".
+- La caída de "external" y la subida de "honeypot" en el panel a partir de esa hora **no es un cambio del tráfico**.
+- Los índices (`soc-decisions-*`, `soc-responses-*`) no cambian: solo cambia la clasificación que hace el dashboard al leerlos.
 
 ### Hallazgos colaterales (no tocados)
 
@@ -2886,6 +2908,7 @@ Todas son predicciones hasta medirlas.
 - **Cuota de AbuseIPDB, agotamiento del 8-oct (H55): causa confirmada** = deploy del bucket con 716 ya gastadas (transitoria; el cron de `.139` cobra 0 de esa cuenta). Pendiente: desplegar el gauge a `.140`, verificar que el 9-oct no se agote, y que Antonio revoque la key vieja (`0170c4a5f8`).
 - **Etiquetador de `.139` sin scores de AbuseIPDB desde ≥ 10-ago (H55, colateral):** el 100% de las muestras devuelve `-1` y la key de la crontab (`54032bf755`) no es la del motor. Afecta las etiquetas del corpus de reentrenamiento, no el período de sombra. Además hay una key en texto plano en `.139:~/.bash_history`.
 - **Período de modo sombra (H52):** seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`.
+- **`campana_automatica.sh` (H56), post-período 2:** reparar (`-sT`, diccionario existente) o eliminar. No se pausa durante el período 2.
 - **H56, pendientes:** deploy de la Fase 3 A (`724cbb8`) en el corte del 9-oct a las 21:00 -03 + edición de `ABUSEIPDB_CACHE_TTL` en el `.env` de `.140` (OK aparte); diseño C (D2) a revisión; hardening de `cowrie.service`; `HOME_NET` y paths HTTP para cerrar E2; revisión manual de las 110 IPs `high`; `campana_automatica.sh` contra el SSH real; drift de Vector en `.139`.
 - **H51 sin documentar** (número reservado, trabajo de otra sesión).
 
