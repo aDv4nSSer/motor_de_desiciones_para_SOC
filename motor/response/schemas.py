@@ -137,6 +137,10 @@ class BlockResult(BaseModel):
 #: sostenido en el tiempo (todo el scoring es por-flujo) — se deja fuera
 #: deliberadamente hasta diseñar esa señal con evidencia, no a las apuradas.
 ACCION_NINGUNA = "ninguna"
+#: T2 cuyo origen es infraestructura propia del SOC (config.OWN_INFRA, H54):
+#: se registra y se explica, pero no abre caso. Distinto de ACCION_NINGUNA
+#: para poder medir en el dashboard cuánto ruido interno se descarta.
+ACCION_NINGUNA_INFRA_PROPIA = "ninguna_infra_propia"
 ACCION_ALERTAR_CREAR_CASO = "alertar_crear_caso"
 ACCION_BLOQUEO_IP = "bloqueo_ip"
 ACCION_ALERTAR_PENDIENTE_APROBACION = "alertar_pendiente_aprobacion"

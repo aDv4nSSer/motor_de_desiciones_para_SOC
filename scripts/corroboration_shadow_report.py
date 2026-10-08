@@ -36,18 +36,31 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "motor"))
 
 from response.config import get_settings
-from response.enforcer import is_safelisted
+from response.enforcer import is_own_infra, is_safelisted
 from response.schemas import (
     ACCION_ALERTAR_CREAR_CASO,
     ACCION_ALERTAR_PENDIENTE_APROBACION,
     ACCION_BLOQUEO_IP,
     ACCION_NINGUNA,
+    ACCION_NINGUNA_INFRA_PROPIA,
     ActionType,
 )
 from response_audit_indexer import AuditIndexerSettings, OpenSearchClient
 
 H25_EXCLUDED = {"gte": "2026-08-18T00:00:00-03:00", "lt": "2026-09-05T00:00:00-03:00"}
 PAGE = 1000
+
+#: Corte de régimen de H54 (epoch de payload.processed_at): desde acá, una T2
+#: no stale cuyo origen está en config.OWN_INFRA registra
+#: ACCION_NINGUNA_INFRA_PROPIA en vez de abrir caso. None = todavía no
+#: desplegado (se espera la regla vieja para todos los docs).
+T2_OWN_INFRA_CUT: float | None = None
+
+
+def _own_infra_rule_applies(payload: dict) -> bool:
+    """True si el doc se procesó con la regla de H54 (T2 de infra propia sin caso)."""
+    ts = payload.get("processed_at")
+    return T2_OWN_INFRA_CUT is not None and isinstance(ts, (int, float)) and ts >= T2_OWN_INFRA_CUT
 
 
 def expected_r2_options(payload: dict, settings) -> list[tuple[str, str | None]]:
@@ -80,6 +93,9 @@ def expected_r2(payload: dict, settings) -> tuple[str, str | None]:
     stale = age is not None and age > settings.stale_event_max_age_seconds
 
     accion = ACCION_ALERTAR_CREAR_CASO if tier == 2 else ACCION_NINGUNA
+    if (tier == 2 and not stale and src_ip and is_own_infra(src_ip)
+            and _own_infra_rule_applies(payload)):
+        accion = ACCION_NINGUNA_INFRA_PROPIA
     if tier < settings.r2_min_tier:
         return accion, "absent"
     if stale:

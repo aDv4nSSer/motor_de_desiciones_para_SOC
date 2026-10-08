@@ -50,6 +50,7 @@ LOCAL_TZ = timezone(timedelta(hours=-3))
 SOURCE = [
     "trace_id", "tier", "src_ip", "event_time", "corroboration_band", "corroboration_count",
     "payload.tier", "payload.src_ip", "payload.accion_recomendada", "payload.event_age_seconds",
+    "payload.processed_at",
     "payload.block.action", "payload.block.enforced",
     "payload.enrichment.corroboration_count", "payload.enrichment.otx_available",
     "payload.enrichment.abuseipdb_available",

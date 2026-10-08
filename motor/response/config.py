@@ -18,17 +18,34 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from response.schemas import ResponseMode
 
 
-# IPs de la infraestructura del lab — NUNCA bloquear (subred 200.54.12.136/29).
-# Se puede ampliar vía env RESPONSE_SAFELIST_EXTRA (coma-separada).
-DEFAULT_SAFELIST: set[str] = {
-    "200.54.12.137",   # Cisco 892FSP — gateway (Telefónica)
-    "200.54.12.138",   # Gen9 A — web server
-    "200.54.12.139",   # Gen10 — sensor / SOC
-    "200.54.12.140",   # Lenovo — motor / ML (este host)
-    "200.54.12.141",   # NO USAR — pero igual nunca bloquear
-    "200.54.12.142",   # Gen9 B — sin asignar
+# Infraestructura que opera el propio SOC, en la topología NAT/VLAN (migración
+# del 1-sep-2026, tabla Infraestructura de CLAUDE.md). Es la ÚNICA lista que
+# exime a una T2 de abrir caso (enforcer.is_own_infra, H54): sin la exención
+# genérica por rango privado, así un host comprometido de una VLAN que no esté
+# acá sigue abriendo caso. Gateways de VLAN = subinterfaces de .139 (eno2.*):
+# Suricata captura en el trunk eno2 y ve también el tráfico del propio .139.
+OWN_INFRA: frozenset[str] = frozenset({
+    "200.54.12.137",     # Cisco 892FSP — gateway upstream de .139 (default route)
+    "200.54.12.139",     # Gen10 .139 — bastion/NAT, Suricata, Wazuh Manager, Vector
+    "2002:c836:c8b::",   # 6to4 de 200.54.12.139 (aparece como origen en flows)
+    "10.10.10.1",        # .139 en VLAN 10: Vector -> motor (:8000) y OpenSearch (:9201)
+    "10.20.20.1",        # .139 en VLAN 20
+    "10.30.30.1",        # .139 en VLAN 30: .139 -> .138
+    "10.10.10.3",        # Lenovo .140 — motor, Redis, OpenSearch (este host)
+    "10.30.30.2",        # Gen9 A .138 — nginx + WordPress
+    "10.10.10.254",      # switch SG350 — gestión
     "127.0.0.1",
     "::1",
+})
+
+# NUNCA bloquear (R2): la infra propia + servidores de terceros que siguen con
+# IP pública del /29 hasta migrar. .138 y .140 ya no tienen IP pública (sus
+# 200.54.12.138/.140 salieron de la lista con la migración). Además,
+# is_safelisted() exime cualquier IP privada/loopback/link-local.
+# Se puede ampliar vía env RESPONSE_SAFELIST_EXTRA (coma-separada).
+DEFAULT_SAFELIST: set[str] = set(OWN_INFRA) | {
+    "200.54.12.141",     # .141 (servidor IA) — pública hasta migrar a 10.20.20.2
+    "200.54.12.142",     # .142 (emprendedores) — fuera del perímetro R-SOAR, sigue pública
 }
 
 

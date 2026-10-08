@@ -25,6 +25,7 @@ export function shortId(id: string): string {
 
 export const ACCION_LABEL: Record<string, string> = {
   ninguna: 'Sin acción',
+  ninguna_infra_propia: 'Sin acción (infra propia)',
   alertar_crear_caso: 'Alertar y crear caso',
   bloqueo_ip: 'Bloqueo de IP',
   alertar_pendiente_aprobacion: 'Pendiente de aprobación',

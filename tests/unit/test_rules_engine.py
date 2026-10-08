@@ -249,7 +249,7 @@ class TestEvaluate:
 class TestRulesYamlReal:
     def test_carga_sin_error(self) -> None:
         rs = load_rules(DEFAULT_RULES_PATH)
-        assert len(rs.rules) == 11
+        assert len(rs.rules) == 12
 
     def test_get_rules_cachea_la_misma_instancia(self) -> None:
         """get_rules() no debe releer el archivo en cada llamada (mismo

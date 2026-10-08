@@ -24,7 +24,7 @@ import httpx
 import redis
 from attck_mapping import ATTACK_FIELDS, attack_fields
 
-from response.config import ResponseSettings
+from response.config import OWN_INFRA, ResponseSettings
 from response.schemas import ActionType, BlockResult
 
 log = logging.getLogger("response.r2")
@@ -77,6 +77,29 @@ def is_safelisted(ip: str, settings: ResponseSettings) -> bool:
         # IP malformada -> por seguridad, no bloquear
         return True
     return False
+
+
+_OWN_INFRA_ADDRS = frozenset(ipaddress.ip_address(ip) for ip in OWN_INFRA)
+
+
+def is_own_infra(ip: str) -> bool:
+    """True si la IP es infraestructura propia del SOC (config.OWN_INFRA).
+
+    A diferencia de is_safelisted(), NO exime rangos privados: decide si una
+    T2 abre caso (H54), no si se puede bloquear. Compara como dirección, así
+    la forma expandida de IPv6 que manda Suricata coincide con la lista.
+
+    Args:
+        ip: IP de origen del evento.
+
+    Returns:
+        True solo si está en OWN_INFRA. Una IP malformada da False (el caso
+        se abre igual, como antes de H54).
+    """
+    try:
+        return ipaddress.ip_address(ip) in _OWN_INFRA_ADDRS
+    except ValueError:
+        return False
 
 
 # ── Tracking de bloqueos activos (idempotencia + TTL) ───────────────────────────

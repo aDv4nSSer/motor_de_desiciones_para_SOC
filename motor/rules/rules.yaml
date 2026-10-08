@@ -44,7 +44,21 @@ rules:
       revisión en vez de actuar directo.
     weight: 1.0
     when:
-      {field: tier, op: eq, value: 2}
+      all:
+        - {field: tier, op: eq, value: 2}
+        - {field: is_own_infra, op: eq, value: false}
+
+  - id: R012_t2_infra_propia
+    text: >-
+      T2 con origen en infraestructura propia del SOC (pipeline Vector,
+      Wazuh, motor o gateways de VLAN): se registra la decisión pero no se
+      abre caso -- es tráfico del propio sistema que Suricata ve al capturar
+      en el trunk de .139.
+    weight: 0.0
+    when:
+      all:
+        - {field: tier, op: eq, value: 2}
+        - {field: is_own_infra, op: eq, value: true}
 
   - id: R004_corroborado_otx
     text: >-

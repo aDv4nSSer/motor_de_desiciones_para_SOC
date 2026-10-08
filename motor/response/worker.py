@@ -28,7 +28,13 @@ from attck_mapping import attack_fields
 from response.approvals import create_pending_approval, expire_stale_approvals
 from response.cases import open_case
 from response.config import get_settings
-from response.enforcer import ar_context, build_enforcer, is_safelisted, respond_block
+from response.enforcer import (
+    ar_context,
+    build_enforcer,
+    is_own_infra,
+    is_safelisted,
+    respond_block,
+)
 from response.enrichment import enrich, lookup_suricata_alert
 from response.recidivism import count_and_record
 from response.schemas import (
@@ -36,6 +42,7 @@ from response.schemas import (
     ACCION_ALERTAR_PENDIENTE_APROBACION,
     ACCION_BLOQUEO_IP,
     ACCION_NINGUNA,
+    ACCION_NINGUNA_INFRA_PROPIA,
     ActionType,
     BlockResult,
     EnrichmentResult,
@@ -63,6 +70,7 @@ def _audit(record: ResponseRecord, rdb: redis.Redis):
 
 def _rule_context(
     task: ResponseTask, record: ResponseRecord, stale: bool, safelisted: bool,
+    own_infra: bool = False,
 ) -> dict:
     """Construye el contexto de hechos para rules.engine.evaluate().
 
@@ -80,6 +88,8 @@ def _rule_context(
             frescura configurado (ver stale_reason/event_age_seconds).
         safelisted: True si task.src_ip pertenece a la safelist de infra
             propia del laboratorio.
+        own_infra: True si task.src_ip está en config.OWN_INFRA (la T2 no
+            abre caso, H54). Más estrecho que safelisted: sin rangos privados.
 
     Returns:
         Diccionario plano de hechos, listo para pasar a
@@ -93,6 +103,7 @@ def _rule_context(
         "corroborating_sources": e.corroborating_sources if e else [],
         "crowdsec_observado": e.crowdsec_observado if e else False,
         "is_safelisted": safelisted,
+        "is_own_infra": own_infra,
         "is_stale": stale,
         "otx_available": e.otx_available if e else True,
         "abuseipdb_available": e.abuseipdb_available if e else True,
@@ -231,6 +242,13 @@ def process_task(
     if task.tier == 2 and stale:
         record.accion_recomendada = ACCION_ALERTAR_CREAR_CASO
         log.info(f"[{task.trace_id[:8]}] T2 sin caso: {stale_reason(settings.stale_event_max_age_seconds)} (age={age:.0f}s)")
+    elif task.tier == 2 and task.src_ip and is_own_infra(task.src_ip):
+        # Infra propia del SOC (H54): Suricata captura en el trunk de .139 y
+        # ve el propio pipeline (Vector -> motor/OpenSearch, worker -> API de
+        # Wazuh). Se registra y se explica, pero no abre caso. Solo la lista
+        # explícita: una IP privada que no esté en OWN_INFRA abre caso igual.
+        record.accion_recomendada = ACCION_NINGUNA_INFRA_PROPIA
+        log.info(f"[{task.trace_id[:8]}] T2 sin caso: infra propia {task.src_ip}")
     elif task.tier == 2:
         record.accion_recomendada = ACCION_ALERTAR_CREAR_CASO
         case = open_case(
@@ -329,8 +347,9 @@ def process_task(
     # sigue firme -- se pierde la explicación, nunca la acción ni el audit.
     if task.tier >= 2:
         safelisted = bool(task.src_ip and is_safelisted(task.src_ip, settings))
+        own_infra = bool(task.src_ip and is_own_infra(task.src_ip))
         try:
-            result = evaluate(_rule_context(task, record, stale, safelisted))
+            result = evaluate(_rule_context(task, record, stale, safelisted, own_infra))
             record.rules_fired = result.rules_fired
             record.reasoning = result.reasoning
             record.rules_total_weight = result.total_weight
