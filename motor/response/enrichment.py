@@ -26,11 +26,15 @@ import redis
 
 from attck_mapping import AttckMappingLoadError, lookup
 from constants import (
+    ABUSEIPDB_NON_DECISIVE_SHARE,
+    ABUSEIPDB_RATE_KEY_PREFIX,
+    ABUSEIPDB_RATE_WINDOW_SECONDS,
     ALERT_CORRELATION_LOOKAHEAD_SECONDS,
     ALERT_CORRELATION_LOOKBACK_SECONDS,
     ALERT_LOOKUP_CONNECT_TIMEOUT_SECONDS,
     ALERT_LOOKUP_FAILURE_COOLDOWN_SECONDS,
     ALERT_LOOKUP_READ_TIMEOUT_SECONDS,
+    SECONDS_PER_DAY,
     SURICATA_ALERTS_INDEX_PATTERN,
     T3_CLASSTYPES,
 )
@@ -119,12 +123,60 @@ def quota_reset_seconds(resp: httpx.Response, now: float | None = None) -> int:
     return int(min(QUOTA_MAX_SECONDS, max(QUOTA_MIN_SECONDS, seconds)))
 
 
+def abuseipdb_window_budget(settings: ResponseSettings) -> int:
+    """Consultas a la API de AbuseIPDB permitidas por ventana del token
+    bucket, derivadas de la cuota diaria configurada (ver constants.py)."""
+    return max(1, (settings.abuseipdb_daily_quota * ABUSEIPDB_RATE_WINDOW_SECONDS) // SECONDS_PER_DAY)
+
+
+def _abuseipdb_rate_key(now: float) -> str:
+    start = int(now // ABUSEIPDB_RATE_WINDOW_SECONDS) * ABUSEIPDB_RATE_WINDOW_SECONDS
+    return f"{ABUSEIPDB_RATE_KEY_PREFIX}{start}"
+
+
+def _take_abuseipdb_token(
+    rdb: redis.Redis, settings: ResponseSettings, decisive: bool, now: float,
+) -> str | None:
+    """Intenta gastar un cupo de la ventana actual del token bucket.
+
+    Las consultas decisivas (OTX corrobora, AbuseIPDB puede llevar count de
+    1 a 2) pueden usar todo el presupuesto de la ventana; las no decisivas
+    solo la fracción ABUSEIPDB_NON_DECISIVE_SHARE, para dejar cupo reservado
+    a las que pueden cambiar la decisión de R2.
+
+    Returns:
+        None si hay cupo (y lo consume); si no, el motivo para la nota de
+        auditoría. Si Redis falla, no consulta: proteger la cuota es más
+        barato que un 429 que corta la fuente hasta el día siguiente.
+    """
+    budget = abuseipdb_window_budget(settings)
+    limit = budget if decisive else int(budget * ABUSEIPDB_NON_DECISIVE_SHARE)
+    key = _abuseipdb_rate_key(now)
+    try:
+        used = int(rdb.get(key) or 0)
+        if used >= limit:
+            kind = "presupuesto de la ventana agotado" if decisive else "cupo no decisivo de la ventana agotado"
+            return f"{kind} ({used}/{budget} en {ABUSEIPDB_RATE_WINDOW_SECONDS}s)"
+        rdb.incr(key)
+        rdb.expire(key, 2 * ABUSEIPDB_RATE_WINDOW_SECONDS)
+        return None
+    except (redis.RedisError, ValueError, TypeError) as e:
+        log.warning(f"token bucket de AbuseIPDB no disponible, sin consultar: {type(e).__name__}")
+        return "token bucket no disponible (Redis)"
+
+
 def _abuseipdb_lookup(
     ip: str, settings: ResponseSettings, rdb: redis.Redis, cache_only: bool = False,
+    decisive: bool = True, now: float | None = None,
 ) -> EnrichmentResult:
     """
     Consulta AbuseIPDB con cache. Devuelve EnrichmentResult parcial.
     Nunca lanza excepción hacia arriba — degradación elegante.
+
+    La consulta a la API (no la caché) gasta un cupo del token bucket
+    (H52): sin cupo se omite para ESTE evento, sin esperar ni reintentar.
+    `decisive` = OTX ya corrobora, así que AbuseIPDB puede cambiar la
+    decisión de R2 (ver _take_abuseipdb_token).
     """
     result = EnrichmentResult(src_ip=ip)
 
@@ -174,7 +226,16 @@ def _abuseipdb_lookup(
         result.notes.append(f"abuseipdb {STALE_NOTE}")
         return result
 
-    # 5) Consulta API
+    # 5) Token bucket (H52): reparto de la cuota diaria. Nota distinta de
+    # "cuota agotada" (429) y de un timeout, para poder separarlas al revisar
+    # el período de sombra.
+    throttled = _take_abuseipdb_token(rdb, settings, decisive, time.time() if now is None else now)
+    if throttled:
+        result.abuseipdb_available = False
+        result.notes.append(f"abuseipdb: omitido por throttling ({throttled})")
+        return result
+
+    # 6) Consulta API
     try:
         resp = httpx.get(
             ABUSEIPDB_URL,
@@ -417,8 +478,16 @@ def enrich(
         r.notes.append("sin src_ip")
         return r
 
-    result = _abuseipdb_lookup(src_ip, settings, rdb, cache_only)
+    # OTX primero (H52): sin cuota diaria conocida que se agote, y su
+    # resultado define si un cupo de AbuseIPDB es decisivo. Con el gate
+    # vigente (count >= 2) solo puede cambiar la decisión de R2 una consulta
+    # a AbuseIPDB sobre una IP que OTX ya corrobora.
     otx_result = _otx_lookup(src_ip, settings, rdb, cache_only)
+    decisive = bool(
+        otx_result.otx_available and otx_result.otx_pulse_count is not None
+        and otx_result.otx_pulse_count >= settings.otx_min_pulse_count
+    )
+    result = _abuseipdb_lookup(src_ip, settings, rdb, cache_only, decisive=decisive)
     result.otx_pulse_count = otx_result.otx_pulse_count
     result.otx_available = otx_result.otx_available
     result.notes.extend(otx_result.notes)

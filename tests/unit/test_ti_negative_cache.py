@@ -52,6 +52,15 @@ class TTLRedis:
         self.kv[key] = value
         self.ttl[key] = ttl
 
+    # Token bucket de AbuseIPDB (H52): contador por ventana.
+    def incr(self, key):
+        self.kv[key] = str(int(self.kv.get(key) or 0) + 1)
+        return int(self.kv[key])
+
+    def expire(self, key, ttl):
+        self.ttl[key] = ttl
+        return True
+
 
 def _settings(**over) -> ResponseSettings:
     base = {"abuseipdb_api_key": "k", "otx_api_key": "k", "ti_negative_cache_ttl": 600,

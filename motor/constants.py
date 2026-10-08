@@ -50,3 +50,20 @@ RECIDIVISM_WINDOW_SECONDS = 30 * 86400
 # (corr_context_recidivism_saturation) y Redis en .140 corre con
 # maxmemory 1 GB + allkeys-lru (805 MB usados, 2026-10-07).
 RECIDIVISM_MAX_MEMBERS = 64
+
+# ── Reparto de la cuota diaria de AbuseIPDB (H52, token bucket de security.md) ─
+# La cuota (ResponseSettings.abuseipdb_daily_quota, 1.000/día en el plan
+# gratuito) se agotaba ~50 min después de cada reset de las 00:00 UTC: 157
+# consultas en los primeros 8 min del 2026-10-08. Se reparte en ventanas fijas
+# `ti:rate:abuseipdb:{inicio de ventana}`: presupuesto por ventana =
+# floor(cuota * ventana / 86400). Con 1.000/día y 600 s: 6 por ventana
+# (~0,6/min, 864/día, margen de 136 contra el 429). Ventana de 10 min y no de
+# 1 min porque la tasa (~0,69/min) es menor a 1 token por minuto.
+SECONDS_PER_DAY = 86400
+ABUSEIPDB_RATE_WINDOW_SECONDS = 600
+ABUSEIPDB_RATE_KEY_PREFIX = "ti:rate:abuseipdb:"
+# Fracción del presupuesto de cada ventana que pueden usar las consultas que
+# NO pueden cambiar la decisión de R2 (OTX no corrobora: AbuseIPDB llevaría
+# count como máximo a 1). El resto queda reservado para las decisivas (OTX
+# corrobora: AbuseIPDB puede llevar count de 1 a 2 y habilitar el bloqueo).
+ABUSEIPDB_NON_DECISIVE_SHARE = 0.5

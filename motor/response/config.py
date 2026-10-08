@@ -78,6 +78,10 @@ class ResponseSettings(BaseSettings):
     # ── R1: AbuseIPDB ──────────────────────────────────────────────────
     abuseipdb_api_key: str = ""          # OBLIGATORIO rotar (estuvo expuesta)
     abuseipdb_cache_ttl: int = 21600     # 6h — respeta límite 900 req/día
+    # Cuota diaria del plan (X-RateLimit-Limit = 1000, verificado 2026-10-07).
+    # De acá sale el presupuesto por ventana del token bucket (constants.py):
+    # si cambia el plan, se cambia solo este valor.
+    abuseipdb_daily_quota: int = 1000
     abuseipdb_timeout: float = 4.0
 
     # ── R1: OTX/AlienVault ───────────────────────────────────────────────

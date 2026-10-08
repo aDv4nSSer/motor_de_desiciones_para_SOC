@@ -124,8 +124,9 @@ class TestEnrichPopulatesCorroboration:
         otx_resp = mocker.MagicMock()
         otx_resp.raise_for_status.return_value = None
         otx_resp.json.return_value = {"pulse_info": {"count": 4}}
+        # H52: OTX se consulta primero (define si el cupo de AbuseIPDB es decisivo).
         mocker.patch(
-            "response.enrichment.httpx.get", side_effect=[abuse_resp, otx_resp]
+            "response.enrichment.httpx.get", side_effect=[otx_resp, abuse_resp]
         )
         mocker.patch("response.enrichment._reverse_dns", return_value=None)
 
