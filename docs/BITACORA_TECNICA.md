@@ -2294,6 +2294,30 @@ Formalizado también en `docs/ESPECIFICACION_TECNICA_SOAR_AMPLIADA.md`, sección
 - **Pendiente de Antonio:** revocar la key vieja (huella `0170c4a5f8`) en el panel de abuseipdb.com.
 - **Dato para P2 (no lo resuelve la rotación):** en los primeros ~8 min después del reset ya se consumieron 157 de las 1.000 consultas (~20/min). A ese ritmo la cuota diaria vuelve a agotarse alrededor de 50 min después del reset, así que AbuseIPDB va a estar disponible ~1 h por día. P2 (≥ 95% de TI disponible en T3 no-stale con IP pública) va a depender casi por completo de OTX.
 
+### Reparto de la cuota de AbuseIPDB: token bucket y OTX primero (`5114223`, 2026-10-07)
+
+**Hallazgo:** no existía ningún rate limit para AbuseIPDB (`security.md` pide un token bucket `ti:rate:{provider}`). Tras el reset de las 00:00 UTC del 2026-10-08, con la key nueva, se consumieron **157 consultas en 8 min** (~20/min): la cuota diaria se agota ~50 min después de cada reset. Medido en `soc-responses-*`, eso concentra **todo el autobloqueo real del día en esa hora**:
+- 162 bloqueos en los primeros 14 min después del reset, con 279 T3 en `count = 2`.
+- 1.047 bloqueos en las últimas 24 h; el día anterior, 489 entre 00:00 y 02:00 UTC.
+- El resto del día, `count >= 2` es inalcanzable porque no hay segunda fuente.
+
+**Lo pedido vs. lo implementado:** el pedido incluía gastar AbuseIPDB solo si OTX **no** corrobora. Con el gate vigente (`count >= 2` exige las dos fuentes) eso vuelve el gate **inalcanzable**: autobloqueo real en 0 y criterio 2 del período imposible. Antonio eligió la variante inversa: **priorizar los cupos que pueden cambiar la decisión**.
+
+**Implementación (`motor/response/enrichment.py`, `constants.py`, `config.py`):**
+- **OTX primero.** Un cupo de AbuseIPDB es *decisivo* cuando OTX ya corrobora (`pulse_count >= otx_min_pulse_count`): solo ahí puede llevar `count` de 1 a 2.
+- **Token bucket por ventana fija** `ti:rate:abuseipdb:{inicio}` de 600 s. Presupuesto = `floor(abuseipdb_daily_quota × 600 / 86400)` = **6 por ventana** (~0,6/min, 864/día, 136 de margen contra el 429). La cuota es un setting (`abuseipdb_daily_quota = 1000`) y el presupuesto se deriva de ella. La ventana es de 10 min y no de 1 porque la tasa (~0,69/min) es menor que un token por minuto.
+- **Decisivas:** pueden usar las 6. **No decisivas** (OTX sin pulses, sin respuesta o con timeout): solo la mitad (`ABUSEIPDB_NON_DECISIVE_SHARE = 0.5`, 3 por ventana). El resto queda reservado.
+- **Sin cupo:** se omite AbuseIPDB para ese evento, sin esperar ni reintentar, y el enrichment sigue con OTX. Las notas de auditoría distinguen las tres causas: `abuseipdb: omitido por throttling (…)`, `abuseipdb: cuota diaria agotada…` (429) y `abuseipdb error: ReadTimeout`. Si Redis falla en el bucket, no se consulta: un 429 cortaría la fuente hasta el día siguiente.
+- La caché (6 h) no gasta cupo. Las tareas stale siguen sin consultar APIs.
+
+**No se tocaron** `worker.py`, `corroboration.py` ni el gate. **Limitación conocida:** `enrich()` no conoce el tier, así que una IP T2 con OTX corroborando también cuenta como decisiva, aunque T2 nunca bloquea. Para restringir los cupos decisivos a T3 habría que pasar el tier desde `worker.py`: cambio de una línea, no hecho por la restricción de esta tarea.
+
+**Efecto esperado sobre decisiones reales:** el autobloqueo deja de concentrarse en la hora posterior al reset y se reparte en todo el día, con hasta 6 consultas decisivas cada 10 min. El total diario de bloqueos puede cambiar en cualquier sentido (menos consultas en la primera hora, más consultas decisivas en el resto del día). Es un **corte en la línea base del período de sombra**: el reporte de invariancia sigue válido (recalcula R2 desde los insumos de cada doc), pero las distribuciones antes y después del deploy no son comparables.
+
+**Tests:** `tests/unit/test_abuseipdb_rate_budget.py` (10): presupuesto derivado de la cuota, bucket vacío (AbuseIPDB omitido, OTX normal, sin excepción), caché sin gasto de cupo, OTX corroborando → consulta y `count = 2`, OTX sin pulses o con timeout → consulta dentro del cupo no decisivo, reserva para decisivas, notas distinguibles, Redis caído, y simulación de 6 h con 30 IPs/min (nunca más de 6 por ventana, promedio ≤ cuota/1440). `test_ti_negative_cache.py` y `test_corroboration.py` se adaptaron al orden OTX → AbuseIPDB. **655 → 665 passed.**
+
+**Deploy:** pendiente del restart de `response-worker` (Antonio). Se completa abajo con la hora de corte.
+
 ### Período de modo sombra propuesto
 
 Mínimo **72 h** continuas (tres ciclos día/noche y tres resets diarios de cuota de AbuseIPDB a las 00:00 UTC), y además:
@@ -2388,7 +2412,7 @@ Haber visto la IP en **una** hora previa es evidencia positiva débil, pero con 
 
 - **⚠️ CONDICIÓN FORMAL (H52): `band == "high"` no puede ser gate de R2** mientras AbuseIPDB siga sin cuota y no haya un segundo proveedor de TI redundante. Salida: TI disponible en ≥ 95% de los T3 y período de sombra repetido con esa TI. Ver H52 y la especificación ampliada, sección 9, punto 14.
 - ~~**Rotar la API key de AbuseIPDB (H52), BLOQUEANTE del período de sombra**~~ → **hecho 2026-10-07** (`0170c4a5f8` → `e7ebe17561`, `200` a las 21:07:48 -03, ver H52). Falta que Antonio **revoque la key vieja** en el panel de abuseipdb.com.
-- **Cuota de AbuseIPDB estructuralmente insuficiente (H52):** 1.000/día, se agota ~2 h después del reset de las 00:00 UTC. Decidir plan pago, estrategia de consultas, o la variante "OTX solo" con saturación calibrada.
+- **Cuota de AbuseIPDB estructuralmente insuficiente (H52):** 1.000/día; sin control se agotaba ~50 min después del reset. **Mitigado con el token bucket** (`5114223`): reparto de 864/día en ventanas de 10 min, con prioridad a los cupos decisivos. La cuota sigue siendo baja para el volumen (~2.800 IPs públicas/h): el plan pago queda como alternativa si el reparto no alcanza para P2.
 - **Período de modo sombra (H52):** seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`.
 - **H51 sin documentar** (número reservado, trabajo de otra sesión).
 
