@@ -79,6 +79,10 @@ class AuditIndexerSettings(BaseSettings):
     batch_size: int = 100
     block_ms: int = 5000
     error_backoff_seconds: float = 5.0
+    # H57: cada cuánto se recortan del stream las entradas ya confirmadas
+    # (XTRIM MINID). El maxlen=100_000 del XADD del worker queda solo como red
+    # de seguridad si el indexador se detiene.
+    trim_interval_seconds: float = 30.0
 
 
 class IndexingError(Exception):
@@ -339,11 +343,19 @@ class OpenSearchClient:
 
 # ── Consumidor ────────────────────────────────────────────────────────────────
 
+def _id_tuple(stream_id: str) -> tuple[int, int]:
+    """'1791417600000-3' -> (1791417600000, 3), para comparar ids de stream."""
+    ms, _, seq = str(stream_id).partition("-")
+    return int(ms), int(seq or 0)
+
+
 class ResponseAuditIndexer:
     def __init__(self, rdb: redis.Redis, os_client: Any, settings: AuditIndexerSettings):
         self.rdb, self.os, self.s = rdb, os_client, settings
         self.seq, self.head_hash = 0, GENESIS_HASH
         self._pending_first = True  # al arrancar (y tras un error): primero los pendientes propios
+        self._last_acked: str | None = None
+        self._last_trim = 0.0
 
     def start(self) -> None:
         try:
@@ -371,7 +383,33 @@ class ResponseAuditIndexer:
             if int(existing.get("chain_seq", 0)) > self.seq:
                 self.seq, self.head_hash = int(existing["chain_seq"]), existing["hash"]
         self.rdb.xack(STREAM, GROUP, msg_id)
+        self._last_acked = msg_id
         return outcome
+
+    def trim_acked(self, now: float | None = None) -> str | None:
+        """Recorta del stream lo que el grupo ya confirmó (H57).
+
+        Antes el único recorte era el maxlen=100_000 del XADD del worker, que
+        descarta las entradas más viejas aunque no estén indexadas: si el
+        indexador se atrasaba más de 100k, se perdían registros sin aviso (H38),
+        y con el indexador al día el stream retenía 100k entradas ya
+        persistidas. MINID nunca pasa el último id confirmado ni el pendiente
+        más viejo del grupo; con `~` Redis solo borra nodos completos por debajo.
+
+        Returns:
+            El MINID usado, o None si no correspondía recortar.
+        """
+        now = time.time() if now is None else now
+        if self._last_acked is None or now - self._last_trim < self.s.trim_interval_seconds:
+            return None
+        minid = self._last_acked
+        summary = self.rdb.xpending(STREAM, GROUP)
+        oldest_pending = summary.get("min") if summary and summary.get("pending") else None
+        if oldest_pending and _id_tuple(oldest_pending) < _id_tuple(minid):
+            minid = oldest_pending
+        self.rdb.xtrim(STREAM, minid=minid, approximate=True)
+        self._last_trim = now
+        return minid
 
     def run_once(self) -> int:
         """Una lectura del stream. Devuelve cuántos mensajes persistió."""
@@ -393,6 +431,8 @@ class ResponseAuditIndexer:
                 # confirmado queda pendiente y se relee primero.
                 self._pending_first = True
                 raise
+        if done:
+            self.trim_acked()
         return done
 
     def run(self) -> None:

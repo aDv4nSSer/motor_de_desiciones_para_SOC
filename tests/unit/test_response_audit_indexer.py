@@ -82,6 +82,21 @@ class FakeStreamRedis:
             self.groups[(stream, group)]["pel"].pop(i, None)
         return len(ids)
 
+    def xpending(self, stream, group):
+        self.calls.append(("xpending", stream))
+        pel = self.groups[(stream, group)]["pel"]
+        if not pel:
+            return {"pending": 0, "min": None, "max": None, "consumers": []}
+        ids = sorted(pel, key=lambda m: tuple(map(int, m.split("-"))))
+        return {"pending": len(ids), "min": ids[0], "max": ids[-1], "consumers": []}
+
+    def xtrim(self, stream, minid=None, approximate=True, **kw):
+        self.calls.append(("xtrim", stream))
+        lo = tuple(map(int, minid.split("-")))
+        before = len(self.streams[stream])
+        self.streams[stream] = [(m, f) for m, f in self.streams[stream] if tuple(map(int, m.split("-"))) >= lo]
+        return before - len(self.streams[stream])
+
     def pending(self, stream=STREAM, group=GROUP) -> int:
         return len(self.groups[(stream, group)]["pel"])
 
