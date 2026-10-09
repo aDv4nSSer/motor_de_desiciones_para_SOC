@@ -140,7 +140,39 @@ def authenticate(username: str, plain_password: str, rdb: redis.Redis | None = N
         return None
     if not _verify_password(plain_password, record.password_hash):
         return None
+    _ensure_indexed(username, rdb)
     return User(**record.model_dump(exclude={"password_hash"}))
+
+
+def _ensure_indexed(username: str, rdb: redis.Redis | None = None) -> None:
+    """Re-registra al usuario en soc:users:index en cada login exitoso (H57).
+
+    El índice desapareció de Redis (probable desalojo de H54) y el login
+    siguió andando porque lee soc:users:<usuario>; pero la vista de
+    Cumplimiento y las sesiones recorren el índice y mostraban 0. SADD es
+    idempotente y O(1). Un fallo acá no impide el login."""
+    try:
+        _get_redis(rdb).sadd(USERS_INDEX_KEY, username)
+    except redis.RedisError as e:
+        log.warning(f"no se pudo re-registrar {username!r} en el índice de usuarios: {e}")
+
+
+def users_index_status(current_username: str | None = None, rdb: redis.Redis | None = None) -> dict:
+    """Confiabilidad del índice de usuarios, sin recorrer el keyspace.
+
+    Returns:
+        {"members": int, "reliable": bool, "reason": str}. No es confiable si
+        el índice está vacío o si no contiene al usuario que está consultando
+        (que existe, porque está autenticado).
+    """
+    r = _get_redis(rdb)
+    members = int(r.scard(USERS_INDEX_KEY) or 0)
+    if members == 0:
+        return {"members": 0, "reliable": False, "reason": "índice de usuarios vacío en Redis"}
+    if current_username and not r.sismember(USERS_INDEX_KEY, current_username):
+        return {"members": members, "reliable": False,
+                "reason": f"el índice no contiene al usuario autenticado ({current_username})"}
+    return {"members": members, "reliable": True, "reason": ""}
 
 
 def list_users(rdb: redis.Redis | None = None) -> list[User]:
