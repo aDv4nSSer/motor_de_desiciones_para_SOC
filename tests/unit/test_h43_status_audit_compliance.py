@@ -251,7 +251,7 @@ def _ctx(**over):
         "reconciliation": {"available": True, "ips_bloqueadas": 3, "acciones_de_bloqueo": 4, "ips_derivadas": 2,
                            "decisiones_t3_derivadas": 7, "pendientes_ahora": 1,
                            "aprobaciones": {"creadas_en_la_ventana": 2, "expiradas": 1, "pendientes": 1, "recurrencias": 5},
-                           "conciliacion": {"available": True, "cierra": True, "diferencia": 0}},
+                           "conciliacion": {"available": True, "estado": "cierra", "cierra": True, "diferencia": 0}},
     }
     base.update(over)
     return base

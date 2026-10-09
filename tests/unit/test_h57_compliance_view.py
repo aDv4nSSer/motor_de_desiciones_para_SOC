@@ -43,7 +43,7 @@ def _ctx(**over):
                            "decisiones_t3_derivadas": 7, "pendientes_ahora": 1,
                            "aprobaciones": {"creadas_en_la_ventana": 2, "expiradas": 1, "pendientes": 1,
                                             "aprobadas": 0, "rechazadas": 0, "recurrencias": 5},
-                           "conciliacion": {"available": True, "cierra": True, "diferencia": 0}},
+                           "conciliacion": {"available": True, "estado": "cierra", "cierra": True, "diferencia": 0}},
         "integrity": {"completa": {"available": False}, "huecos_declarados": {"gaps": [{"id": "H54"}]}},
         "generated_at": NOW.isoformat(), "window_label": "ventana móvil de 24 h", "organizacion_es_oiv": None,
     }
@@ -94,23 +94,28 @@ class TestNodos:
 # ── a3 ───────────────────────────────────────────────────────────────────────
 
 class FakeOS:
-    """soc-responses sintético: 10 decisiones derivadas de 3 IPs; 3 aprobaciones
-    creadas en la ventana (A1 expirada, A2 aprobada, A3 pendiente), una vieja
-    expirada (creada antes de la ventana) que no debe contarse."""
+    """soc-responses sintético. Aprobaciones creadas en la ventana: A1 expirada
+    (4 ocurrencias), A2 aprobada (1), A3 pendiente (3, en la foto de Redis).
+    Creadas ANTES de la ventana: A0 expirada dentro (3 ocurrencias) y P0
+    pendiente (1). `derived_ids` es el trace_id de cada decisión derivada con
+    aprobación de por medio; `stale` son derivadas sin aprobación (H38)."""
 
-    def __init__(self, derived_ids, extra_events=()):
-        self.derived_ids = derived_ids  # trace_id de cada decisión derivada (con repetidos = recurrencias)
+    def __init__(self, derived_ids, stale=0, a0_occ=3):
+        self.derived_ids, self.stale = derived_ids, stale
         self.events = [
-            {"event_type": "approval_expired", "trace_id": "A1", "payload": {"created_at": IN}},
-            {"event_type": "approval_expired", "trace_id": "A0", "payload": {"created_at": BEFORE}},
+            {"event_type": "approval_expired", "trace_id": "A1", "payload": {"created_at": IN, "occurrences": 4}},
+            {"event_type": "approval_expired", "trace_id": "A0", "payload": {"created_at": BEFORE, "occurrences": a0_occ}},
             {"event_type": "manual_approval", "trace_id": "A2", "payload": {"approval_created_at": IN}},
-            *extra_events,
         ]
 
     def __call__(self, method, path, body=None):
         if "aggs" in (body or {}):
+            buckets = [{"key": "block_pending_approval", "doc_count": len(self.derived_ids)}]
+            if self.stale:
+                buckets.append({"key": "block_skipped", "doc_count": self.stale})
             return {"hits": {"total": {"value": 0}}, "aggregations": {
-                "derivadas": {"doc_count": len(self.derived_ids), "ips": {"value": 3}},
+                "derivadas": {"doc_count": len(self.derived_ids) + self.stale, "ips": {"value": 3},
+                              "accion": {"buckets": buckets}},
                 "bloqueos": {"doc_count": 4, "ips": {"value": 2}}}}
         filt = body["query"]["bool"]["filter"]
         terms = [f["terms"] for f in filt if "terms" in f]
@@ -125,41 +130,59 @@ class FakeOS:
 @pytest.fixture
 def pending(monkeypatch):
     monkeypatch.setattr(compliance, "list_pending_approvals",
-                        lambda rdb, limit: [{"trace_id": "A3", "created_at": IN},
-                                            {"trace_id": "P0", "created_at": BEFORE}])
+                        lambda rdb, limit: [{"trace_id": "A3", "created_at": IN, "occurrences": 3},
+                                            {"trace_id": "P0", "created_at": BEFORE, "occurrences": 1}])
+
+
+# Creaciones A1, A2, A3; recurrencias: 3 de A1, 2 de A3 (contador: 5) y las de A0 (abierta antes).
+def _derived(extra_a0: int) -> list[str]:
+    return ["A1", "a1", "a1", "a1", "A2", "A3", "a3", "a3"] + ["a0"] * extra_a0
 
 
 class TestConciliacion:
-    def test_cierra_con_datos_sinteticos(self, pending) -> None:
-        derived = ["A1", "x", "x", "A2", "y", "A3", "z", "z", "z", "w"]  # 3 creaciones + 7 recurrencias
-        rec = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(derived))
-        apr = rec["aprobaciones"]
+    def test_cierra_exacto_sin_borde(self, pending) -> None:
+        rec = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(_derived(0)))
+        apr, c = rec["aprobaciones"], rec["conciliacion"]
         assert apr["creadas_en_la_ventana"] == 3
         assert (apr["aprobadas"], apr["rechazadas"], apr["expiradas"], apr["pendientes"]) == (1, 0, 1, 1)
-        assert apr["creadas_en_la_ventana"] == apr["aprobadas"] + apr["rechazadas"] + apr["expiradas"] + apr["pendientes"]
-        assert apr["creadas_en_la_ventana"] + apr["recurrencias"] == rec["decisiones_t3_derivadas"] == 10
-        assert rec["conciliacion"]["cierra"] is True
-        assert rec["pendientes_ahora"] == 2  # foto actual, sin ventana: incluye P0, creada antes
+        assert c["creadas_por_destino"] == c["creadas_por_documentos"] == 3
+        assert c["recurrencias_por_documentos"] == c["recurrencias_por_contador"] == 5
+        assert c["estado"] == "cierra" and c["cierra"] is True
+        assert rec["pendientes_ahora"] == 2  # foto actual: incluye P0, creada antes
+
+    def test_diferencia_explicada_por_aprobaciones_abiertas_antes(self, pending) -> None:
+        rec = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(_derived(2)))
+        c = rec["conciliacion"]
+        assert c["recurrencias_por_documentos"] == 7 and c["recurrencias_por_contador"] == 5
+        assert c["diferencia"] == 2 and c["cota_borde"] == 2  # A0: 3 ocurrencias, hasta 2 recurrencias
+        assert c["estado"] == "diferencia_explicada" and c["cierra"] is True
+        assert "aprobaciones abiertas antes" in c["causa"]
+        items = _by_id(_ctx(reconciliation=rec))
+        assert items["respuesta"]["status"] == "cumple"
+        assert "Diferencia explicada" in items["respuesta"]["evidence"]
+
+    def test_no_cierra_si_la_diferencia_supera_la_cota(self, pending) -> None:
+        rec = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(_derived(5)))
+        c = rec["conciliacion"]
+        assert c["estado"] == "no_cierra" and c["cierra"] is False
+        items = _by_id(_ctx(reconciliation=rec))
+        assert items["respuesta"]["status"] == "con_observacion" and "NO cierra" in items["respuesta"]["evidence"]
+
+    def test_no_cierra_si_falta_la_decision_que_abrio_una_aprobacion(self, pending) -> None:
+        derived = [t for t in _derived(0) if t != "A3"]  # la apertura de A3 no está en la ventana
+        c = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(derived))["conciliacion"]
+        assert c["estado"] == "no_cierra" and "difieren" in c["causa"]
+
+    def test_derivadas_sin_aprobacion_se_informan_aparte(self, pending) -> None:
+        rec = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(_derived(0), stale=4))
+        assert rec["decisiones_derivadas_sin_aprobacion"] == 4
+        assert rec["conciliacion"]["estado"] == "cierra"  # no entran a las recurrencias
 
     def test_evento_sin_created_at_se_declara(self, pending) -> None:
-        """Un evento de expiración anterior a H57 sin created_at no se puede
-        ubicar en la ventana: no se inventa su creación."""
-        derived = ["A1", "A2", "A3", "A9", "x"]
-        os_ = FakeOS(derived)
-        os_.events.append({"event_type": "approval_expired", "trace_id": "A9", "payload": {}})  # sin created_at
+        os_ = FakeOS(_derived(0))
+        os_.events.append({"event_type": "approval_expired", "trace_id": "A9", "payload": {}})
         rec = compliance.approvals_reconciliation(SINCE, NOW, object(), os_)
-        # A9 no se puede ubicar en el tiempo: no cuenta como creada por ningún
-        # camino (queda como recurrencia) y el reporte lo declara aparte.
         assert rec["aprobaciones"]["eventos_sin_created_at"] == 1
-        assert rec["conciliacion"]["creadas_por_destino"] == rec["conciliacion"]["creadas_por_documentos"] == 3
-
-    def test_no_cierra_cuando_los_caminos_difieren(self, pending) -> None:
-        derived = ["A1", "A2", "x"]  # la decisión que abrió A3 no está en la ventana
-        rec = compliance.approvals_reconciliation(SINCE, NOW, object(), FakeOS(derived))
-        assert rec["conciliacion"]["cierra"] is False and rec["conciliacion"]["diferencia"] == 1
-        items = _by_id(_ctx(reconciliation=rec))
-        assert items["respuesta"]["status"] == "con_observacion"
-        assert "NO cierra" in items["respuesta"]["evidence"]
 
     def test_unidades_explicitas_en_la_fila(self) -> None:
         ev = _by_id(_ctx())["respuesta"]["evidence"]

@@ -312,29 +312,38 @@ ENFORCED_FILTER = {"bool": {"should": [{"term": {"event_type": "response"}},
 def approvals_reconciliation(since: datetime, now: datetime, rdb: redis.Redis | None,
                              request: OsRequest = _os_request) -> dict[str, Any]:
     """Respuesta y aprobaciones de la ventana, con unidades explícitas y una
-    conciliación comprobable por dos caminos independientes.
+    conciliación por caminos independientes (H57, ajustada en H58 con datos reales).
 
     Unidades: IPs distintas (lo que importa operativamente), decisiones T3
     (documentos de soc-responses) y aprobaciones (una por IP mientras está
     abierta: las decisiones T3 siguientes de la misma IP se suman como
     recurrencias, dedup de H38).
 
-    Conciliación, para las aprobaciones CREADAS en la ventana:
-    - por destino: creadas = aprobadas + rechazadas + expiradas + pendientes
-      (cada aprobación termina en uno solo de esos estados);
-    - por documentos: creadas = decisiones T3 derivadas de la ventana cuyo
-      trace_id es el id de una aprobación (el id de una aprobación es el
-      trace_id de la decisión que la abrió);
-    - creadas + recurrencias = decisiones T3 derivadas.
-    Si los dos caminos no coinciden, `cierra` es False y se informa la
-    diferencia (p. ej. una aprobación perdida de Redis, H54).
+    1. Aprobaciones creadas en la ventana, por dos caminos:
+       - por destino: aprobadas + rechazadas + expiradas + pendientes con
+         created_at dentro de la ventana;
+       - por documentos: decisiones T3 derivadas de la ventana cuyo trace_id es
+         el id de una de esas aprobaciones (el id es el trace_id que la abrió).
+    2. Recurrencias, por dos caminos:
+       - por documentos: decisiones T3 derivadas con aprobación de por medio
+         (block_pending_approval) menos las que abrieron una aprobación;
+       - por contador: suma de (occurrences - 1) de las aprobaciones creadas
+         en la ventana.
+       Diferencia esperable y explicada: las decisiones de la ventana que se
+       sumaron a aprobaciones abiertas ANTES de su inicio (TTL de 4 h). Su
+       cota es la suma de (occurrences - 1) de esas aprobaciones. Si la
+       diferencia cae entre 0 y la cota, es "diferencia explicada"; si no, la
+       conciliación no cierra y la vista lo dice.
+    Las decisiones derivadas sin aprobación (p. ej. stale, H38) se informan
+    aparte y no entran a las recurrencias.
     """
     agg = request("POST", f"/{RESPONSES_PATTERN}/_search", {
         "size": 0, "track_total_hits": True,
         "query": _window_filter(since),
         "aggs": {
             "derivadas": {"filter": {"bool": {"filter": DERIVED_FILTER}},
-                          "aggs": {"ips": {"cardinality": {"field": "src_ip", "precision_threshold": 40000}}}},
+                          "aggs": {"ips": {"cardinality": {"field": "src_ip", "precision_threshold": 40000}},
+                                   "accion": {"terms": {"field": "block_action", "size": 10}}}},
             "bloqueos": {"filter": ENFORCED_FILTER,
                          "aggs": {"ips": {"cardinality": {"field": "src_ip", "precision_threshold": 40000}}}},
         },
@@ -343,6 +352,8 @@ def approvals_reconciliation(since: datetime, now: datetime, rdb: redis.Redis | 
         return {"available": False}
     a = agg.get("aggregations", {})
     derived_docs = a.get("derivadas", {}).get("doc_count", 0)
+    by_action = {b["key"]: b["doc_count"] for b in a.get("derivadas", {}).get("accion", {}).get("buckets", [])}
+    with_approval_flow = by_action.get("block_pending_approval", 0)
     out: dict[str, Any] = {
         "available": True,
         "ventana": {"desde": since.isoformat(), "hasta": now.isoformat()},
@@ -350,10 +361,12 @@ def approvals_reconciliation(since: datetime, now: datetime, rdb: redis.Redis | 
         "acciones_de_bloqueo": a.get("bloqueos", {}).get("doc_count", 0),
         "ips_derivadas": a.get("derivadas", {}).get("ips", {}).get("value", 0),
         "decisiones_t3_derivadas": derived_docs,
+        "decisiones_derivadas_sin_aprobacion": derived_docs - with_approval_flow,
     }
 
-    # Destino de cada aprobación creada en la ventana.
-    fates: dict[str, set[str]] = {"aprobadas": set(), "rechazadas": set(), "expiradas": set(), "pendientes": set()}
+    # id -> occurrences, por destino; y las aprobaciones creadas antes de la ventana.
+    fates: dict[str, dict[str, int]] = {"aprobadas": {}, "rechazadas": {}, "expiradas": {}, "pendientes": {}}
+    before: dict[str, int] = {}
     sin_created_at = 0
     events = _search_all(request, {"query": {"bool": {"filter": [
         _window_filter(since),
@@ -365,36 +378,36 @@ def approvals_reconciliation(since: datetime, now: datetime, rdb: redis.Redis | 
         p = e.get("payload") or {}
         etype = e.get("event_type")
         if etype == "approval_expired":
-            created, fate, tid = p.get("created_at"), "expiradas", e.get("trace_id")
+            created, fate, tid, occ = p.get("created_at"), "expiradas", e.get("trace_id"), p.get("occurrences", 1)
         elif etype == "manual_approval":
-            created, fate, tid = p.get("approval_created_at"), "aprobadas", e.get("trace_id")
+            created, fate, tid, occ = p.get("approval_created_at"), "aprobadas", e.get("trace_id"), 1
         elif etype == "access" and e.get("access_event") == "approval_rejected":
             detail = p.get("detail") or {}
-            created, fate, tid = detail.get("approval_created_at"), "rechazadas", detail.get("trace_id") or e.get("trace_id")
+            created, fate, tid, occ = (detail.get("approval_created_at"), "rechazadas",
+                                       detail.get("trace_id") or e.get("trace_id"), 1)
         else:
             continue
         ts = _parse_ts(created)
         if ts is None:
             sin_created_at += 1  # eventos previos a H57 sin created_at: no se pueden ubicar
             continue
-        if ts >= since and tid:
-            fates[fate].add(tid)
+        if tid:
+            (fates[fate] if ts >= since else before)[tid] = int(occ or 1)
     pending_truncated = False
     try:
         pend = list_pending_approvals(rdb, limit=APPROVALS_MAX_LIMIT) if rdb is not None else []
         pending_truncated = len(pend) >= APPROVALS_MAX_LIMIT
         for ap in pend:
             ts = _parse_ts(ap.get("created_at"))
-            if ts is not None and ts >= since and ap.get("trace_id"):
-                fates["pendientes"].add(ap["trace_id"])
+            if ts is not None and ap.get("trace_id"):
+                (fates["pendientes"] if ts >= since else before)[ap["trace_id"]] = int(ap.get("occurrences") or 1)
         pend_now = len(pend)
     except (redis.RedisError, AttributeError) as e:
         log.error(f"conciliación sin la foto de pendientes: {e}")
         pend_now = None
-    ids = set().union(*fates.values())
+    ids = set().union(*(f.keys() for f in fates.values()))
     by_fate = sum(len(v) for v in fates.values())
 
-    # Camino independiente: decisiones derivadas de la ventana que abrieron una aprobación.
     by_docs = 0
     id_list = sorted(ids)
     for i in range(0, len(id_list), 10_000):
@@ -406,22 +419,46 @@ def approvals_reconciliation(since: datetime, now: datetime, rdb: redis.Redis | 
             return {**out, "conciliacion": {"available": False}}
         by_docs += res.get("hits", {}).get("total", {}).get("value", 0)
 
+    rec_docs = with_approval_flow - by_docs
+    rec_counter = sum(o - 1 for f in fates.values() for o in f.values())
+    edge_bound = sum(o - 1 for o in before.values())
+    diff = rec_docs - rec_counter
+    if by_fate != by_docs:
+        estado, causa = "no_cierra", (f"las aprobaciones creadas difieren: {by_fate} por destino y {by_docs} "
+                                      "por documentos (p. ej. una aprobación perdida de Redis)")
+    elif diff == 0:
+        estado, causa = "cierra", ""
+    elif 0 <= diff <= edge_bound:
+        estado, causa = "diferencia_explicada", (
+            f"{diff} decisiones de la ventana se sumaron a {len(before)} aprobaciones abiertas antes de su "
+            f"inicio (TTL de 4 h); esas aprobaciones acumulan hasta {edge_bound} recurrencias")
+    else:
+        estado, causa = "no_cierra", (f"{diff} recurrencias por documentos sin explicar: la cota por las "
+                                      f"aprobaciones abiertas antes de la ventana es {edge_bound}")
+
     out["aprobaciones"] = {
         "creadas_en_la_ventana": by_fate,
         **{k: len(v) for k, v in fates.items()},
-        "recurrencias": derived_docs - by_docs,
+        "recurrencias": rec_docs,
+        "recurrencias_por_contador": rec_counter,
+        "abiertas_antes_de_la_ventana": len(before),
         "eventos_sin_created_at": sin_created_at,
     }
     out["pendientes_ahora"] = pend_now
     out["pendientes_truncado"] = pending_truncated
     out["conciliacion"] = {
         "available": True,
+        "estado": estado,
+        "cierra": estado in ("cierra", "diferencia_explicada"),
+        "causa": causa,
         "creadas_por_destino": by_fate,
         "creadas_por_documentos": by_docs,
-        "cierra": by_fate == by_docs,
-        "diferencia": by_fate - by_docs,
-        "regla": ("creadas = aprobadas + rechazadas + expiradas + pendientes; "
-                  "creadas + recurrencias = decisiones T3 derivadas"),
+        "recurrencias_por_documentos": rec_docs,
+        "recurrencias_por_contador": rec_counter,
+        "diferencia": diff if by_fate == by_docs else by_fate - by_docs,
+        "cota_borde": edge_bound,
+        "regla": ("creadas por destino = creadas por documentos; recurrencias por documentos = recurrencias "
+                  "por contador + las sumadas a aprobaciones abiertas antes de la ventana"),
     }
     return out
 
@@ -682,7 +719,7 @@ def build_checklist(ctx: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         apr = rec.get("aprobaciones") or {}
         conc = rec.get("conciliacion") or {}
-        status = "cumple" if conc.get("cierra", False) else "con_observacion"
+        status = "cumple" if conc.get("estado") in ("cierra", "diferencia_explicada") else "con_observacion"
         ev = (f"En la ventana: {_n(rec['ips_bloqueadas'])} IPs distintas bloqueadas "
               f"({_n(rec['acciones_de_bloqueo'])} acciones de bloqueo, incluye re-bloqueos al vencer el TTL); "
               f"{_n(rec['ips_derivadas'])} IPs distintas derivadas a aprobación "
@@ -691,9 +728,11 @@ def build_checklist(ctx: dict[str, Any]) -> list[dict[str, Any]]:
               f"{apr.get('rechazadas', 0)}, expiradas {apr.get('expiradas', 0)}, pendientes "
               f"{apr.get('pendientes', 0)}); recurrencias sumadas a aprobaciones abiertas: "
               f"{_n(apr.get('recurrencias', 0))}. ")
-        ev += ("La conciliación cierra." if conc.get("cierra") else
-               f"La conciliación NO cierra: {conc.get('diferencia')} aprobaciones de diferencia entre el "
-               "destino y los documentos." if conc.get("available") else "Conciliación no disponible.")
+        estado = conc.get("estado")
+        ev += ("La conciliación cierra." if estado == "cierra" else
+               f"Diferencia explicada: {conc.get('causa')}." if estado == "diferencia_explicada" else
+               f"La conciliación NO cierra: {conc.get('causa')}." if conc.get("available")
+               else "Conciliación no disponible.")
         ev += f" Foto actual: {rec.get('pendientes_ahora', 'sin dato')} aprobaciones pendientes."
     items.append(_item("respuesta", "Art. 8 e)", "Medidas oportunas para reducir el impacto y la propagación",
                        status, ev + " " + oiv_note, "automático",
