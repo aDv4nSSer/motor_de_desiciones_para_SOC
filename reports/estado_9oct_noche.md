@@ -270,7 +270,7 @@ El evento completo va en `payload` y entra al hash. El cálculo no depende del e
 3. **Documentación de H58 y filas de PENDIENTES.** Se commitearon solo en `feature/cumplimiento`, para no agregar a fase3a nada fuera de lo aprobado. Al pushear fase3a, la fila del 9-oct en PENDIENTES de `develop` va a seguir con el texto anterior hasta el 11-oct.
 4. **Restart del indexador el 9-oct.** Activa el recorte con colchón de 48 h, que hoy no recorta nada. Como el 8-oct dijiste "XTRIM no esta noche", lo marco para OK explícito; la alternativa es no reiniciarlo.
 5. **`ABUSEIPDB_CACHE_TTL`:** OK aparte, con o sin cambio. Las dos opciones están descritas en la sección 3.
-6. **"Diferencia explicada" en Art. 8 e).** La fila queda "cumple" con el texto "Diferencia explicada: {causa}", porque la diferencia está acotada por una causa medida. Si preferís que una diferencia no nula se muestre como "con observación", es un cambio de una línea.
+6. **"Diferencia explicada" en Art. 8 e).** Resuelto por Antonio: la conciliación sigue como "diferencia explicada" y la fila Art. 8 e) queda "con observación". Solo una conciliación exacta "cumple".
 7. **Art. 8 d) "parcial" aunque los nodos estén bien:** la ley exige más que el análisis continuo.
 8. **El "conocimiento" del incidente** (plazos de 3 h y 72 h) es un acto de la organización. El primer T3 corroborado es solo una aproximación, y la vista lo dice (sin cambios desde H57).
 

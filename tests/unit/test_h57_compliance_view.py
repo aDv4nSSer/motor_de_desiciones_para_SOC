@@ -160,7 +160,7 @@ class TestConciliacion:
         assert c["estado"] == "diferencia_explicada" and c["cierra"] is True
         assert "aprobaciones abiertas antes" in c["causa"]
         items = _by_id(_ctx(reconciliation=rec))
-        assert items["respuesta"]["status"] == "cumple"
+        assert items["respuesta"]["status"] == "con_observacion"
         assert "Diferencia explicada" in items["respuesta"]["evidence"]
 
     def test_no_cierra_si_la_diferencia_supera_la_cota(self, pending) -> None:

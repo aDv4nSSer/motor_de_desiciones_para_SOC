@@ -3015,7 +3015,7 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 **Vista.**
 - Art. 8 d) queda siempre "parcial". Cubre R-SOAR: análisis continuo. Queda en la organización: ejercicios, simulacros y comunicación de amenazas al CSIRT. Cierra la discrepancia 1 de H57.
 - El panel de integridad nombra cada cadena con su rango (`soc-responses-*` desde 2-oct y `soc-decisions-*` desde 3-oct, `chain_seq` 1 a N), la hora de la verificación y que el índice legado de 17,9 M no se verificó. Los huecos declarados siguen visibles.
-- La conciliación muestra su estado y su causa.
+- La conciliación muestra su estado y su causa. Art. 8 e) queda "con observación" con diferencia explicada; solo "cumple" si la conciliación cierra exacta (decisión de Antonio).
 
 ---
 

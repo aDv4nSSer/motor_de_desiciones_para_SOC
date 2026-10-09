@@ -738,7 +738,9 @@ def build_checklist(ctx: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         apr = rec.get("aprobaciones") or {}
         conc = rec.get("conciliacion") or {}
-        status = "cumple" if conc.get("estado") in ("cierra", "diferencia_explicada") else "con_observacion"
+        # Solo una conciliación exacta "cumple". Una diferencia explicada se
+        # muestra con su causa pero queda "con observación" (decisión de Antonio, H58).
+        status = "cumple" if conc.get("estado") == "cierra" else "con_observacion"
         ev = (f"En la ventana: {_n(rec['ips_bloqueadas'])} IPs distintas bloqueadas "
               f"({_n(rec['acciones_de_bloqueo'])} acciones de bloqueo, incluye re-bloqueos al vencer el TTL); "
               f"{_n(rec['ips_derivadas'])} IPs distintas derivadas a aprobación "
