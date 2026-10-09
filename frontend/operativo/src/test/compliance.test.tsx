@@ -99,23 +99,24 @@ function h57Report(over: Record<string, unknown> = {}) {
     policy_version: 'politica-prueba',
     regime: { id: 'R3', desde: '2026-10-09T02:42:16+00:00', descripcion: 'Gauge de la cuota real de AbuseIPDB (H55, d0c8f93)' },
     regimes_in_window: [{ id: 'R2', desde: '', descripcion: '' }, { id: 'R3', desde: '', descripcion: '' }],
-    resumen: { obligaciones_del_sistema: 8, por_estado: { con_observacion: 2, parcial: 2, no_cubierto: 4 }, fuera_del_sistema: 6, generado: '2026-10-09T03:00:00Z' },
+    resumen: { obligaciones_del_sistema: 8, por_estado: { con_observacion: 1, parcial: 3, no_cubierto: 4 }, fuera_del_sistema: 6, generado: '2026-10-09T03:00:00Z' },
     nota_alcance: 'R-SOAR aporta evidencia técnica de apoyo. La evaluación de cumplimiento legal es de la organización.',
     latencia_descripcion: 'Latencia interna del Fast Path: procesamiento del motor, sin red ni Vector.',
     checklist: [{
-      id: 'monitoreo', article: 'Art. 8 d)', title: 'Revisión y análisis', status: 'con_observacion',
-      evidence: 'estado de nodos: degraded', source: 'automático',
+      id: 'respuesta', article: 'Art. 8 e)', title: 'Medidas oportunas', status: 'con_observacion',
+      evidence: 'La conciliación NO cierra', source: 'automático',
       meta: { ventana: 'ventana móvil de 24 h', unidad: 'decisiones', fuente: 'soc-decisions', actualizado: '2026-10-09T03:00:00Z', registros: '#nodos' },
     }],
     conciliacion_aprobaciones: {
       available: true, ips_bloqueadas: 244, acciones_de_bloqueo: 551, ips_derivadas: 531, decisiones_t3_derivadas: 20336,
       aprobaciones: { creadas_en_la_ventana: 1604, aprobadas: 0, rechazadas: 0, expiradas: 1325, pendientes: 279, recurrencias: 18732, eventos_sin_created_at: 0 },
       pendientes_ahora: 279,
-      conciliacion: { available: true, creadas_por_destino: 1604, creadas_por_documentos: 1604, cierra: true, diferencia: 0, regla: 'creadas = aprobadas + rechazadas + expiradas + pendientes' },
+      conciliacion: { available: true, estado: 'diferencia_explicada', causa: '570 decisiones de la ventana se sumaron a 101 aprobaciones abiertas antes de su inicio (TTL de 4 h); esas aprobaciones acumulan hasta 770 recurrencias', creadas_por_destino: 1604, creadas_por_documentos: 1604, recurrencias_por_documentos: 18732, recurrencias_por_contador: 18162, cierra: true, diferencia: 570, cota_borde: 770, regla: 'creadas por destino = creadas por documentos' },
     },
     integridad: {
       alcance: 'parcial',
-      completa: { available: true, alcance: 'parcial', alcance_detalle: 'abortada en decisions', ok: false, generated_at: '2026-10-09T01:00:00Z' },
+      alcance_texto: 'verificación completa (completa) del 2026-10-09 04:04 UTC: soc-responses-* desde 2026-10-02, chain_seq 1 a 1699916, íntegra; soc-decisions-* desde 2026-10-03, chain_seq 1 a 2456573, íntegra; el índice legado soc-decisions (17,9 M documentos, cadena vieja) no se verificó en esta pasada',
+      completa: { available: true, alcance: 'completa', ok: true, generated_at: '2026-10-09T04:04:48Z' },
       cola_en_vivo: report(CORR).cadenas,
       huecos_declarados: { available: true, gaps: [{ id: 'H54', hallazgo: 'H54', cadena: 'soc-responses', desde: '2026-10-08T03:32:41.987Z', hasta: '2026-10-08T03:32:45.538Z', registros: '0 a 5 registros R1/R2', detectable_por_cadena: false, descripcion: '' }] },
     },
@@ -139,7 +140,7 @@ async function enterH57(over: Record<string, unknown> = {}) {
 }
 
 describe('Cumplimiento H57', () => {
-  it('un nodo degradado se muestra como "con observación", con el contexto de la métrica', async () => {
+  it('una fila con observación muestra su etiqueta y el contexto de la métrica', async () => {
     await enterH57()
     expect(screen.getAllByText('Con observación').length).toBeGreaterThan(0)
     expect(screen.queryByText('Con evidencia')).not.toBeInTheDocument()
@@ -160,28 +161,29 @@ describe('Cumplimiento H57', () => {
     await enterH57()
     expect(screen.getByText('IPs distintas bloqueadas').nextSibling).toHaveTextContent('244')
     expect(screen.getByText('Recurrencias sumadas a aprobaciones abiertas').nextSibling).toHaveTextContent('18.732')
-    expect(screen.getByText(/La conciliación cierra: 1\.604 aprobaciones creadas/)).toBeInTheDocument()
+    expect(screen.getByText(/Diferencia explicada: 570 decisiones de la ventana se sumaron a 101 aprobaciones abiertas/)).toBeInTheDocument()
     expect(screen.getByText(/Foto actual, sin ventana: 279 aprobaciones pendientes ahora/)).toBeInTheDocument()
   })
 
   it('si la conciliación no cierra, lo dice', async () => {
     await enterH57({ conciliacion_aprobaciones: { ...h57Report().conciliacion_aprobaciones,
-      conciliacion: { available: true, creadas_por_destino: 1604, creadas_por_documentos: 1600, cierra: false, diferencia: 4 } } })
-    expect(screen.getByText(/La conciliación NO cierra: 1\.604 por destino y 1\.600 por documentos \(diferencia 4\)/)).toBeInTheDocument()
+      conciliacion: { available: true, estado: 'no_cierra', causa: 'las aprobaciones creadas difieren: 1604 por destino y 1600 por documentos', cierra: false, diferencia: 4 } } })
+    expect(screen.getByText(/La conciliación NO cierra: las aprobaciones creadas difieren: 1604 por destino y 1600 por documentos/)).toBeInTheDocument()
   })
 
   it('el panel de integridad declara su alcance y los huecos conocidos', async () => {
     await enterH57()
     const panel = screen.getByRole('status', { name: /verificación parcial/ })
     expect(panel).toHaveTextContent('Alcance: parcial')
-    expect(panel).toHaveTextContent('Verificación completa (abortada en decisions)')
+    expect(panel).toHaveTextContent('soc-responses-* desde 2026-10-02, chain_seq 1 a 1699916')
+    expect(panel).toHaveTextContent('no se verificó en esta pasada')
     expect(within(panel).getByText('H54').closest('li')).toHaveTextContent('0 a 5 registros R1/R2')
   })
 
   it('resumen de cobertura con política, régimen y nota de alcance', async () => {
     await enterH57()
     const cov = screen.getByRole('region', { name: 'Cobertura de lo que corresponde al sistema' })
-    expect(cov).toHaveTextContent('8 obligaciones atendibles por R-SOAR: 2 con observación, 2 parcial, 4 no cubierto')
+    expect(cov).toHaveTextContent('8 obligaciones atendibles por R-SOAR: 1 con observación, 3 parcial, 4 no cubierto')
     expect(cov).toHaveTextContent('6 quedan fuera del sistema')
     expect(cov).toHaveTextContent('Política politica-prueba; régimen R3')
     expect(cov).toHaveTextContent('cruza 2 regímenes (R2, R3)')

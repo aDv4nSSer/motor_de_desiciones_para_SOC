@@ -262,9 +262,15 @@ export interface ApprovalsReconciliation {
   aprobaciones?: {
     creadas_en_la_ventana: number; aprobadas: number; rechazadas: number; expiradas: number
     pendientes: number; recurrencias: number; eventos_sin_created_at: number
+    recurrencias_por_contador?: number; abiertas_antes_de_la_ventana?: number
   }
   pendientes_ahora?: number | null
-  conciliacion?: { available: boolean; creadas_por_destino?: number; creadas_por_documentos?: number; cierra?: boolean; diferencia?: number; regla?: string }
+  decisiones_derivadas_sin_aprobacion?: number
+  conciliacion?: {
+    available: boolean; estado?: 'cierra' | 'diferencia_explicada' | 'no_cierra'; causa?: string
+    creadas_por_destino?: number; creadas_por_documentos?: number; recurrencias_por_documentos?: number
+    recurrencias_por_contador?: number; cierra?: boolean; diferencia?: number; cota_borde?: number; regla?: string
+  }
 }
 
 export interface TimingStat { p50: number | null; p95: number | null; n: number | null; detalle?: string }
@@ -290,6 +296,7 @@ export interface ChainFullResult {
 
 export interface IntegrityPanel {
   alcance: 'completa' | 'parcial' | 'solo_cola'
+  alcance_texto?: string
   completa: { available: boolean; detail?: string; generated_at?: string; alcance?: string; alcance_detalle?: string; ok?: boolean; limite?: string; cadenas?: Record<string, ChainFullResult> }
   cola_en_vivo: ChainStatus
   huecos_declarados: { available: boolean; gaps: DeclaredGap[] }

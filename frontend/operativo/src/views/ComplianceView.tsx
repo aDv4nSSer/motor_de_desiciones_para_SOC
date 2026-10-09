@@ -138,10 +138,9 @@ function IntegrityCard({ integ, fallback }: { integ?: IntegrityPanel; fallback: 
         <p className="muted small">
           Alcance: {alcance === 'completa' ? 'completa' : alcance === 'parcial' ? 'parcial' : 'solo la cola en vivo'}.
           {' '}Cola: últimos {live.tail_size.toLocaleString('es-CL')} eslabones de cada cadena, recalculados {formatTime(live.verified_at)}.
-          {full?.available
-            ? ` Verificación completa (${full.alcance_detalle ?? full.alcance}) del ${formatTime(full.generated_at ?? '')}: ${full.ok ? 'íntegra' : 'con problemas o abortada'}${
-              full.cadenas ? '; ' + Object.entries(full.cadenas).map(([k, c]) => `${k} ${c.docs.toLocaleString('es-CL')} eslabones (chain_seq ${c.first_seq} a ${c.last_seq})`).join(', ') : ''}.`
-            : ` Verificación completa: ${full?.detail ?? 'sin informe'}.`}
+          {integ?.alcance_texto ? ` ${integ.alcance_texto.charAt(0).toUpperCase()}${integ.alcance_texto.slice(1)}.`
+            : full?.available ? ` Verificación completa del ${formatTime(full.generated_at ?? '')}: ${full.ok ? 'íntegra' : 'con problemas o abortada'}.`
+              : ` Verificación completa: ${full?.detail ?? 'sin informe'}.`}
         </p>
         {integ?.huecos_declarados?.gaps?.length ? (
           <>
@@ -183,15 +182,15 @@ function ReconciliationPanel({ rec, pendingFallback, acciones }: { rec?: Approva
         <dt>Pendientes (creadas en la ventana)</dt><dd className="mono">{fmt(a?.pendientes)}</dd>
         <dt>Casos abiertos (decisiones T2)</dt><dd className="mono">{fmt(acciones.casos_abiertos)}</dd>
       </dl>
-      <p className={`notice ${c?.cierra ? 'notice-info' : 'notice-warn'} mt2`}>
+      <p className={`notice ${c?.estado === 'no_cierra' || !c?.available ? 'notice-warn' : 'notice-info'} mt2`}>
         <Info size={18} aria-hidden="true" />{' '}
-        {c?.available
-          ? c.cierra
-            ? `La conciliación cierra: ${fmt(c.creadas_por_destino)} aprobaciones creadas por destino y por documentos.`
-            : `La conciliación NO cierra: ${fmt(c.creadas_por_destino)} por destino y ${fmt(c.creadas_por_documentos)} por documentos (diferencia ${fmt(c.diferencia)}).`
-          : 'Conciliación no disponible.'}
+        {!c?.available ? 'Conciliación no disponible.'
+          : c.estado === 'cierra' ? `La conciliación cierra: ${fmt(c.creadas_por_destino)} aprobaciones creadas por destino y por documentos; ${fmt(c.recurrencias_por_documentos)} recurrencias por documentos y por contador.`
+            : c.estado === 'diferencia_explicada' ? `Diferencia explicada: ${c.causa}. Aprobaciones creadas: ${fmt(c.creadas_por_destino)} por destino y por documentos.`
+              : `La conciliación NO cierra: ${c.causa}.`}
         {' '}Regla: {c?.regla ?? 'creadas = aprobadas + rechazadas + expiradas + pendientes'}.
         {a?.eventos_sin_created_at ? ` ${fmt(a.eventos_sin_created_at)} eventos anteriores a H57 sin hora de apertura no se pueden ubicar en la ventana.` : ''}
+        {rec.decisiones_derivadas_sin_aprobacion ? ` ${fmt(rec.decisiones_derivadas_sin_aprobacion)} decisiones derivadas no abrieron aprobación (p. ej. eventos atrasados) y no cuentan como recurrencias.` : ''}
       </p>
       <p className="muted small mt2">
         Foto actual, sin ventana: {fmt(rec.pendientes_ahora ?? pendingFallback)} aprobaciones pendientes ahora.
