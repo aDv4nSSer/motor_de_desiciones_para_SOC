@@ -83,6 +83,11 @@ class AuditIndexerSettings(BaseSettings):
     # (XTRIM MINID). El maxlen=100_000 del XADD del worker queda solo como red
     # de seguridad si el indexador se detiene.
     trim_interval_seconds: float = 30.0
+    # Colchón mínimo que nunca se recorta, aunque ya esté confirmado (decisión
+    # de Antonio, 8-oct: >= 48 h). Con el maxlen de 100.000 del worker el
+    # stream cubre ~18 h, así que con 48 h el recorte no libera memoria hoy:
+    # solo protege. Bajarlo es una decisión explícita (cada hora ~14,6 MB).
+    trim_min_age_seconds: float = 48 * 3600
 
 
 class IndexingError(Exception):
@@ -403,6 +408,9 @@ class ResponseAuditIndexer:
         if self._last_acked is None or now - self._last_trim < self.s.trim_interval_seconds:
             return None
         minid = self._last_acked
+        floor = f"{int((now - self.s.trim_min_age_seconds) * 1000)}-0"
+        if _id_tuple(floor) < _id_tuple(minid):
+            minid = floor  # colchón: lo de las últimas trim_min_age_seconds no se toca
         summary = self.rdb.xpending(STREAM, GROUP)
         oldest_pending = summary.get("min") if summary and summary.get("pending") else None
         if oldest_pending and _id_tuple(oldest_pending) < _id_tuple(minid):

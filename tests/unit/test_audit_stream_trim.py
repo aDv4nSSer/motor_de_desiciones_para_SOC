@@ -21,9 +21,10 @@ from tests.unit.test_response_audit_indexer import (
 )
 
 
-def _ix(rdb, osc, interval=0.0):
+def _ix(rdb, osc, interval=0.0, min_age=0.0):
     s = _settings()
     s.trim_interval_seconds = interval
+    s.trim_min_age_seconds = min_age
     ix = ResponseAuditIndexer(rdb, osc, s)
     ix.start()
     return ix
@@ -77,4 +78,23 @@ def test_sin_nada_confirmado_no_recorta() -> None:
     rdb.xadd(STREAM, _event(0))
     ix = _ix(rdb, osc)
     assert ix.trim_acked(now=10**9) is None
+    assert len(rdb.streams[STREAM]) == 1
+
+
+def test_el_colchon_minimo_nunca_se_recorta(monkeypatch) -> None:
+    """Con 48 h de colchón y entradas de la última hora, no se recorta nada;
+    49 h después, sí (hasta lo confirmado)."""
+    import response_audit_indexer as rai
+
+    rdb, osc = FakeStreamRedis(), FakeOpenSearch()
+    for i in range(10):
+        rdb.xadd(STREAM, _event(i))  # ids en ms ~1.790.000.000.000
+    newest_s = int(rdb.streams[STREAM][-1][0].split("-")[0]) / 1000
+    monkeypatch.setattr(rai.time, "time", lambda: newest_s + 3600)
+    ix = _ix(rdb, osc, min_age=48 * 3600)
+    for _ in range(5):
+        ix.run_once()
+    assert len(rdb.streams[STREAM]) == 10  # todo dentro del colchón
+    ix._last_trim = 0
+    ix.trim_acked(now=newest_s + 49 * 3600)
     assert len(rdb.streams[STREAM]) == 1
