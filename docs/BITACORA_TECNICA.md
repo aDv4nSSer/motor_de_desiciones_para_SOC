@@ -3017,6 +3017,16 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 - El panel de integridad nombra cada cadena con su rango (`soc-responses-*` desde 2-oct y `soc-decisions-*` desde 3-oct, `chain_seq` 1 a N), la hora de la verificación y que el índice legado de 17,9 M no se verificó. Los huecos declarados siguen visibles.
 - La conciliación muestra su estado y su causa. Art. 8 e) queda "con observación" con diferencia explicada; solo "cumple" si la conciliación cierra exacta (decisión de Antonio).
 
+**`maxmemory` de Redis a 1,5 GB, en caliente (9-oct, 11:12:54 -03), sin reiniciar Redis.**
+- Persistente: Antonio editó `/etc/redis/soc-motor.conf` (línea 4: `maxmemory 1610612736`, respaldo `.bak-h58`). Redis no se reinició.
+- En caliente: `CONFIG SET maxmemory 1610612736` con el comando `CONFIG` renombrado (su nombre no se imprime). Antes se leyó el valor con el mismo comando: 1073741824 (valor de rollback). Política sin tocar: `allkeys-lru`.
+- El primer intento falló antes del `SET` (la respuesta de `CONFIG GET` llega como mapa, RESP3, y el script la leía como lista): no se aplicó nada en ese intento, verificado con `INFO`.
+- Verificado a +2 s y a +5 min: `maxmemory` 1610612736 (1,50G), used_memory ~830 MB, `evicted_keys` 72.205 sin crecer, `loading` 0, AOF activo con última escritura y rewrite `ok`, `XLEN` del stream ~100.000, grupo del indexador con lag 0 y pending 0, los 4 servicios `active` con los mismos PID, `/health` 200.
+- Rollback: el mismo comando con `maxmemory 1073741824` y restaurar `soc-motor.conf.bak-h58`.
+- **Hallazgo de seguridad:** el nombre del `CONFIG` renombrado está en texto plano en esta bitácora (H32), versionada en git. El renombre deja de proteger contra quien lea el repo. Pendiente: cambiar el nombre en `soc-motor.conf`/`redis.conf` (requiere restart de Redis) y redactarlo de la bitácora; el historial de git lo conserva igual.
+
+**Límite de diseño del stream de auditoría.** El worker hace `XADD maxlen=100_000` (aproximado): con el ritmo actual son unas 14 h. Si OpenSearch o el indexador quedan caídos más tiempo que eso, el `maxlen` descarta entradas todavía no indexadas y esos registros se pierden sin hueco detectable por la cadena (ya pasó en H38). El recorte de H57 (`XTRIM MINID`, solo de lo confirmado) no cambia este límite; lo cambiaría quitar el `maxlen` del worker o subirlo, a costa de memoria (~2,8 KB por entrada).
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)
