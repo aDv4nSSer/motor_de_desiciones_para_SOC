@@ -264,6 +264,8 @@ def process_task(
                 ),
             },
             rdb=rdb,
+            ttl=settings.case_ttl_seconds,
+            dedup_window=settings.case_dedup_window_seconds,
         )
         record.case_id = case["case_id"]
         log.info(f"[{task.trace_id[:8]}] T2 caso automático abierto: {case['case_id']}")

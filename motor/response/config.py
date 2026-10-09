@@ -86,6 +86,10 @@ class ResponseSettings(BaseSettings):
 
     # ── Aprobaciones humanas (H38) ─────────────────────────────────────
     approval_ttl_seconds: int = 14400            # 4 h sin resolver -> expired
+    # Casos automáticos de T2 (H57): TTL desde la última ocurrencia y ventana de
+    # dedup por IP pública. Un caso que un analista toca queda persistente.
+    case_ttl_seconds: int = 7 * 86400
+    case_dedup_window_seconds: int = 86400
     approval_sweep_interval_seconds: int = 60    # barrido de expiración en el worker
 
     # ── R2: parámetros de bloqueo ──────────────────────────────────────

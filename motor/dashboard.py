@@ -517,29 +517,47 @@ CASES_INDEX_KEY = "soc:cases:index"
 VALID_CASE_STATES = {"abierto", "en_investigacion", "cerrado_confirmado", "cerrado_falso_positivo"}
 
 
+CASES_RECENT_KEY = "soc:cases:recent"
+CASES_LIST_SCAN_MAX = 2000   # tope de casos leídos por listado (lotes de MGET)
+CASES_LIST_BATCH = 200
+
+
 def list_cases(only_open: bool = False, limit: int = 50) -> list[dict]:
+    """Casos más recientes por última actividad, desde el índice acotado
+    `soc:cases:recent` (H57). Antes se hacía SMEMBERS de soc:cases:index
+    (~550.000 ids) y un GET por caso dentro del proceso del Fast Path: el
+    mismo patrón de lectura masiva que causó el incidente de H54. Ahora lee a
+    lo sumo CASES_LIST_SCAN_MAX casos, en lotes de MGET. Los casos anteriores
+    a H57 no están en el índice nuevo y expiran con la migración de H57."""
     try:
         r = _get_redis()
-        ids = r.smembers(CASES_INDEX_KEY)
     except Exception as e:
         logging.error(f"no se pudo leer casos de Redis: {e}")
         return []
 
-    cases = []
-    for cid in ids:
+    cases: list[dict] = []
+    for start in range(0, CASES_LIST_SCAN_MAX, CASES_LIST_BATCH):
         try:
-            raw = r.get(f"{CASES_KEY_PREFIX}{cid}")
+            ids = r.zrevrange(CASES_RECENT_KEY, start, start + CASES_LIST_BATCH - 1)
+            if not ids:
+                break
+            raws = r.mget([f"{CASES_KEY_PREFIX}{cid}" for cid in ids])
+        except Exception as e:
+            logging.error(f"no se pudo leer casos de Redis: {e}")
+            break
+        for raw in raws:
             if not raw:
                 continue
-            case = json.loads(raw)
+            try:
+                case = json.loads(raw)
+            except ValueError:
+                continue
             if only_open and case.get("state") not in ("abierto", "en_investigacion"):
                 continue
             cases.append(case)
-        except Exception:
-            continue
-
-    cases.sort(key=lambda c: c.get("opened_at", ""), reverse=True)
-    return cases[:limit]
+            if len(cases) >= limit:
+                return cases
+    return cases
 
 
 def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> dict | None:
@@ -561,6 +579,8 @@ def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> di
         "note": note,
         "actor": actor,
     })
+    # SET sin TTL a propósito (H57): un caso que un analista tocó es evidencia
+    # y deja de expirar, aunque haya nacido como caso automático con TTL.
     r.set(f"{CASES_KEY_PREFIX}{case_id}", json.dumps(case))
     logging.info(f"caso {case_id} -> {new_state} por {actor}")
     return case
