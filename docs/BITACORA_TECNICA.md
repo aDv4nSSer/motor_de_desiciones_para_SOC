@@ -2970,6 +2970,55 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 
 ---
 
+## H58: Dos ventanas de deploy separadas, conciliación de aprobaciones con datos reales y esquema de las cadenas
+
+**Fecha:** 9-oct-2026, 02:00 a 03:00 -03 aprox. Ramas locales, sin push, deploy ni restart. Sobre producción hubo solo lecturas: OpenSearch paginado con pausas y aborto por heap o latencia, sin SCAN de Redis. Detalle completo, comandos de deploy y rollback en `reports/estado_9oct_noche.md`.
+
+**Ramas.**
+- `feature/fase3a-cuota` (`43a62bd`): `origin/develop` (`d0c8f93`) más los 8 commits locales de H56 y los cherry-picks de 1.1, 1.2, 1.3, el colchón de 48 h, la función guarda, el corte de H55 y la foto fija de R2.
+  - Hashes nuevos: `c209526`→`afa62bf`, `64cb845`→`d0d7d37`, `13e8601`→`e11cd8d`, `2dd46e2`→`85e9761`, `9934255`→`cb30bd9`, `b792e2b`→`a0750a6`, `595fda7`→`43a62bd`.
+  - Ventana: 9-oct 21:00 -03.
+  - Resultados: 758 passed y pre-commit limpio.
+- `feature/cumplimiento`: fase3a más usuarios, regímenes, `verify_chain`, vista Cumplimiento (backend y frontend) y bitácora H57, con los mismos commits re-aplicados. Encima van los commits de H58.
+  - Ventana: 11-oct.
+  - Resultados: 797 passed, frontend 48 passed y pre-commit limpio.
+- La foto fija de R2 pasa en las dos ramas.
+
+**Commits mixtos.**
+- `a2ad153` también toca `main.py` (`approval_created_at`) y `response/config.py` (`organizacion_es_oiv`). Quedó en cumplimiento: el campo nuevo de la cadena entra el 11-oct.
+- `f7c9184` (bitácora H57) quedó en cumplimiento.
+- `c209526` (fase3a) toca `dashboard.py`, así que el 9-oct también reinicia `motor-soc`.
+
+**`.env` de `.140`.** Fija `ABUSEIPDB_CACHE_TTL=21600`, que pisa el default nuevo de 86400. Sin editarlo, el TTL asimétrico de la Fase 3 A queda en 6 h. La edición requiere OK aparte.
+
+**Conciliación real** (24 h móviles, cuatro mediciones del 9-oct, 02:19 a 02:50 -03).
+- **Igualdad 1, aprobaciones creadas: cierra exacta.** Las creadas por destino (aprobadas + rechazadas + expiradas + pendientes) coinciden con las creadas por documentos: 1.594, 1.600, 1.602 y 1.625.
+- **Igualdad 2, recurrencias.** La forma vieja era tautológica: `recurrencias = derivadas − creadas` no podía fallar. Ahora se mide por dos caminos:
+  - **por documentos:** derivadas que entraron al flujo menos creadas;
+  - **por contador:** Σ (`occurrences` − 1) de las aprobaciones creadas en la ventana.
+- Hubo diferencias de 575, 570, 540 y 472:
+  - las explican las aprobaciones abiertas antes del inicio de la ventana (101 a 109, TTL de 4 h), que siguen absorbiendo decisiones dentro de ella;
+  - la cota superior es Σ (`occurrences` − 1) de esas aprobaciones = 770;
+  - estado: **"diferencia explicada"**. No se forzó el cierre: si la diferencia supera la cota, o falta un documento de creación, el estado pasa a "no cierra" con su causa.
+- **Hallazgo:** en 24 h hubo **0 aprobaciones resueltas por humanos** (0 aprobadas, 0 rechazadas). Todas vencieron por TTL (1.389 a 1.439) o siguen pendientes (186 a 206). El tiempo humano de respuesta "sin datos" es real, no un error de medición.
+
+**Esquema de las cadenas.**
+- El único campo nuevo en registros encadenados es `approval_created_at`, en el payload de `manual_approval` y en el `detail` de `approval_rejected` de `soc-responses`.
+- Entra al hash solo en eslabones nuevos. El hash es `sha256(json canónico del contenido con chain_seq + prev_hash)` y no depende del esquema.
+- `policy_version` y `regime_id` no se escriben en ninguna cadena. `soc-decisions-*` no cambia.
+- Lo prueba `test_h58_cadena_esquema_mixto.py`:
+  - una cadena mixta verifica íntegra;
+  - la alteración de un doc viejo o nuevo se detecta;
+  - un eslabón viejo da el mismo hash que el indexador desplegado (`d0c8f93`).
+- **Verificador sin cambios y sin recálculo histórico.** El riesgo para el 11-oct es bajo.
+
+**Vista.**
+- Art. 8 d) queda siempre "parcial". Cubre R-SOAR: análisis continuo. Queda en la organización: ejercicios, simulacros y comunicación de amenazas al CSIRT. Cierra la discrepancia 1 de H57.
+- El panel de integridad nombra cada cadena con su rango (`soc-responses-*` desde 2-oct y `soc-decisions-*` desde 3-oct, `chain_seq` 1 a N), la hora de la verificación y que el índice legado de 17,9 M no se verificó. Los huecos declarados siguen visibles.
+- La conciliación muestra su estado y su causa.
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - ~~**Desacuerdo de grupos unilaterales (H53)**~~ → **resuelto con P4** (`a90df02`): solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%.
