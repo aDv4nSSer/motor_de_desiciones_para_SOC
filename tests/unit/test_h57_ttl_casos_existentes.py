@@ -72,7 +72,7 @@ def test_apply_respeta_exclusion_y_nx_sin_leer_contenido(monkeypatch) -> None:
     r = FakeRedis(1000)
     r.ttl["soc:cases:c5"] = 604800  # caso nuevo de H57: ya tiene TTL, NX no lo toca
     res = h57.apply(r, excluded={"c7"}, pause=0)
-    assert res == {"aplicados": 998, "sin_cambio": 1, "excluidos": 1, "lotes": 5}
+    assert res == {"aplicados": 998, "sin_cambio": 1, "excluidos": 1, "lotes": 10}
     assert r.ttl["soc:cases:c7"] == -1 and r.ttl["soc:cases:c5"] == 604800
     assert r.reads == 0  # --apply no lee el contenido de los casos
 

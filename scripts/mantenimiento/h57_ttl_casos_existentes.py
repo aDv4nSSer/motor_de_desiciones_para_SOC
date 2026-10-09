@@ -26,8 +26,8 @@ Tres pasos, en este orden (en .140, desde motor/ para tomar el .env):
        python3 ../scripts/mantenimiento/h57_ttl_casos_existentes.py --apply \\
            --excluir ~/tesis/backups/h57_casos_excluidos.json
 
-Redis: solo SSCAN con COUNT chico y pausas, MGET de a 100 en la muestra,
-pipelines de EXPIRE de a 200, INFO. Nunca SMEMBERS ni lecturas masivas (H54).
+Redis: solo SSCAN mediante redis_guard (COUNT 100, pausas, tope de iteraciones),
+MGET de a 100 en la muestra, pipelines de EXPIRE de a 100, INFO. Nunca SMEMBERS ni lecturas masivas (H54).
 """
 from __future__ import annotations
 
@@ -41,11 +41,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "motor"))
 
+from redis_guard import guarded_scan
 from response.cases import CASES_INDEX_KEY, CASES_KEY_PREFIX
 
 SAMPLE_MAX = 500
 SAMPLE_BATCH = 100
-APPLY_BATCH = 200
+APPLY_BATCH = 100       # COUNT máximo de la función guarda (redis_guard)
+MAX_ITERATIONS = 20_000  # ~634k ids / 100 por iteración, con margen
 PAUSE_SECONDS = 0.1
 GUARD_EVERY = 10
 MEMORY_ABORT_FRACTION = 0.90
@@ -70,15 +72,10 @@ def touched_by_analyst(case: dict) -> bool:
 
 
 def sscan_ids(rdb, count: int, pause: float):
-    """Recorre soc:cases:index de a `count` ids con pausas (nunca SMEMBERS)."""
-    cursor = 0
-    while True:
-        cursor, ids = rdb.sscan(CASES_INDEX_KEY, cursor=cursor, count=count)
-        if ids:
-            yield list(ids)
-        if cursor == 0:
-            return
-        time.sleep(pause)
+    """Recorre soc:cases:index con la función guarda (SSCAN, COUNT <= 100,
+    pausa y tope de iteraciones). Nunca SMEMBERS."""
+    yield from guarded_scan(rdb, set_key=CASES_INDEX_KEY, count=count, pause=pause,
+                            max_iterations=MAX_ITERATIONS)
 
 
 def muestra(rdb, excluir: Path) -> dict:
