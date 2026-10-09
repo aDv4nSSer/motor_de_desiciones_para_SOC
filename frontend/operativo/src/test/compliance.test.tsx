@@ -88,3 +88,110 @@ describe('tarjeta de corroboración multi-fuente (Cumplimiento)', () => {
     expect(within(card).getByText(/No determina bloqueos reales/)).toHaveTextContent('validación cerrada el 10 oct, 20:40')
   })
 })
+
+// ── H57: vista consistente, auditable y honesta ──────────────────────────────
+
+function h57Report(over: Record<string, unknown> = {}) {
+  return {
+    ...report(CORR),
+    usuarios_por_rol: null, sesiones_activas: null,
+    indice_usuarios: { reliable: false, reason: 'índice de usuarios vacío en Redis', members: 0 },
+    policy_version: 'politica-prueba',
+    regime: { id: 'R3', desde: '2026-10-09T02:42:16+00:00', descripcion: 'Gauge de la cuota real de AbuseIPDB (H55, d0c8f93)' },
+    regimes_in_window: [{ id: 'R2', desde: '', descripcion: '' }, { id: 'R3', desde: '', descripcion: '' }],
+    resumen: { obligaciones_del_sistema: 8, por_estado: { con_observacion: 2, parcial: 2, no_cubierto: 4 }, fuera_del_sistema: 6, generado: '2026-10-09T03:00:00Z' },
+    nota_alcance: 'R-SOAR aporta evidencia técnica de apoyo. La evaluación de cumplimiento legal es de la organización.',
+    latencia_descripcion: 'Latencia interna del Fast Path: procesamiento del motor, sin red ni Vector.',
+    checklist: [{
+      id: 'monitoreo', article: 'Art. 8 d)', title: 'Revisión y análisis', status: 'con_observacion',
+      evidence: 'estado de nodos: degraded', source: 'automático',
+      meta: { ventana: 'ventana móvil de 24 h', unidad: 'decisiones', fuente: 'soc-decisions', actualizado: '2026-10-09T03:00:00Z', registros: '#nodos' },
+    }],
+    conciliacion_aprobaciones: {
+      available: true, ips_bloqueadas: 244, acciones_de_bloqueo: 551, ips_derivadas: 531, decisiones_t3_derivadas: 20336,
+      aprobaciones: { creadas_en_la_ventana: 1604, aprobadas: 0, rechazadas: 0, expiradas: 1325, pendientes: 279, recurrencias: 18732, eventos_sin_created_at: 0 },
+      pendientes_ahora: 279,
+      conciliacion: { available: true, creadas_por_destino: 1604, creadas_por_documentos: 1604, cierra: true, diferencia: 0, regla: 'creadas = aprobadas + rechazadas + expiradas + pendientes' },
+    },
+    integridad: {
+      alcance: 'parcial',
+      completa: { available: true, alcance: 'parcial', alcance_detalle: 'abortada en decisions', ok: false, generated_at: '2026-10-09T01:00:00Z' },
+      cola_en_vivo: report(CORR).cadenas,
+      huecos_declarados: { available: true, gaps: [{ id: 'H54', hallazgo: 'H54', cadena: 'soc-responses', desde: '2026-10-08T03:32:41.987Z', hasta: '2026-10-08T03:32:45.538Z', registros: '0 a 5 registros R1/R2', detectable_por_cadena: false, descripcion: '' }] },
+    },
+    tiempos: { available: true, humano_s: { p50: null, p95: null, n: 0, detalle: 'sin datos: no hubo aprobaciones resueltas' } },
+    historial_diario: { available: true, unidad: 'IPs distintas por día', dias: [{ dia: '2026-10-08', ips_bloqueadas: 244, ips_derivadas: 531, razon_bloqueo_sobre_derivacion: 0.46, aprobaciones_expiradas: 1325, regimenes: ['R1', 'R2', 'R3'] }] },
+    ...over,
+  }
+}
+
+async function enterH57(over: Record<string, unknown> = {}) {
+  mockFetch({
+    '/api/v1/auth/login': () => json(200, { access_token: 'tok', token_type: 'bearer', role: 'CISO' }),
+    '/api/v1/dashboard/compliance': () => json(200, h57Report(over)),
+  })
+  const user = userEvent.setup()
+  render(<AuthProvider><App /></AuthProvider>)
+  await user.type(screen.getByLabelText('Usuario'), 'ana')
+  await user.type(screen.getByLabelText('Contraseña'), 'una-clave-larga')
+  await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }))
+  await screen.findByLabelText('Métricas de valor')
+}
+
+describe('Cumplimiento H57', () => {
+  it('un nodo degradado se muestra como "con observación", con el contexto de la métrica', async () => {
+    await enterH57()
+    expect(screen.getAllByText('Con observación').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Con evidencia')).not.toBeInTheDocument()
+    const link = screen.getByRole('link', { name: 'Ver registros' })
+    expect(link).toHaveAttribute('href', '#nodos')
+    expect(link.closest('p')).toHaveTextContent('ventana móvil de 24 h. Unidad: decisiones. Fuente: soc-decisions.')
+  })
+
+  it('usuarios y sesiones con el índice vacío dicen "dato no confiable", nunca 0', async () => {
+    await enterH57()
+    expect(screen.getByText(/Usuarios y sesiones: dato no confiable \(índice de usuarios vacío en Redis\)/)).toBeInTheDocument()
+    const access = screen.getByRole('heading', { name: 'Control de acceso' }).closest('.panel') as HTMLElement
+    expect(within(access).getByText('CISO / Gerencia').nextSibling).toHaveTextContent('dato no confiable')
+    expect(within(access).getByText('Sesiones activas').nextSibling).toHaveTextContent('dato no confiable')
+  })
+
+  it('la conciliación de aprobaciones muestra unidades y si cierra', async () => {
+    await enterH57()
+    expect(screen.getByText('IPs distintas bloqueadas').nextSibling).toHaveTextContent('244')
+    expect(screen.getByText('Recurrencias sumadas a aprobaciones abiertas').nextSibling).toHaveTextContent('18.732')
+    expect(screen.getByText(/La conciliación cierra: 1\.604 aprobaciones creadas/)).toBeInTheDocument()
+    expect(screen.getByText(/Foto actual, sin ventana: 279 aprobaciones pendientes ahora/)).toBeInTheDocument()
+  })
+
+  it('si la conciliación no cierra, lo dice', async () => {
+    await enterH57({ conciliacion_aprobaciones: { ...h57Report().conciliacion_aprobaciones,
+      conciliacion: { available: true, creadas_por_destino: 1604, creadas_por_documentos: 1600, cierra: false, diferencia: 4 } } })
+    expect(screen.getByText(/La conciliación NO cierra: 1\.604 por destino y 1\.600 por documentos \(diferencia 4\)/)).toBeInTheDocument()
+  })
+
+  it('el panel de integridad declara su alcance y los huecos conocidos', async () => {
+    await enterH57()
+    const panel = screen.getByRole('status', { name: /verificación parcial/ })
+    expect(panel).toHaveTextContent('Alcance: parcial')
+    expect(panel).toHaveTextContent('Verificación completa (abortada en decisions)')
+    expect(within(panel).getByText('H54').closest('li')).toHaveTextContent('0 a 5 registros R1/R2')
+  })
+
+  it('resumen de cobertura con política, régimen y nota de alcance', async () => {
+    await enterH57()
+    const cov = screen.getByRole('region', { name: 'Cobertura de lo que corresponde al sistema' })
+    expect(cov).toHaveTextContent('8 obligaciones atendibles por R-SOAR: 2 con observación, 2 parcial, 4 no cubierto')
+    expect(cov).toHaveTextContent('6 quedan fuera del sistema')
+    expect(cov).toHaveTextContent('Política politica-prueba; régimen R3')
+    expect(cov).toHaveTextContent('cruza 2 regímenes (R2, R3)')
+    expect(cov).toHaveTextContent('evidencia técnica de apoyo')
+  })
+
+  it('tiempo humano sin datos e historial con regímenes', async () => {
+    await enterH57()
+    expect(screen.getByText('Apertura de la aprobación a resolución humana').nextSibling).toHaveTextContent('sin datos')
+    const hist = screen.getByRole('region', { name: 'Historial diario (30 días)' })
+    expect(within(hist).getByText('2026-10-08').closest('tr')).toHaveTextContent('R1, R2, R3')
+  })
+})

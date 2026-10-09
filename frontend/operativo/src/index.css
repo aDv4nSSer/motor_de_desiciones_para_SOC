@@ -425,6 +425,12 @@ table.data { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .toolbar { display: flex; justify-content: flex-end; margin-bottom: var(--s3); }
 .mb2 { margin-bottom: var(--s2); }
 .mt1 { margin-top: var(--s1); }
+.mt2 { margin-top: var(--s2); }
+.mb3 { margin-bottom: var(--s3); }
+/* H57: contexto de cada número y huecos declarados en Cumplimiento. */
+.meta-line a { text-decoration: underline; }
+.gaps { margin: var(--s1) 0 0; padding-left: 1.2em; }
+.gaps li { margin-top: 2px; }
 .ml1 { margin-left: var(--s1); }
 .node-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--s3); }
 .node { display: grid; gap: var(--s2); padding: var(--s4); align-content: start; justify-items: start; }
