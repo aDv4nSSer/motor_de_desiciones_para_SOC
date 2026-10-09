@@ -1,0 +1,61 @@
+# Huecos declarados del registro de evidencia (H57).
+#
+# La verificación de la cadena (scripts/audit/verify_chain.py) prueba que lo
+# que está en OpenSearch no fue alterado y que no faltan eslabones. NO puede
+# detectar registros que se perdieron ANTES de encadenarse: el indexador
+# asigna chain_seq al indexar, así que la secuencia queda continua. Esos
+# huecos se declaran acá, con su rango, su alcance y el hallazgo que los
+# documenta. El panel de integridad los muestra como "declarados".
+#
+# Agregar una entrada en el mismo commit que documenta el hueco en la bitácora.
+version: 1
+gaps:
+  - id: H54
+    hallazgo: H54
+    cadena: soc-responses
+    desde: "2026-10-08T03:32:41.987Z"
+    hasta: "2026-10-08T03:32:45.538Z"
+    registros: "0 a 5 registros R1/R2"
+    detectable_por_cadena: false
+    descripcion: >-
+      Desalojo masivo de Redis (allkeys-lru, 72.205 claves) causado por una
+      consulta de diagnóstico: se perdió el stream soc:response:audit con su
+      consumer group. Lo que estaba en el stream y no se había indexado nunca
+      llegó a OpenSearch.
+
+  - id: H25
+    hallazgo: H25
+    cadena: soc-decisions
+    desde: "2026-08-18T19:13:00Z"
+    hasta: "2026-09-05T03:00:00Z"
+    registros: "sin decisiones: el Fast Path no recibió tráfico"
+    detectable_por_cadena: false
+    descripcion: >-
+      Vector apuntaba a la IP pública obsoleta de .140 tras la migración a
+      VLAN: el motor no decidió nada en ese rango. No es pérdida de registros
+      sino ausencia de decisiones; las métricas excluyen el rango.
+
+  - id: H42-perdida
+    hallazgo: H42
+    cadena: soc-decisions (cadena vieja)
+    desde: "2026-06-15T00:00:00Z"
+    hasta: "2026-10-03T06:17:41Z"
+    registros: "169.484 mensajes entregados y nunca confirmados, ya fuera del stream"
+    detectable_por_cadena: false
+    descripcion: >-
+      El indexador viejo hacía XACK aunque OpenSearch no confirmara. Los
+      mensajes pendientes del consumer group opensearch-indexer ya no existían
+      en el stream al corregirlo.
+
+  - id: H42-corte
+    hallazgo: H42
+    cadena: soc-decisions
+    desde: "2026-10-03T06:17:41Z"
+    hasta: "2026-10-03T06:17:41Z"
+    registros: "corte de cadena, sin pérdida"
+    detectable_por_cadena: true
+    descripcion: >-
+      La cadena nueva (soc-decisions-*) empieza en chain_seq 1 con prev_hash
+      igual a la cabeza de la cadena vieja (índice legado soc-decisions) y un
+      objeto chain_cutover dentro del contenido hasheado. La cadena vieja se
+      verifica aparte (scripts/verify_decisions_legacy_chain.py).
