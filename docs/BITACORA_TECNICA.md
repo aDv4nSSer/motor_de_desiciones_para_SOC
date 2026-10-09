@@ -2896,6 +2896,78 @@ Todas son predicciones hasta medirlas.
 
 **Período 1 (7-oct 20:40 → 9-oct 21:00, ~49 h):** registrado como **no válido para decidir el gate** por la regla de 72 h de la sección 2 de `PENDIENTES_MODO_SOMBRA.md`. Queda como evidencia de diagnóstico con TI sin cuota.
 
+## H57: Robustez operativa (Redis, casos, stream de auditoría) y vista Cumplimiento consistente y auditable
+
+**Fecha:** 8 y 9-oct-2026. Rama `feature/mvp-cierre`, sin deploy ni push. Las lecturas en producción fueron de solo lectura; la única escritura autorizada fue el informe JSON de la verificación completa de las cadenas.
+
+### Estado de partida medido (8-oct, 20:43 a 23:44 -03; 9-oct, 00:10 -03)
+
+- **Redis de `.140`** (solo `INFO`, `SCARD`, `SCAN` muestral con pausas y `MEMORY USAGE` puntual):
+  - 795 MB de 1.024 MB, con **677.538 claves y solo 12.416 con TTL**.
+  - Casos `soc:cases:*`: ~633.000 claves sin TTL, **~449 MB**; el índice `soc:cases:index` suma 51,6 MB.
+  - Stream `soc:response:audit`: 100.000 entradas, **259,6 MB**, todas ya indexadas (pending 0, lag 0).
+  - Aprobaciones: ~24.000 claves sin TTL, ~13 MB.
+  - Crecimiento: ~15 MB/h de tarde y ~4,6 MB/h de noche.
+- **`CONFIG` está deshabilitado** en este Redis (`rename-command`): `CONFIG SET maxmemory` falló sin cambiar nada. Subir `maxmemory` requiere editar `redis.conf` con sudo y reiniciar Redis.
+- **Desliz propio:** para confirmar las claves de usuarios hice un `SCAN MATCH` que recorrió todo el keyspace (COUNT 500, sin pausas), fuera de la regla acordada. No hubo desalojos (siguen en 72.205). Desde H57 todo recorrido pasa por la función guarda `motor/redis_guard.py`.
+- **Disco:** `.140` al 44%, OpenSearch al 46% (umbrales 85/90/95%), `.139` al 4%. Sin ISM: el índice legado `soc-decisions` (9,5 GB), los 72 `suricata-alerts-*` y `soc-experimental-detections`. Sin logrotate: `/var/log/suricata` en `.139` (56 GB, ~1 GB/día) y `worker.log` en `.140` (3,2 GB, ~61 MB/día).
+- **Riesgo encontrado:** `dashboard.list_cases()` hacía `SMEMBERS` de ~634.000 ids y un `GET` por caso dentro del proceso que atiende el Fast Path: el patrón de lectura masiva de H54. Lo dispara abrir `/dashboard` (dos veces por carga).
+- **Riesgo encontrado:** el `XADD maxlen=100_000` del worker recorta el stream de auditoría aunque el indexador no haya confirmado: si el indexador se atrasa más de 100.000, se pierden registros sin aviso (ya pasó en H38).
+
+### Robustez (ítems 1.1 a 1.3)
+
+- **1.1 Casos** (`c209526`): dedup por IP pública (ventana de 24 h), TTL de 7 días desde la última ocurrencia, campo `net24` e índice acotado `soc:cases:recent`. `list_cases()` ya no hace `SMEMBERS`. Un caso que toca un analista queda persistente.
+- **1.2 Casos existentes** (`13e8601`, guarda en `b792e2b`): script de TTL escalonado (2 a 14 h) sin archivar, con muestra previa de 500 casos que excluye los tocados por un analista, conteos agregados desde `soc-responses` y guardia de memoria. Ejecución supervisada, pendiente de OK.
+- **1.3 Stream de auditoría** (`64cb845`, colchón en `9934255`): el indexador recorta con `XTRIM MINID` solo lo confirmado, sin pasar nunca el pendiente más viejo y con un **colchón mínimo de 48 h** (decisión de Antonio). Con el `maxlen` actual el stream cubre ~18 h, así que con ese colchón el recorte hoy no libera memoria: solo protege.
+- **Verificación previa del recorte (solo lectura, 9-oct):** pending 0 y lag 0; las 100.000 entradas tienen sus 100.000 documentos en `soc-responses`; `verify_chain` íntegra sobre los índices del 8 y el 9-oct (139.676 documentos). Cada hora de historial pesa ~14,6 MB.
+
+### Vista Cumplimiento (diagnóstico)
+
+| Punto | Causa | Evidencia |
+|---|---|---|
+| Art. 7: "CISO 0, 0 sesiones" | `soc:users:index` no existe en Redis (probable desalojo de H54); el login lee `soc:users:<usuario>` directo | `SCARD` 0; existen `aiayala` (1 sesión), `smoke-ciso`, `smoke-n1`, `smoke-n2` |
+| Art. 8 d): "con evidencia" con nodos "degraded" | OpenSearch amarillo: 180 shards réplica sin asignar (`security-auditlog` 100, `suricata-alerts` 71, índices internos del ISM 9), índices con `number_of_replicas: 1` en un clúster de un nodo | `_cat/shards` |
+| Art. 8 e): números que no suman | Unidades distintas: documentos con bloqueo (244 IPs), decisiones T3 derivadas (531 IPs), aprobaciones expiradas en la ventana y pendientes en una foto sin ventana. ~1.604 aprobaciones creadas; el resto son recurrencias de la misma IP (dedup H38) | `soc-responses` y Redis |
+| Art. 8 b): "últimos 2.000 eslabones" | La vista verifica solo la cola. El hueco de H54 no es detectable por la cadena | `audit_view.py:48` |
+| p95 57,79 ms | `get_stats(1440)` sobre `soc-decisions`, 24 h móviles, todos los tiers, latencia interna del Fast Path | `dashboard.py` |
+
+### Vista Cumplimiento (cambios)
+
+Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
+- **a1** (`c1946dc`): el login re-registra al usuario en el índice; si el índice está vacío o no contiene al usuario autenticado, la vista dice "dato no confiable", nunca 0. Script de reparación con dry-run que excluye `smoke-*`.
+- **a2 a a4, b, d a g** (`a2ad153`, frontend `4f49cdb`):
+  - "con observación" con un nodo degradado, con el diagnóstico de réplicas;
+  - conciliación de aprobaciones por dos caminos independientes;
+  - ventana, unidad, fuente, hora y enlace en cada fila;
+  - panel de integridad con alcance y huecos declarados (`motor/audit_gaps.yaml`: H54, H25, la pérdida histórica y el corte de H42);
+  - tiempos de detección a decisión y a bloqueo; el humano queda "sin datos" y el evento de resolución guarda `approval_created_at` desde ahora;
+  - resumen de cobertura sin "fuera del sistema", `policy_version` y `regime_id` (`motor/regimes.py`, `f02655f`), nota de alcance;
+  - historial diario por IPs distintas con regímenes;
+  - contenido legal corregido.
+- **Contenido legal** (verificado el 9-oct contra Ley 21.663, idNorma 1202434, y DS 295/2024, idNorma 1211466):
+  - Art. 7 como deberes generales (estado "parcial");
+  - filas fuera del sistema para 8 f), g) y h);
+  - plazos: 3 h desde el conocimiento (Art. 9 a; DS 295 art. 9), 72 h desde el conocimiento (DS 295 art. 10; la ley no fija el inicio), 24 h solo OIV con servicio esencial afectado, 15 días corridos desde el envío de la alerta temprana (Art. 9 c; DS 295 art. 12), informes parciales cada 15 días (DS 295 art. 13), plan de acción de 7 días en el párrafo final del Art. 9 y DS 295 art. 11;
+  - ajuste único `organizacion_es_oiv` (None = no declarado).
+- **No regresión** (`595fda7`): foto fija de las decisiones de R2 sobre los 180 docs reales del fixture de H56; falla si cambia una sola.
+
+**Discrepancias legales marcadas, no corregidas:**
+1. El Art. 8 d) también exige ejercicios, simulacros y comunicar las amenazas al CSIRT. La fila conserva "con evidencia" cuando los nodos están bien, pero cubre solo el análisis continuo. Decidir si debería ser "parcial".
+2. El "conocimiento" del incidente es un acto de la organización; el primer T3 corroborado es solo una aproximación.
+
+**Verificación completa de las cadenas** (autorizada, solo lectura, 9-oct 00:41 a 01:04 -03, pausa de 0,2 s entre páginas, sin abortos):
+- `soc-responses`: **1.699.916 eslabones, `chain_seq` 1 a 1.699.916** (2-oct 21:50Z a 9-oct 03:51Z), íntegra, 10,2 min.
+- `soc-decisions-*`: **2.456.573 eslabones, `chain_seq` 1 a 2.456.573** (3-oct 06:16Z a 9-oct 04:04Z), íntegra, 13 min.
+- Alcance "completa" sobre los índices retenidos. El índice legado de 17,9 M quedó fuera, como se pidió. Informe en `~/tesis/motor-runtime/audit/verify_chain_latest.json` de `.140`, más una copia con fecha.
+- "Íntegra" no significa que no se haya perdido nada: los huecos de `motor/audit_gaps.yaml` no son detectables por la cadena.
+
+**Tests:** backend **788 passed**, frontend **48 passed**, pre-commit limpio.
+
+**Deploy (ventana del 11-oct, no corta el período 2):** `git pull` en `.140` más un restart de `motor-soc` (~15 s sin Fast Path); el bundle del frontend se copia con `scripts/deploy_operativo.sh`. Se registra como **evento** en `PENDIENTES_MODO_SOMBRA.md`. Las acciones de producción relacionadas van aparte, cada una con OK de Antonio:
+- desactivar `smoke-*`;
+- poner las réplicas en 0 solo donde hay shards sin asignar;
+- reparar el índice de usuarios.
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)
@@ -2910,6 +2982,7 @@ Todas son predicciones hasta medirlas.
 - **Cuota de AbuseIPDB, agotamiento del 8-oct (H55): causa confirmada** = deploy del bucket con 716 ya gastadas (transitoria; el cron de `.139` cobra 0 de esa cuenta). Pendiente: desplegar el gauge a `.140`, verificar que el 9-oct no se agote, y que Antonio revoque la key vieja (`0170c4a5f8`).
 - **Etiquetador de `.139` sin scores de AbuseIPDB desde ≥ 10-ago (H55, colateral):** el 100% de las muestras devuelve `-1` y la key de la crontab (`54032bf755`) no es la del motor. Afecta las etiquetas del corpus de reentrenamiento, no el período de sombra. Además hay una key en texto plano en `.139:~/.bash_history`.
 - **Período de modo sombra (H52):** seguimiento en `docs/PENDIENTES_MODO_SOMBRA.md`.
+- **H57, con OK por acción:** desactivar `smoke-ciso`, `smoke-n1` y `smoke-n2`; réplicas a 0 donde hay shards sin asignar; reparar `soc:users:index`; ejecutar el TTL de casos (1.2); decidir el colchón del stream y `maxmemory` (`redis.conf`, sudo). ISM para `suricata-alerts-*` y el índice legado; logrotate de Suricata y del worker.
 - **`campana_automatica.sh` (H56), post-período 2:** reparar (`-sT`, diccionario existente) o eliminar. No se pausa durante el período 2.
 - **H56, pendientes:** deploy de la Fase 3 A (`724cbb8`) en el corte del 9-oct a las 21:00 -03 + edición de `ABUSEIPDB_CACHE_TTL` en el `.env` de `.140` (OK aparte); diseño C (D2) a revisión; hardening de `cowrie.service`; `HOME_NET` y paths HTTP para cerrar E2; revisión manual de las 110 IPs `high`; `campana_automatica.sh` contra el SSH real; drift de Vector en `.139`.
 - **H51 sin documentar** (número reservado, trabajo de otra sesión).
