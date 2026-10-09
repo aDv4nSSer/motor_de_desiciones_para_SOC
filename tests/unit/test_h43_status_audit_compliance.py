@@ -264,7 +264,8 @@ class TestChecklist:
 
     def test_todo_sano(self) -> None:
         items = self._by_id(_ctx())
-        assert items["monitoreo"]["status"] == "cumple" and "12.000 decisiones" in items["monitoreo"]["evidence"]
+        # H58: el Art. 8 d) es "parcial" (R-SOAR cubre solo el análisis continuo).
+        assert items["monitoreo"]["status"] == "parcial" and "12.000 decisiones" in items["monitoreo"]["evidence"]
         assert items["registro"]["status"] == "cumple"
         # H57: el Art. 7 son deberes generales, más amplios que el control de acceso.
         assert items["acceso"]["status"] == "parcial"

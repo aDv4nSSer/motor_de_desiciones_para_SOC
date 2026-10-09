@@ -560,6 +560,27 @@ def full_verification(path: Path = AUDIT_VERIFY_JSON) -> dict[str, Any]:
     return {"available": True, **report}
 
 
+LEGACY_NOT_VERIFIED = ("el índice legado soc-decisions (17,9 M documentos, cadena vieja) no se verificó en "
+                       "esta pasada")
+
+
+def chain_scope_text(full: dict[str, Any]) -> str:
+    """Alcance explícito de la verificación completa: cada cadena vigente con
+    su rango (fecha de inicio, chain_seq 1 a N), la hora de la verificación y
+    lo que no se verificó (H58)."""
+    if not full.get("available"):
+        return f"sin verificación completa registrada; {LEGACY_NOT_VERIFIED}"
+    parts = []
+    for name, c in (full.get("cadenas") or {}).items():
+        pattern = c.get("pattern", name)
+        desde = str(c.get("first_time") or "")[:10] or "sin dato"
+        estado = ("abortada: " + str(c["aborted"])) if c.get("aborted") else ("íntegra" if c.get("ok") else "con problemas")
+        parts.append(f"{pattern} desde {desde}, chain_seq {c.get('first_seq')} a {c.get('last_seq')}, {estado}")
+    when = str(full.get("generated_at") or "")[:16].replace("T", " ")
+    return (f"verificación completa ({full.get('alcance')}) del {when} UTC: " + "; ".join(parts)
+            + f"; {LEGACY_NOT_VERIFIED}")
+
+
 def integrity_panel(chains_live: dict[str, Any]) -> dict[str, Any]:
     """Combina la verificación completa (informe JSON), la de la cola en vivo
     y los huecos declarados. "completa" solo si el informe cubrió todas las
@@ -574,7 +595,8 @@ def integrity_panel(chains_live: dict[str, Any]) -> dict[str, Any]:
         alcance = "parcial"
     else:
         alcance = "solo_cola"
-    return {"alcance": alcance, "completa": full, "cola_en_vivo": chains_live, "huecos_declarados": declared_gaps()}
+    return {"alcance": alcance, "alcance_texto": chain_scope_text(full), "completa": full,
+            "cola_en_vivo": chains_live, "huecos_declarados": declared_gaps()}
 
 
 # ── Historial diario (H57, f) ────────────────────────────────────────────────
@@ -651,17 +673,16 @@ def build_checklist(ctx: dict[str, Any]) -> list[dict[str, Any]]:
     meta = _meta(win, "decisiones del Fast Path, todos los tiers; latencia en ms",
                  "soc-decisions,soc-decisions-* (timestamp, latency_ms) y estado de nodos",
                  when, "#nodos")
-    if stats.get("available") and total > 0 and nodes == "ok":
-        status = "cumple"
-    elif stats.get("available") and total > 0 and nodes != "down":
-        status = "con_observacion"
-    else:
-        status = "parcial"
-    ev = (f"{_n(total)} decisiones en la ventana; latencia interna del Fast Path p95 "
-          f"{stats.get('latencia_p95_ms')} ms (procesamiento del motor, sin red ni Vector; percentil "
-          f"aproximado de OpenSearch); estado de nodos: {nodes}. R-SOAR cubre el análisis continuo: "
-          "ejercicios, simulacros y la comunicación de amenazas al CSIRT Nacional quedan fuera del sistema."
-          if stats.get("available") else "OpenSearch no respondió: no se pudo medir el monitoreo.")
+    # H58: siempre "parcial". El literal exige revisión, ejercicios, simulacros,
+    # análisis y comunicar las amenazas al CSIRT; R-SOAR cubre solo el análisis
+    # continuo. Un nodo degradado se informa en las observaciones.
+    status = "parcial"
+    ev = (f"Cubre R-SOAR: análisis continuo de redes y sistemas, con {_n(total)} decisiones en la ventana, "
+          f"latencia interna del Fast Path p95 {stats.get('latencia_p95_ms')} ms (procesamiento del motor, sin red "
+          f"ni Vector; percentil aproximado de OpenSearch) y estado de nodos {nodes}. Queda en la organización: "
+          "ejercicios, simulacros y la comunicación de amenazas al CSIRT Nacional."
+          if stats.get("available") else "OpenSearch no respondió: no se pudo medir el análisis continuo. Queda "
+          "en la organización: ejercicios, simulacros y la comunicación de amenazas al CSIRT Nacional.")
     if obs:
         ev += " Observaciones: " + " ".join(obs)
     items.append(_item("monitoreo", "Art. 8 d)", "Revisión, ejercicios, simulacros y análisis continuo de redes "
@@ -677,9 +698,7 @@ def build_checklist(ctx: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         status = "parcial"
     full = integ.get("completa") or {}
-    full_txt = (f"verificación completa {full.get('alcance')} del {full.get('generated_at', '')[:16]} "
-                f"({'íntegra' if full.get('ok') else 'con problemas o abortada'})"
-                if full.get("available") else "sin verificación completa registrada")
+    full_txt = chain_scope_text(full)
     gaps = (integ.get("huecos_declarados") or {}).get("gaps", [])
     ev = (f"Cola en vivo: respuestas {'íntegra' if resp_ok else 'con problemas' if resp_ok is False else 'sin dato'}, "
           f"decisiones {'íntegra' if dec_ok else 'con problemas' if dec_ok is False else 'sin dato'} "

@@ -68,10 +68,12 @@ class TestVistaUsuarios:
 # ── a2 ───────────────────────────────────────────────────────────────────────
 
 class TestNodos:
-    @pytest.mark.parametrize("overall", ["degraded", "unknown"])
-    def test_nunca_con_evidencia_con_un_nodo_degradado(self, overall) -> None:
-        items = _by_id(_ctx(nodes_overall=overall))
-        assert items["monitoreo"]["status"] == "con_observacion"
+    @pytest.mark.parametrize("overall", ["ok", "degraded", "unknown"])
+    def test_art_8_d_siempre_parcial_y_dice_que_queda_en_la_organizacion(self, overall) -> None:
+        it = _by_id(_ctx(nodes_overall=overall))["monitoreo"]
+        assert it["status"] == "parcial"  # nunca "con evidencia", con o sin nodo degradado
+        assert "Cubre R-SOAR: análisis continuo" in it["evidence"]
+        assert "Queda en la organización: ejercicios, simulacros y la comunicación de amenazas al CSIRT" in it["evidence"]
 
     def test_diagnostico_de_replicas_visible(self) -> None:
         nodes = {"components": [{"id": "opensearch", "name": "OpenSearch", "host": ".140", "status": "degraded",
@@ -312,3 +314,18 @@ class TestContenidoLegal:
         text = json.dumps(compliance.build_checklist(_ctx()), ensure_ascii=False).lower()
         assert "cumple la ley" not in text and "cumplimiento legal garantizado" not in text
         assert "evidencia técnica de apoyo" in compliance.SCOPE_NOTE
+
+
+def test_alcance_explicito_de_la_verificacion_completa() -> None:
+    full = {"available": True, "alcance": "completa", "generated_at": "2026-10-09T04:04:48+00:00", "cadenas": {
+        "responses": {"pattern": "soc-responses-*", "first_time": "2026-10-02T21:50:46Z", "first_seq": 1,
+                      "last_seq": 1699916, "ok": True, "aborted": None},
+        "decisions": {"pattern": "soc-decisions-*", "first_time": "2026-10-03T06:16:52Z", "first_seq": 1,
+                      "last_seq": 2456573, "ok": True, "aborted": None}}}
+    t = compliance.chain_scope_text(full)
+    assert "soc-responses-* desde 2026-10-02, chain_seq 1 a 1699916, íntegra" in t
+    assert "soc-decisions-* desde 2026-10-03, chain_seq 1 a 2456573, íntegra" in t
+    assert "2026-10-09 04:04 UTC" in t and "17,9 M" in t and "no se verificó" in t
+    assert "17,9 M" in compliance.chain_scope_text({"available": False})
+    ev = _by_id(_ctx(integrity={"completa": full, "huecos_declarados": {"gaps": [{"id": "H54"}]}}))["registro"]["evidence"]
+    assert "chain_seq 1 a 1699916" in ev and "H54" in ev
