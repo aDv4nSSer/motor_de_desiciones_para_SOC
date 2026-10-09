@@ -90,6 +90,10 @@ class ResponseSettings(BaseSettings):
     # dedup por IP pública. Un caso que un analista toca queda persistente.
     case_ttl_seconds: int = 7 * 86400
     case_dedup_window_seconds: int = 86400
+    # Ley 21.663: si la organización es operador de importancia vital (OIV).
+    # None = no declarado. Define si aplican el Art. 8, el plazo de 24 h y el plan
+    # de acción de 7 días en la vista de Cumplimiento (H57). Lo decide la organización.
+    organizacion_es_oiv: bool | None = None
     approval_sweep_interval_seconds: int = 60    # barrido de expiración en el worker
 
     # ── R2: parámetros de bloqueo ──────────────────────────────────────

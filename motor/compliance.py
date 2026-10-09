@@ -29,16 +29,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import audit_view
 import redis
 import sessions as sess
 import users
+import yaml
 from dashboard import (
     OS_INDEX,
     RESPONSE_AUDIT_STREAM,
@@ -47,7 +50,12 @@ from dashboard import (
     get_precision_stats,
     get_stats,
 )
-from response.approvals import pending_approvals_page
+from regimes import policy_version, regime_at, regimes_between
+from response.approvals import (
+    APPROVALS_MAX_LIMIT,
+    list_pending_approvals,
+    pending_approvals_page,
+)
 from response.config import get_settings
 
 log = logging.getLogger("motor.compliance")
@@ -72,11 +80,14 @@ SHADOW_PERIOD_END = datetime(2026, 10, 10, 23, 40, tzinfo=timezone.utc)
 CORROBORATION_BANDS = ("high", "medium", "low", "ambiguous")
 CORROBORATION_GROUPS = ("ml", "ti", "signature", "context")
 
-LEGAL_NOTE = ("Artículos, literales y plazos verificados contra el texto oficial de la Ley 21.663 "
-              "(LeyChile/BCN, idNorma 1202434, versión del 08-04-2024). El Art. 8 obliga a los "
-              "operadores de importancia vital; el Art. 9, a todas las instituciones del Art. 4. "
-              "El checklist muestra la evidencia que aporta R-SOAR, no una declaración de "
-              "cumplimiento legal.")
+LEGAL_NOTE = ("Artículos, literales y plazos verificados el 09-10-2026 contra el texto oficial de la Ley 21.663 "
+              "(LeyChile/BCN, idNorma 1202434) y del DS 295/2024, reglamento de reporte de incidentes "
+              "(idNorma 1211466). El Art. 8 obliga a los operadores de importancia vital; el Art. 9, a todas "
+              "las instituciones del Art. 4. Los plazos de 72 h y de 7 días se cuentan desde el conocimiento "
+              "del incidente (DS 295 arts. 10 y 11) y el de 15 días desde el envío de la alerta temprana "
+              "(Art. 9 c).")
+SCOPE_NOTE = ("R-SOAR aporta evidencia técnica de apoyo. La evaluación de cumplimiento legal, la determinación "
+              "de si un incidente es reportable y los reportes a la ANCI son responsabilidad de la organización.")
 
 OsRequest = Callable[..., "dict | None"]
 
@@ -213,34 +224,413 @@ def ism_policies_present(request: OsRequest = _os_request) -> dict[str, bool]:
     return {p: request("GET", f"/_plugins/_ism/policies/{p}") is not None for p in ISM_POLICIES}
 
 
+# ── Diagnóstico de nodos (H57, a2) ───────────────────────────────────────────
+
+def shards_diagnosis(request: OsRequest = _os_request) -> dict[str, Any]:
+    """Shards sin asignar por prefijo de índice y tipo (primario o réplica).
+
+    Explica un OpenSearch en amarillo: en un clúster de un solo nodo, todo
+    índice creado con number_of_replicas >= 1 deja sus réplicas sin asignar.
+    """
+    rows = request("GET", "/_cat/shards?h=index,prirep,state&format=json")
+    if not isinstance(rows, list):
+        return {"available": False}
+    by_prefix: dict[str, int] = {}
+    replicas = primaries = 0
+    for s in rows:
+        if s.get("state") != "UNASSIGNED":
+            continue
+        idx = str(s.get("index", ""))
+        prefix = idx.rsplit("-", 1)[0] if idx[-10:-6].isdigit() else idx
+        by_prefix[prefix] = by_prefix.get(prefix, 0) + 1
+        replicas += s.get("prirep") == "r"
+        primaries += s.get("prirep") == "p"
+    return {"available": True, "unassigned_total": replicas + primaries, "replicas": replicas,
+            "primaries": primaries, "by_prefix": dict(sorted(by_prefix.items(), key=lambda x: -x[1]))}
+
+
+def _node_observations(nodes: dict[str, Any], shards: dict[str, Any]) -> list[str]:
+    """Una línea por componente no "ok", con el diagnóstico de réplicas si aplica."""
+    out = []
+    for c in nodes.get("components", []):
+        if c.get("status") in ("ok", "not_configured"):
+            continue
+        line = f"{c.get('name', c.get('id'))} ({c.get('host', '')}): {c.get('status')}, {c.get('detail', '')}"
+        if c.get("id") == "opensearch" and shards.get("available") and shards.get("replicas"):
+            top = ", ".join(f"{k} {v}" for k, v in list(shards["by_prefix"].items())[:4])
+            line += (f". Son {shards['replicas']} shards réplica sin asignar ({top}): índices con "
+                     "number_of_replicas 1 en un clúster de un solo nodo. No hay pérdida de datos "
+                     "(los primarios están asignados).")
+        out.append(line)
+    return out
+
+
+# ── Conciliación de aprobaciones (H57, a3) ───────────────────────────────────
+
+def _search_all(request: OsRequest, body: dict, page: int = 5000, max_docs: int = 200_000) -> list[dict] | None:
+    """_source de todos los documentos de soc-responses-* que cumplen `body`
+    (search_after por event_time y stream_id). None si OpenSearch no respondió."""
+    out: list[dict] = []
+    after = None
+    while len(out) < max_docs:
+        q = {**body, "size": page, "sort": [{"event_time": "asc"}, {"stream_id": "asc"}]}
+        if after is not None:
+            q["search_after"] = after
+        res = request("POST", f"/{RESPONSES_PATTERN}/_search", q)
+        if res is None:
+            return None
+        hits = res.get("hits", {}).get("hits", [])
+        if not hits:
+            break
+        out.extend(h.get("_source", {}) for h in hits)
+        after = hits[-1].get("sort")
+    return out
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _window_filter(since: datetime) -> dict:
+    return {"range": {"event_time": {"gte": since.isoformat()}}}
+
+
+DERIVED_FILTER = [{"term": {"event_type": "response"}},
+                  {"term": {"accion_recomendada": "alertar_pendiente_aprobacion"}}]
+ENFORCED_FILTER = {"bool": {"should": [{"term": {"event_type": "response"}},
+                                       {"term": {"event_type": "manual_approval"}}],
+                            "minimum_should_match": 1,
+                            "filter": [{"term": {"block_enforced": True}}]}}
+
+
+def approvals_reconciliation(since: datetime, now: datetime, rdb: redis.Redis | None,
+                             request: OsRequest = _os_request) -> dict[str, Any]:
+    """Respuesta y aprobaciones de la ventana, con unidades explícitas y una
+    conciliación comprobable por dos caminos independientes.
+
+    Unidades: IPs distintas (lo que importa operativamente), decisiones T3
+    (documentos de soc-responses) y aprobaciones (una por IP mientras está
+    abierta: las decisiones T3 siguientes de la misma IP se suman como
+    recurrencias, dedup de H38).
+
+    Conciliación, para las aprobaciones CREADAS en la ventana:
+    - por destino: creadas = aprobadas + rechazadas + expiradas + pendientes
+      (cada aprobación termina en uno solo de esos estados);
+    - por documentos: creadas = decisiones T3 derivadas de la ventana cuyo
+      trace_id es el id de una aprobación (el id de una aprobación es el
+      trace_id de la decisión que la abrió);
+    - creadas + recurrencias = decisiones T3 derivadas.
+    Si los dos caminos no coinciden, `cierra` es False y se informa la
+    diferencia (p. ej. una aprobación perdida de Redis, H54).
+    """
+    agg = request("POST", f"/{RESPONSES_PATTERN}/_search", {
+        "size": 0, "track_total_hits": True,
+        "query": _window_filter(since),
+        "aggs": {
+            "derivadas": {"filter": {"bool": {"filter": DERIVED_FILTER}},
+                          "aggs": {"ips": {"cardinality": {"field": "src_ip", "precision_threshold": 40000}}}},
+            "bloqueos": {"filter": ENFORCED_FILTER,
+                         "aggs": {"ips": {"cardinality": {"field": "src_ip", "precision_threshold": 40000}}}},
+        },
+    })
+    if agg is None:
+        return {"available": False}
+    a = agg.get("aggregations", {})
+    derived_docs = a.get("derivadas", {}).get("doc_count", 0)
+    out: dict[str, Any] = {
+        "available": True,
+        "ventana": {"desde": since.isoformat(), "hasta": now.isoformat()},
+        "ips_bloqueadas": a.get("bloqueos", {}).get("ips", {}).get("value", 0),
+        "acciones_de_bloqueo": a.get("bloqueos", {}).get("doc_count", 0),
+        "ips_derivadas": a.get("derivadas", {}).get("ips", {}).get("value", 0),
+        "decisiones_t3_derivadas": derived_docs,
+    }
+
+    # Destino de cada aprobación creada en la ventana.
+    fates: dict[str, set[str]] = {"aprobadas": set(), "rechazadas": set(), "expiradas": set(), "pendientes": set()}
+    sin_created_at = 0
+    events = _search_all(request, {"query": {"bool": {"filter": [
+        _window_filter(since),
+        {"terms": {"event_type": ["approval_expired", "manual_approval", "access"]}}]}},
+        "_source": ["event_type", "access_event", "trace_id", "payload"]})
+    if events is None:
+        return {**out, "conciliacion": {"available": False}}
+    for e in events:
+        p = e.get("payload") or {}
+        etype = e.get("event_type")
+        if etype == "approval_expired":
+            created, fate, tid = p.get("created_at"), "expiradas", e.get("trace_id")
+        elif etype == "manual_approval":
+            created, fate, tid = p.get("approval_created_at"), "aprobadas", e.get("trace_id")
+        elif etype == "access" and e.get("access_event") == "approval_rejected":
+            detail = p.get("detail") or {}
+            created, fate, tid = detail.get("approval_created_at"), "rechazadas", detail.get("trace_id") or e.get("trace_id")
+        else:
+            continue
+        ts = _parse_ts(created)
+        if ts is None:
+            sin_created_at += 1  # eventos previos a H57 sin created_at: no se pueden ubicar
+            continue
+        if ts >= since and tid:
+            fates[fate].add(tid)
+    pending_truncated = False
+    try:
+        pend = list_pending_approvals(rdb, limit=APPROVALS_MAX_LIMIT) if rdb is not None else []
+        pending_truncated = len(pend) >= APPROVALS_MAX_LIMIT
+        for ap in pend:
+            ts = _parse_ts(ap.get("created_at"))
+            if ts is not None and ts >= since and ap.get("trace_id"):
+                fates["pendientes"].add(ap["trace_id"])
+        pend_now = len(pend)
+    except (redis.RedisError, AttributeError) as e:
+        log.error(f"conciliación sin la foto de pendientes: {e}")
+        pend_now = None
+    ids = set().union(*fates.values())
+    by_fate = sum(len(v) for v in fates.values())
+
+    # Camino independiente: decisiones derivadas de la ventana que abrieron una aprobación.
+    by_docs = 0
+    id_list = sorted(ids)
+    for i in range(0, len(id_list), 10_000):
+        res = request("POST", f"/{RESPONSES_PATTERN}/_search", {
+            "size": 0, "track_total_hits": True,
+            "query": {"bool": {"filter": [_window_filter(since), *DERIVED_FILTER,
+                                          {"terms": {"trace_id": id_list[i:i + 10_000]}}]}}})
+        if res is None:
+            return {**out, "conciliacion": {"available": False}}
+        by_docs += res.get("hits", {}).get("total", {}).get("value", 0)
+
+    out["aprobaciones"] = {
+        "creadas_en_la_ventana": by_fate,
+        **{k: len(v) for k, v in fates.items()},
+        "recurrencias": derived_docs - by_docs,
+        "eventos_sin_created_at": sin_created_at,
+    }
+    out["pendientes_ahora"] = pend_now
+    out["pendientes_truncado"] = pending_truncated
+    out["conciliacion"] = {
+        "available": True,
+        "creadas_por_destino": by_fate,
+        "creadas_por_documentos": by_docs,
+        "cierra": by_fate == by_docs,
+        "diferencia": by_fate - by_docs,
+        "regla": ("creadas = aprobadas + rechazadas + expiradas + pendientes; "
+                  "creadas + recurrencias = decisiones T3 derivadas"),
+    }
+    return out
+
+
+# ── Tiempos de detección y respuesta (H57, d) ────────────────────────────────
+
+def _pctl(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    v = sorted(values)
+    return round(v[min(len(v) - 1, int(q * len(v)))], 2)
+
+
+def response_timings(since: datetime, request: OsRequest = _os_request) -> dict[str, Any]:
+    """MTTD y MTTR reducidos, desde soc-responses.
+
+    - detección a decisión: event_age_seconds (desde el flujo que detectó
+      Suricata hasta que el worker registra la decisión R1/R2), T2 y T3.
+    - decisión a bloqueo: entre el inicio del procesamiento (processed_at) y
+      el registro del bloqueo ejecutado, en los bloqueos automáticos.
+    - detección a bloqueo: event_age_seconds de los bloqueos automáticos.
+    - humano: desde que se abre una aprobación hasta que alguien la resuelve.
+      Solo desde H57 el evento de resolución guarda created_at.
+    """
+    res = request("POST", f"/{RESPONSES_PATTERN}/_search", {
+        "size": 0, "query": {"bool": {"filter": [_window_filter(since), {"term": {"event_type": "response"}},
+                                                 {"range": {"tier": {"gte": 2}}}]}},
+        "aggs": {"decision": {"percentiles": {"field": "event_age_seconds", "percents": [50, 95]}},
+                 "bloqueo": {"filter": {"term": {"block_enforced": True}},
+                             "aggs": {"p": {"percentiles": {"field": "event_age_seconds", "percents": [50, 95]}}}}}})
+    if res is None:
+        return {"available": False}
+    a = res.get("aggregations", {})
+    dec = a.get("decision", {}).get("values", {})
+    blk = a.get("bloqueo", {})
+    blocks = _search_all(request, {"query": {"bool": {"filter": [
+        _window_filter(since), {"term": {"event_type": "response"}}, {"term": {"block_enforced": True}}]}},
+        "_source": ["event_time", "payload.processed_at"]}, max_docs=50_000) or []
+    to_action = []
+    for d in blocks:
+        t_ev = _parse_ts(d.get("event_time"))
+        start = (d.get("payload") or {}).get("processed_at")
+        if t_ev is not None and isinstance(start, int | float):
+            to_action.append(max(0.0, t_ev.timestamp() - start))
+    human = []
+    resolved = _search_all(request, {"query": {"bool": {"filter": [
+        _window_filter(since), {"terms": {"event_type": ["manual_approval", "access"]}}]}},
+        "_source": ["event_type", "access_event", "event_time", "payload"]}) or []
+    for e in resolved:
+        p = e.get("payload") or {}
+        if e.get("event_type") == "manual_approval":
+            created = p.get("approval_created_at")
+        elif e.get("access_event") == "approval_rejected":
+            created = (p.get("detail") or {}).get("approval_created_at")
+        else:
+            continue
+        c, r = _parse_ts(created), _parse_ts(e.get("event_time"))
+        if c and r:
+            human.append((r - c).total_seconds())
+    return {
+        "available": True,
+        "deteccion_a_decision_s": {"p50": dec.get("50.0"), "p95": dec.get("95.0"),
+                                   "n": res.get("hits", {}).get("total", {}).get("value")},
+        "deteccion_a_bloqueo_s": {"p50": blk.get("p", {}).get("values", {}).get("50.0"),
+                                  "p95": blk.get("p", {}).get("values", {}).get("95.0"),
+                                  "n": blk.get("doc_count", 0)},
+        "decision_a_bloqueo_s": {"p50": _pctl(to_action, 0.5), "p95": _pctl(to_action, 0.95), "n": len(to_action)},
+        "humano_s": ({"p50": _pctl(human, 0.5), "p95": _pctl(human, 0.95), "n": len(human)} if human else
+                     {"p50": None, "p95": None, "n": 0,
+                      "detalle": "sin datos: no hubo aprobaciones resueltas por una persona con hora de "
+                                 "apertura registrada en la ventana (se registra desde H57)"}),
+    }
+
+
+# ── Integridad (H57, b) ──────────────────────────────────────────────────────
+
+AUDIT_VERIFY_JSON = Path(os.environ.get(
+    "AUDIT_VERIFY_JSON", str(Path.home() / "tesis" / "motor-runtime" / "audit" / "verify_chain_latest.json")))
+AUDIT_GAPS_YAML = Path(__file__).resolve().parent / "audit_gaps.yaml"
+
+
+def declared_gaps(path: Path = AUDIT_GAPS_YAML) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        log.error(f"huecos declarados no legibles ({path}): {e}")
+        return {"available": False, "gaps": []}
+    return {"available": True, "version": data.get("version"), "gaps": data.get("gaps", [])}
+
+
+def full_verification(path: Path = AUDIT_VERIFY_JSON) -> dict[str, Any]:
+    """Último informe de scripts/audit/verify_chain.py, si existe."""
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"available": False, "detail": "todavía no se corrió scripts/audit/verify_chain.py"}
+    except (OSError, ValueError) as e:
+        return {"available": False, "detail": f"informe no legible: {e}"}
+    return {"available": True, **report}
+
+
+def integrity_panel(chains_live: dict[str, Any]) -> dict[str, Any]:
+    """Combina la verificación completa (informe JSON), la de la cola en vivo
+    y los huecos declarados. "completa" solo si el informe cubrió todas las
+    cadenas nuevas sin abortar, sin problemas, y la cola en vivo también está
+    íntegra."""
+    full = full_verification()
+    live_ok = all(c.get("ok") is True for c in chains_live.get("chains", {}).values())
+    full_ok = full.get("available") and full.get("alcance") == "completa" and full.get("ok") is True
+    if full_ok and live_ok:
+        alcance = "completa"
+    elif full.get("available"):
+        alcance = "parcial"
+    else:
+        alcance = "solo_cola"
+    return {"alcance": alcance, "completa": full, "cola_en_vivo": chains_live, "huecos_declarados": declared_gaps()}
+
+
+# ── Historial diario (H57, f) ────────────────────────────────────────────────
+
+def daily_history(days: int = 30, request: OsRequest = _os_request, now: datetime | None = None) -> dict[str, Any]:
+    """Por día (hora de Chile), recalculado desde soc-responses sin guardar
+    nada: IPs distintas bloqueadas y derivadas a aprobación, su razón y las
+    expiradas, con los regímenes que tocan cada día (antes y después de un
+    corte no son el mismo sistema)."""
+    now = now or datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+    card = {"cardinality": {"field": "src_ip", "precision_threshold": 40000}}
+    res = request("POST", f"/{RESPONSES_PATTERN}/_search", {
+        "size": 0, "query": _window_filter(since),
+        "aggs": {"dia": {"date_histogram": {"field": "event_time", "calendar_interval": "1d",
+                                            "time_zone": TREND_TIME_ZONE, "min_doc_count": 0},
+                         "aggs": {"bloqueos": {"filter": ENFORCED_FILTER, "aggs": {"ips": card}},
+                                  "derivadas": {"filter": {"bool": {"filter": DERIVED_FILTER}}, "aggs": {"ips": card}},
+                                  "expiradas": {"filter": {"term": {"event_type": "approval_expired"}}}}}}})
+    if res is None:
+        return {"available": False}
+    rows = []
+    for b in res.get("aggregations", {}).get("dia", {}).get("buckets", []):
+        start = _parse_ts(b.get("key_as_string")) or datetime.fromtimestamp(b["key"] / 1000, timezone.utc)
+        blocked = b.get("bloqueos", {}).get("ips", {}).get("value", 0)
+        derived = b.get("derivadas", {}).get("ips", {}).get("value", 0)
+        rows.append({
+            "dia": start.date().isoformat(),
+            "ips_bloqueadas": blocked,
+            "ips_derivadas": derived,
+            "razon_bloqueo_sobre_derivacion": round(blocked / derived, 3) if derived else None,
+            "aprobaciones_expiradas": b.get("expiradas", {}).get("doc_count", 0),
+            "regimenes": [r["id"] for r in regimes_between(start, start + timedelta(days=1))],
+        })
+    return {"available": True, "zona_horaria": TREND_TIME_ZONE, "unidad": "IPs distintas por día", "dias": rows}
+
+
 # ── Checklist Ley 21.663 ─────────────────────────────────────────────────────
 
-def _item(iid: str, article: str, title: str, status: str, evidence: str, source: str) -> dict[str, str]:
+def _meta(ventana: str, unidad: str, fuente: str, actualizado: str, registros: str) -> dict[str, str]:
+    """Contexto de cada número: de qué ventana sale, en qué unidad, de qué
+    fuente, cuándo se calculó y dónde ver los registros que lo respaldan."""
+    return {"ventana": ventana, "unidad": unidad, "fuente": fuente, "actualizado": actualizado,
+            "registros": registros}
+
+
+def _item(iid: str, article: str, title: str, status: str, evidence: str, source: str,
+          meta: dict[str, str] | None = None) -> dict[str, Any]:
     return {"id": iid, "article": article, "title": title, "status": status,
-            "evidence": evidence, "source": source}
+            "evidence": evidence, "source": source, "meta": meta}
 
 
-def build_checklist(ctx: dict[str, Any]) -> list[dict[str, str]]:
-    """Obligaciones vs. evidencia del sistema. Función pura sobre `ctx`.
+def build_checklist(ctx: dict[str, Any]) -> list[dict[str, Any]]:
+    """Obligaciones vs. evidencia técnica de apoyo. Función pura sobre `ctx`.
 
-    Estados: "cumple" (evidencia automática suficiente), "parcial" (R-SOAR
-    aporta parte), "no_cubierto" (obligación que R-SOAR no atiende todavía),
-    "fuera_de_alcance" (organizacional, se gestiona fuera del sistema).
+    Estados: "cumple" (con evidencia técnica de apoyo), "con_observacion"
+    (hay evidencia pero algún componente está degradado: nunca "cumple" con
+    un nodo degradado), "parcial" (R-SOAR aporta parte), "no_cubierto"
+    (obligación que R-SOAR no atiende), "fuera_de_alcance" (organizacional).
+    Ningún estado es una declaración de cumplimiento legal.
     """
     stats, chains, resp = ctx["stats"], ctx["chains"], ctx["responses"]
     total = stats.get("total_decisiones") or 0
     nodes = ctx["nodes_overall"]
+    obs = ctx.get("node_observations") or []
+    when = ctx.get("generated_at", "")
+    win = ctx.get("window_label", "ventana móvil")
+    oiv = ctx.get("organizacion_es_oiv")
+    oiv_note = ("La organización se declaró operador de importancia vital: este literal aplica."
+                if oiv is True else "Aplica solo si la organización es operador de importancia vital."
+                if oiv is None else "La organización declaró no ser operador de importancia vital.")
     items = []
 
-    if stats.get("available") and total > 0 and nodes != "down":
-        status, ev = "cumple", (f"{_n(total)} decisiones en la ventana; latencia p95 del Fast Path "
-                                f"{stats.get('latencia_p95_ms')} ms; estado de nodos: {nodes}.")
-    elif stats.get("available"):
-        status, ev = "parcial", f"Sin decisiones en la ventana o nodos caídos (estado: {nodes})."
+    meta = _meta(win, "decisiones del Fast Path, todos los tiers; latencia en ms",
+                 "soc-decisions,soc-decisions-* (timestamp, latency_ms) y estado de nodos",
+                 when, "#nodos")
+    if stats.get("available") and total > 0 and nodes == "ok":
+        status = "cumple"
+    elif stats.get("available") and total > 0 and nodes != "down":
+        status = "con_observacion"
     else:
-        status, ev = "parcial", "OpenSearch no respondió: no se pudo medir el monitoreo."
-    items.append(_item("monitoreo", "Art. 8 d)", "Revisión y análisis continuo de redes y sistemas", status, ev, "automático"))
+        status = "parcial"
+    ev = (f"{_n(total)} decisiones en la ventana; latencia interna del Fast Path p95 "
+          f"{stats.get('latencia_p95_ms')} ms (procesamiento del motor, sin red ni Vector; percentil "
+          f"aproximado de OpenSearch); estado de nodos: {nodes}. R-SOAR cubre el análisis continuo: "
+          "ejercicios, simulacros y la comunicación de amenazas al CSIRT Nacional quedan fuera del sistema."
+          if stats.get("available") else "OpenSearch no respondió: no se pudo medir el monitoreo.")
+    if obs:
+        ev += " Observaciones: " + " ".join(obs)
+    items.append(_item("monitoreo", "Art. 8 d)", "Revisión, ejercicios, simulacros y análisis continuo de redes "
+                       "y sistemas", status, ev + " " + oiv_note, "automático", meta))
 
+    integ = ctx.get("integrity") or {}
     resp_ok, dec_ok = chains["responses"].get("ok"), chains["decisions"].get("ok")
     ism = ctx["ism"]
     if resp_ok and dec_ok and all(ism.values()):
@@ -249,52 +639,113 @@ def build_checklist(ctx: dict[str, Any]) -> list[dict[str, str]]:
         status = "no_cubierto"
     else:
         status = "parcial"
-    ev = (f"Cadena de respuestas: {'íntegra' if resp_ok else 'con problemas' if resp_ok is False else 'sin dato'}; "
-          f"cadena de decisiones: {'íntegra' if dec_ok else 'con problemas' if dec_ok is False else 'sin dato'} "
-          f"(últimos {_n(ctx['tail_size'])} eslabones de cada una). Retención ISM: "
-          + ", ".join(f"{k} {'activa' if v else 'ausente'}" for k, v in ism.items()) + ".")
-    items.append(_item("registro", "Art. 8 b)", "Registro de las acciones ejecutadas",
-                       status, ev, "automático"))
+    full = integ.get("completa") or {}
+    full_txt = (f"verificación completa {full.get('alcance')} del {full.get('generated_at', '')[:16]} "
+                f"({'íntegra' if full.get('ok') else 'con problemas o abortada'})"
+                if full.get("available") else "sin verificación completa registrada")
+    gaps = (integ.get("huecos_declarados") or {}).get("gaps", [])
+    ev = (f"Cola en vivo: respuestas {'íntegra' if resp_ok else 'con problemas' if resp_ok is False else 'sin dato'}, "
+          f"decisiones {'íntegra' if dec_ok else 'con problemas' if dec_ok is False else 'sin dato'} "
+          f"(últimos {_n(ctx['tail_size'])} eslabones de cada una); {full_txt}; "
+          f"{len(gaps)} huecos declarados ({', '.join(g.get('id', '') for g in gaps)}). Retención ISM: "
+          + ", ".join(f"{k} {'activa' if v else 'ausente'}" for k, v in ism.items()) + ". "
+          + oiv_note)
+    items.append(_item("registro", "Art. 8 b)", "Registro de las acciones ejecutadas", status, ev, "automático",
+                       _meta("cola: últimos eslabones al momento; completa: según el informe",
+                             "eslabones de las cadenas hash", "soc-responses-*, soc-decisions-*, "
+                             "scripts/audit/verify_chain.py, motor/audit_gaps.yaml", when, "#auditoria")))
 
-    roles = ctx["users_by_role"]
+    roles, ustat = ctx["users_by_role"], ctx.get("users_index") or {"reliable": True}
     accesos = sum((resp.get("accesos") or {}).values()) if resp.get("available") else None
-    status = "cumple" if roles.get("CISO", 0) >= 1 and resp.get("available") else "parcial"
-    ev = (f"Usuarios activos por rol: N1 {roles.get('N1', 0)}, N2 {roles.get('N2', 0)}, CISO {roles.get('CISO', 0)}; "
-          f"{ctx['active_sessions']} sesiones activas; "
-          + (f"{accesos} eventos de acceso registrados en la cadena." if accesos is not None
-             else "registro de accesos no disponible."))
-    items.append(_item("acceso", "Art. 7", "Medidas permanentes de prevención: control de acceso y trazabilidad",
-                       status, ev, "automático"))
+    if not ustat.get("reliable", True):
+        users_txt = f"usuarios y sesiones: dato no confiable ({ustat.get('reason')})"
+    else:
+        users_txt = (f"usuarios activos por rol: N1 {roles.get('N1', 0)}, N2 {roles.get('N2', 0)}, "
+                     f"CISO {roles.get('CISO', 0)}; {ctx['active_sessions']} sesiones activas")
+    ev = (f"R-SOAR aporta control de acceso por rol y trazabilidad: {users_txt}; "
+          + (f"{accesos} eventos de acceso registrados en la cadena en la ventana. " if accesos is not None
+             else "registro de accesos no disponible. ")
+          + "Las medidas para prevenir, reportar y resolver incidentes son más amplias que el sistema.")
+    items.append(_item("acceso", "Art. 7", "Deberes generales: medidas permanentes para prevenir, reportar y "
+                       "resolver incidentes", "parcial", ev, "automático",
+                       _meta(win + " (eventos de acceso); usuarios y sesiones: foto actual",
+                             "usuarios, sesiones vigentes, eventos de acceso",
+                             "Redis soc:users:index y soc:sessions:*; soc-responses-* (event_type access)",
+                             when, "#usuarios")))
 
-    acciones = resp.get("acciones") or {}
-    ejecutadas = acciones.get("ejecutadas_auto", 0) + acciones.get("ejecutadas_manual", 0)
+    rec = ctx.get("reconciliation") or {}
     mode = ctx["response_mode"]
     if mode != "enforce":
-        status, ev = "parcial", (f"Respuesta activa en modo {mode}: R2 registra los bloqueos pero no los ejecuta. "
-                                 f"{ctx['pending_approvals']} aprobaciones pendientes.")
+        status, ev = "parcial", f"Respuesta activa en modo {mode}: R2 registra los bloqueos pero no los ejecuta."
+    elif not rec.get("available"):
+        status, ev = "parcial", "OpenSearch no respondió: sin datos de respuesta."
     else:
-        status = "cumple" if resp.get("available") else "parcial"
-        ev = (f"{ejecutadas} bloqueos ejecutados, {acciones.get('derivadas_aprobacion', 0)} derivados a aprobación, "
-              f"{acciones.get('expiradas', 0)} expirados sin resolver, {ctx['pending_approvals']} pendientes ahora.")
-    items.append(_item("respuesta", "Art. 8 e)", "Medidas oportunas para reducir impacto y propagación",
-                       status, ev, "automático"))
+        apr = rec.get("aprobaciones") or {}
+        conc = rec.get("conciliacion") or {}
+        status = "cumple" if conc.get("cierra", False) else "con_observacion"
+        ev = (f"En la ventana: {_n(rec['ips_bloqueadas'])} IPs distintas bloqueadas "
+              f"({_n(rec['acciones_de_bloqueo'])} acciones de bloqueo, incluye re-bloqueos al vencer el TTL); "
+              f"{_n(rec['ips_derivadas'])} IPs distintas derivadas a aprobación "
+              f"({_n(rec['decisiones_t3_derivadas'])} decisiones T3). Aprobaciones creadas: "
+              f"{_n(apr.get('creadas_en_la_ventana', 0))} (aprobadas {apr.get('aprobadas', 0)}, rechazadas "
+              f"{apr.get('rechazadas', 0)}, expiradas {apr.get('expiradas', 0)}, pendientes "
+              f"{apr.get('pendientes', 0)}); recurrencias sumadas a aprobaciones abiertas: "
+              f"{_n(apr.get('recurrencias', 0))}. ")
+        ev += ("La conciliación cierra." if conc.get("cierra") else
+               f"La conciliación NO cierra: {conc.get('diferencia')} aprobaciones de diferencia entre el "
+               "destino y los documentos." if conc.get("available") else "Conciliación no disponible.")
+        ev += f" Foto actual: {rec.get('pendientes_ahora', 'sin dato')} aprobaciones pendientes."
+    items.append(_item("respuesta", "Art. 8 e)", "Medidas oportunas para reducir el impacto y la propagación",
+                       status, ev + " " + oiv_note, "automático",
+                       _meta(win + "; pendientes: foto actual",
+                             "IPs distintas; decisiones T3; aprobaciones (una por IP abierta)",
+                             "soc-responses-* (response, manual_approval, approval_expired, access) y Redis "
+                             "soc:approvals:pending", when, "#aprobaciones")))
 
-    items.append(_item("alerta_temprana", "Art. 9 a)", "Alerta temprana al CSIRT Nacional (plazo de 3 h)",
+    items.append(_item("alerta_temprana", "Art. 9 a); DS 295 art. 9",
+                       "Alerta temprana al CSIRT Nacional: 3 h desde el conocimiento del incidente",
                        "no_cubierto",
-                       "R-SOAR no genera ni envía el reporte a la ANCI. Las alertas T3 de la vista "
-                       "Operativa son el insumo para evaluar si un incidente es reportable.", "pendiente"))
-    items.append(_item("informes", "Art. 9 b) y c)", "Actualización (72 h; 24 h si es OIV con servicio "
-                       "esencial afectado), informe final (15 días) y plan de acción OIV (7 días)",
-                       "no_cubierto", "Generador de reporte ANCI y exportación a PDF pendientes.", "pendiente"))
+                       "R-SOAR no genera ni envía reportes a la ANCI. Las decisiones T3 corroboradas son insumo "
+                       "para que la organización evalúe si hay un incidente con impacto significativo; el "
+                       "conocimiento del incidente lo determina la organización.", "pendiente"))
+    items.append(_item("segundo_reporte", "Art. 9 b); DS 295 art. 10",
+                       "Segundo reporte: 72 h desde el conocimiento; 24 h si es OIV con servicio esencial afectado",
+                       "no_cubierto", "Generador de reportes pendiente. El plazo de 24 h aplica solo a operadores "
+                       "de importancia vital.", "pendiente"))
+    items.append(_item("informe_final", "Art. 9 c); DS 295 arts. 12 y 13",
+                       "Informe final: 15 días corridos desde el envío de la alerta temprana; informes parciales "
+                       "cada 15 días mientras no esté gestionado", "no_cubierto",
+                       "Generador de reportes y exportación pendientes (PDF en el roadmap).", "pendiente"))
+    items.append(_item("plan_accion", "Art. 9, párrafo final; DS 295 art. 11",
+                       "Plan de acción del OIV: hasta 7 días corridos desde el conocimiento del incidente",
+                       "no_cubierto", "Aplica solo a operadores de importancia vital; no lo produce R-SOAR.",
+                       "pendiente"))
     items.append(_item("sgsi", "Art. 8 a)", "Sistema de gestión de seguridad de la información (SGSI)",
-                       "parcial", "R-SOAR aporta evidencia operativa y de auditoría; políticas, "
-                       "revisiones y certificación del SGSI se gestionan fuera del sistema.", "manual"))
+                       "parcial", "R-SOAR aporta evidencia operativa y de auditoría; políticas, revisiones y "
+                       "certificación del SGSI se gestionan fuera del sistema.", "manual"))
     items.append(_item("continuidad", "Art. 8 c)", "Planes de continuidad operacional y ciberseguridad",
                        "fuera_de_alcance", "Planes certificados (Art. 28) y revisados al menos cada dos años; "
                        "no los produce R-SOAR.", "manual"))
+    items.append(_item("certificaciones", "Art. 8 f)", "Certificaciones del Art. 28", "fuera_de_alcance",
+                       "Gestión organizacional; R-SOAR no las emite ni las registra.", "manual"))
+    items.append(_item("afectados", "Art. 8 g)", "Informar a los potenciales afectados cuando lo requiera la Agencia",
+                       "fuera_de_alcance", "Comunicación organizacional; R-SOAR no la realiza.", "manual"))
+    items.append(_item("capacitacion", "Art. 8 h)", "Capacitación y educación continua de trabajadores y "
+                       "colaboradores", "fuera_de_alcance", "Programa organizacional; no lo gestiona R-SOAR.",
+                       "manual"))
     items.append(_item("delegado", "Art. 8 i)", "Delegado de ciberseguridad designado",
                        "fuera_de_alcance", "Designación organizacional; no la registra R-SOAR.", "manual"))
     return items
+
+
+def coverage_summary(items: list[dict[str, Any]], generated_at: str) -> dict[str, Any]:
+    """Cobertura sobre lo que corresponde al sistema: no cuenta "fuera del sistema"."""
+    system = [i for i in items if i["status"] != "fuera_de_alcance"]
+    counts: dict[str, int] = {}
+    for i in system:
+        counts[i["status"]] = counts.get(i["status"], 0) + 1
+    return {"obligaciones_del_sistema": len(system), "por_estado": counts,
+            "fuera_del_sistema": len(items) - len(system), "generado": generated_at}
 
 
 def _users_by_role(rdb: redis.Redis | None) -> dict[str, int]:
@@ -305,68 +756,99 @@ def _users_by_role(rdb: redis.Redis | None) -> dict[str, int]:
     return counts
 
 
-def compliance_report(window_minutes: int, nodes_overall: str, rdb: redis.Redis | None = None,
-                      request: OsRequest = _os_request) -> dict[str, Any]:
-    """Reporte CISO: métricas de valor (sección 7, Fase 1) + checklist.
+WINDOW_LABELS = {1440: "ventana móvil de 24 h", 10_080: "ventana móvil de 7 días", 43_200: "ventana móvil de 30 días"}
+
+
+def compliance_report(window_minutes: int, nodes: dict[str, Any] | str, rdb: redis.Redis | None = None,
+                      request: OsRequest = _os_request, current_username: str | None = None) -> dict[str, Any]:
+    """Reporte CISO: métricas de valor + checklist con evidencia técnica de apoyo.
 
     Args:
         window_minutes: ventana hacia atrás desde ahora.
-        nodes_overall: estado consolidado de system_status (lo pasa el endpoint).
+        nodes: estado de system_status.get_node_status() (o solo el "overall").
         rdb: Redis (tests).
         request: cliente OpenSearch inyectable (tests).
+        current_username: usuario que consulta (chequeo del índice de usuarios).
 
     Returns:
-        Reporte con métricas, checklist y nota legal. Cada fuente que falla
-        queda marcada como no disponible; el reporte se arma igual.
+        Reporte con resumen, métricas, conciliación, tiempos, integridad,
+        historial y checklist. Cada fuente que falla queda marcada como no
+        disponible; el reporte se arma igual.
     """
     rdb = rdb or _get_redis()
-    since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    nodes = nodes if isinstance(nodes, dict) else {"overall": nodes, "components": []}
+    now = datetime.now(timezone.utc)
+    generated_at = now.isoformat()
+    since = now - timedelta(minutes=window_minutes)
     stats = get_stats(window_minutes)
     precision = get_precision_stats(window_minutes)
     total = stats.get("total_decisiones") or 0
     por_decision = stats.get("por_decision", {})
     auto_resuelto = sum(v for k, v in por_decision.items() if k in ("ALLOW", "LOG"))
+    settings = get_settings()
 
     try:
-        pending = pending_approvals_page(rdb, 1, ttl_seconds=get_settings().approval_ttl_seconds)
-        pending_total = pending["total"] if pending["available"] else None
-        by_role = _users_by_role(rdb)
-        active_sessions = len(sess.list_all_sessions(rdb))
-    except redis.RedisError as e:
-        log.error(f"reporte de cumplimiento sin datos de Redis: {e}")
-        pending_total, by_role, active_sessions = None, {"N1": 0, "N2": 0, "CISO": 0}, 0
+        ustat = users.users_index_status(current_username, rdb)
+        by_role = _users_by_role(rdb) if ustat["reliable"] else None
+        active_sessions = len(sess.list_all_sessions(rdb)) if ustat["reliable"] else None
+    except (redis.RedisError, AttributeError) as e:
+        log.error(f"reporte de cumplimiento sin datos de usuarios: {e}")
+        ustat, by_role, active_sessions = {"reliable": False, "reason": "Redis no respondió"}, None, None
 
     chains = audit_view.chain_status(request=request)
     responses = response_counts(since, request)
+    shards = shards_diagnosis(request) if nodes.get("overall") != "ok" else {"available": False}
+    reconciliation = approvals_reconciliation(since, now, rdb, request)
+    regime = regime_at(now)
+    pv = policy_version(settings)
+    integrity = integrity_panel(chains)
+    timings = response_timings(since, request)
     ctx = {"stats": stats, "chains": chains["chains"], "tail_size": chains["tail_size"],
-           "responses": responses, "ism": ism_policies_present(request), "nodes_overall": nodes_overall,
-           "users_by_role": by_role, "active_sessions": active_sessions,
-           "pending_approvals": pending_total if pending_total is not None else "sin dato",
-           "response_mode": getattr(get_settings().response_mode, "value", str(get_settings().response_mode))}
+           "responses": responses, "ism": ism_policies_present(request), "nodes_overall": nodes.get("overall"),
+           "node_observations": _node_observations(nodes, shards),
+           "users_by_role": by_role or {}, "users_index": ustat,
+           "active_sessions": active_sessions if active_sessions is not None else "sin dato",
+           "reconciliation": reconciliation, "integrity": integrity,
+           "generated_at": generated_at, "window_label": WINDOW_LABELS.get(window_minutes, f"ventana de {window_minutes} min"),
+           "organizacion_es_oiv": getattr(settings, "organizacion_es_oiv", None),
+           "response_mode": getattr(settings.response_mode, "value", str(settings.response_mode))}
+    checklist = build_checklist(ctx)
     return {
         "window_minutes": window_minutes,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
+        "policy_version": pv,
+        "regime": regime,
+        "regimes_in_window": regimes_between(since, now),
+        "resumen": coverage_summary(checklist, generated_at),
         # Campos del stub original (compatibles).
         "fatiga_alertas_pct": round(100 * auto_resuelto / total, 1) if total else None,
         "latencia_avg_ms": stats.get("latencia_avg_ms"),
         "latencia_p95_ms": stats.get("latencia_p95_ms"),
+        "latencia_descripcion": ("Latencia interna del Fast Path: procesamiento del motor, sin red ni Vector; "
+                                 "ventana móvil; percentil aproximado de OpenSearch."),
         "precision_bloqueos": precision,
-        # Reemplaza a precision_bloqueos en la vista (H52/H53, modo sombra).
         "corroboracion_sombra": corroboration_shadow(since, request),
-        # H43.
         "decisiones": {"available": stats.get("available", False), "total": total,
                        "por_tier": stats.get("por_tier", {})},
         "respuestas": responses,
-        "aprobaciones_pendientes": pending_total,
+        "conciliacion_aprobaciones": reconciliation,
+        "tiempos": timings,
+        "integridad": integrity,
+        "historial_diario": daily_history(30, request, now=now),
+        "nodos": {"overall": nodes.get("overall"), "observaciones": ctx["node_observations"], "shards": shards},
+        "aprobaciones_pendientes": reconciliation.get("pendientes_ahora"),
         "usuarios_por_rol": by_role,
+        "indice_usuarios": ustat,
         "sesiones_activas": active_sessions,
         "response_mode": ctx["response_mode"],
+        "organizacion_es_oiv": ctx["organizacion_es_oiv"],
         "cadenas": chains,
-        "checklist": build_checklist(ctx),
-        "mttr_humano": {"available": False,
-                        "detail": "No medido todavía: el evento de resolución no registra cuándo se abrió la aprobación."},
+        "checklist": checklist,
+        "mttr_humano": {"available": (timings.get("humano_s") or {}).get("n", 0) > 0,
+                        "detail": "Ver tiempos.humano_s: se mide desde H57 con la hora de apertura de la aprobación."},
         "nota_legal": LEGAL_NOTE,
-        "exportacion_pdf": {"available": False, "detail": "Pendiente: no implementado en esta versión."},
+        "nota_alcance": SCOPE_NOTE,
+        "exportacion_pdf": {"available": False, "detail": "Pendiente: en docs/ROADMAP_2027.md."},
     }
 
 

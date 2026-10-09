@@ -248,6 +248,10 @@ def _ctx(**over):
         "ism": {"soc-decisions-retention": True, "soc-responses-retention": True},
         "nodes_overall": "ok", "users_by_role": {"N1": 2, "N2": 1, "CISO": 1}, "active_sessions": 2,
         "pending_approvals": 5, "response_mode": "enforce",
+        "reconciliation": {"available": True, "ips_bloqueadas": 3, "acciones_de_bloqueo": 4, "ips_derivadas": 2,
+                           "decisiones_t3_derivadas": 7, "pendientes_ahora": 1,
+                           "aprobaciones": {"creadas_en_la_ventana": 2, "expiradas": 1, "pendientes": 1, "recurrencias": 5},
+                           "conciliacion": {"available": True, "cierra": True, "diferencia": 0}},
     }
     base.update(over)
     return base
@@ -262,11 +266,13 @@ class TestChecklist:
         items = self._by_id(_ctx())
         assert items["monitoreo"]["status"] == "cumple" and "12.000 decisiones" in items["monitoreo"]["evidence"]
         assert items["registro"]["status"] == "cumple"
-        assert items["acceso"]["status"] == "cumple"
+        # H57: el Art. 7 son deberes generales, más amplios que el control de acceso.
+        assert items["acceso"]["status"] == "parcial"
         assert items["respuesta"]["status"] == "cumple"
         # Lo que R-SOAR no hace nunca aparece como cumplido.
         assert items["alerta_temprana"]["status"] == "no_cubierto"
-        assert items["informes"]["status"] == "no_cubierto"
+        assert items["segundo_reporte"]["status"] == "no_cubierto"
+        assert items["informe_final"]["status"] == "no_cubierto"
         assert items["continuidad"]["status"] == "fuera_de_alcance"
 
     def test_cadena_rota_no_cumple(self) -> None:

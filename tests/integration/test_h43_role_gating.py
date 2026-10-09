@@ -63,7 +63,7 @@ def env(monkeypatch, mocker):
                         lambda trace_id, include_access: {"trace_id": trace_id, "include_access": include_access})
     monkeypatch.setattr(audit_view, "chain_status", lambda: {"chains": {}})
     monkeypatch.setattr(audit_view, "access_events", lambda limit, username: {"available": True, "items": []})
-    monkeypatch.setattr(compliance, "compliance_report", lambda w, n: {"checklist": []})
+    monkeypatch.setattr(compliance, "compliance_report", lambda w, n, **kw: {"checklist": []})
     monkeypatch.setattr(compliance, "get_trends", lambda days: {"days": days})
 
     tokens = {}

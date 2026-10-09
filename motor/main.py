@@ -589,6 +589,8 @@ def dashboard_resolve_approval(
                 "enforced": enforced,
                 "error": error,
                 "at": datetime.now(timezone.utc).isoformat(),
+                # H57: con la hora de apertura se mide el tiempo humano de respuesta.
+                "approval_created_at": approval.get("created_at"),
             }
             rdb.xadd("soc:response:audit", {"data": json.dumps(audit_payload)},
                      maxlen=100_000, approximate=True)
@@ -598,7 +600,8 @@ def dashboard_resolve_approval(
                           {"trace_id": trace_id, "src_ip": approval["src_ip"], "enforced": enforced})
         resolved["enforced"] = enforced
     else:
-        log_access_event(user.username, "approval_rejected", {"trace_id": trace_id})
+        log_access_event(user.username, "approval_rejected",
+                         {"trace_id": trace_id, "approval_created_at": approval.get("created_at")})
 
     return resolved
 
@@ -738,7 +741,7 @@ def dashboard_compliance(
     evidencia real de cada obligación (compliance.py). Conserva los campos
     del stub original (fatiga, latencias, precisión)."""
     nodes = get_node_status()
-    return compliance.compliance_report(window_minutes, nodes["overall"])
+    return compliance.compliance_report(window_minutes, nodes, current_username=user.username)
 
 
 @app.get("/api/v1/dashboard/trends")
