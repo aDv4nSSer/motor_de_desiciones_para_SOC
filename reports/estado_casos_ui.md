@@ -119,15 +119,15 @@ Lectura: la cola no es diversa. Casi 4 de cada 5 IPs esperan aprobación porque 
 
 Archivos: `d_cola_por_red24.csv`, `d_cola_ips.csv`, `d_hermanas_top5.csv`.
 
-## 4. Plan de deploy (no ejecutado; cada paso con tu OK)
+## 4. Plan de deploy final (no ejecutado; cada paso con tu OK)
 
-**Cuándo:** el 11-oct después de verificar el reentrenamiento del IF de las 04:00 (corpus `2026-06-20 13:52`, hash `4958eb4b`), si a mediodía la revisión de `55f4b7b` está aprobada. Si no, todo el paquete el 12-oct antes de las 18:00. Es un **evento**, no un corte de régimen: no cambia ninguna decisión.
+**Cuándo:** el 11-oct después de verificar el reentrenamiento del IF de las 04:00 (corpus `2026-06-20 13:52`, hash `4958eb4b`) y si a mediodía tu revisión de `55f4b7b` y `fa273ad` está aprobada. Si no, todo el paquete el 12-oct antes de las 18:00. Es un **evento**, no un corte de régimen: no cambia ninguna decisión, no se toca `response-worker` ni los indexadores y el `.env` no cambia.
 
-**Qué entra:** `develop` pasa de `43a62bd` a la punta de `feature/casos-ui` (fast-forward). Incluye cumplimiento (H57 a H59), explicabilidad (H59) y casos (H60). 51 archivos, +5.357 / −172.
+**Orden de merge a develop.** Las tres ramas son una cadena lineal (`cumplimiento` ⊂ `explicabilidad` ⊂ `casos-ui`), así que **un solo push** fast-forward de `feature/casos-ui` a `develop` las trae en orden; no hay merges separados. `develop` pasa de `43a62bd` a la punta de `feature/casos-ui` (53 archivos de H57 a H60). Si D2 entra antes (`27830f2` sobre `43a62bd`), primero `git rebase origin/develop` en `feature/casos-ui` y repetir la suite; D2 rebasada no tuvo conflictos con cumplimiento y explicabilidad (849 passed en la prueba descartable). `main` no se toca.
 
-**Diff exacto** (reproducible; no se versiona como `.patch` porque el pre-commit le quitaría los espacios finales):
-- Backend contra producción: `git diff 43a62bd..feature/casos-ui -- motor/` (8 archivos: `audit_gaps.yaml`, `compliance.py`, `dashboard.py`, `explain.py`, `main.py`, `regimes.py`, `response/config.py`, `users.py`; 1.728 líneas de diff).
-- Solo H60: `git diff 9a01771..feature/casos-ui -- motor/` (`dashboard.py` y `main.py`, 366 líneas).
+**Diff exacto** (reproducible):
+- Backend contra producción: `git diff 43a62bd..feature/casos-ui -- motor/` (`audit_gaps.yaml`, `compliance.py`, `dashboard.html`, `dashboard.py`, `explain.py`, `main.py`, `regimes.py`, `response/config.py`, `users.py`). `response/config.py` solo suma `organizacion_es_oiv`, que lee Cumplimiento.
+- Solo H60: `git diff 9a01771..feature/casos-ui -- motor/`.
 - Frontend: `git diff 9a01771..feature/casos-ui -- frontend/`.
 
 **Comandos, en orden:**
@@ -135,39 +135,44 @@ Archivos: `d_cola_por_red24.csv`, `d_cola_ips.csv`, `d_hermanas_top5.csv`.
 ```bash
 # 0. Mac, worktree de casos-ui
 cd ~/DevProjects/motor_soc_casos_ui
-git fetch origin && git log --oneline -1 origin/develop        # 43a62bd; si D2 entró (27830f2): git rebase origin/develop y repetir 1
-# 1. suites
-../motor_de_desiciones_para_SOC/.venv/bin/python -m pytest -q   # 860 passed esperados
-(cd frontend/operativo && npx tsc -b && npm test)               # 56 passed
-# 2. push (fast-forward, sin merge)
-git push origin feature/casos-ui:develop
+git fetch origin && git log --oneline -1 origin/develop         # 43a62bd (si no: rebase, ver arriba)
+# 1. suites en verde antes de empujar
+../motor_de_desiciones_para_SOC/.venv/bin/python -m pytest -q    # 898 passed
+(cd frontend/operativo && npx tsc -b && npm test)                # 56 passed
+# 2. un push fast-forward, y develop local al día
+git push origin feature/casos-ui:develop && git branch -f develop feature/casos-ui
 # 3. .140, UNA conexión: anotar el bundle vigente y traer el código
 ssh motor140 'cd ~/tesis/repo && ls motor/static/operativo/assets/index-*.js && git status -sb && git pull --ff-only && git log --oneline -1'
 # 4. .140: restart PRIMERO (lo ejecutás vos). ~15 s sin Fast Path
 date '+%F %T %z'; sudo systemctl restart motor-soc; date '+%F %T %z'
-# 5. comprobar el backend nuevo antes del bundle (sin SSH)
+# 5. verificar el backend nuevo ANTES del bundle (sin SSH)
 curl -s https://motor-soc-ubo.duckdns.org/health
-curl -s -o /dev/null -w '%{http_code}\n' https://motor-soc-ubo.duckdns.org/api/v1/dashboard/cases/page   # 401 (existe), no 404
+curl -s -o /dev/null -w '%{http_code}\n' https://motor-soc-ubo.duckdns.org/api/v1/dashboard/cases/page   # 401 (la ruta existe); 404 = backend viejo: parar
 # 6. Mac: recién ahora el bundle (tests, build y copia atómica; deja operativo.prev). UNA conexión
 scripts/deploy_operativo.sh
 ```
 
-**Orden: backend primero, bundle después** (corregido por la revisión independiente). El backend nuevo es compatible hacia atrás: el bundle de `43a62bd` no llama a ningún endpoint nuevo de casos y `GET /cases` no cambió. Al revés no: con el bundle nuevo sobre el backend viejo, Casos, la traza y el CSV darían 404 hasta el restart, y Cumplimiento probablemente no calzaría con el `compliance_report` viejo.
+**Por qué backend primero.** El backend nuevo es compatible hacia atrás: el bundle viejo no llama a ningún endpoint nuevo y `GET /cases` no cambió. Al revés, el bundle nuevo sobre el backend viejo da 404 en Casos, la traza y el CSV, y Cumplimiento no calzaría con el `compliance_report` viejo.
 
-`response-worker` y los indexadores **no** se reinician. El `.env` no cambia.
+**Verificaciones.**
 
-**Verificaciones (+2 min, una conexión SSH más el dominio público):**
-1. `curl -s https://motor-soc-ubo.duckdns.org/health`: `status` ok y el modelo real cargado.
-2. En `.140`: `ps -o lstart= -p $(systemctl show -p MainPID --value motor-soc)` posterior al restart; `git log --oneline -1` es la punta de casos-ui; `INFO stats` de Redis: `evicted_keys` sigue en 72.205.
-3. En el navegador, como `aiayala` (CISO): Casos carga la lista (índice de recientes alrededor de 12.000), el detalle muestra la traza y Alertas muestra "Ya bloqueada (TTL extendido)" en algún T3. No cerrar casos de prueba: un cierre es evidencia permanente.
-4. Fast Path: en la hora siguiente, decisiones por hora y tier sin salto (`extraer_metricas.py`); sin decisiones solo durante el restart. Registrar la hora real y los segundos sin Fast Path en PENDIENTES §6.
+| Cuándo | Qué | Cómo |
+|---|---|---|
+| +2 min | Backend vivo y nuevo | `/health` ok con el modelo real; `ps -o lstart=` del PID de `motor-soc` posterior al restart; `git log -1` es la punta; `evicted_keys` sigue en 72.205 |
+| +2 min | Bundle | Como `aiayala` (CISO): Casos carga, el detalle muestra la traza y los eslabones, Alertas muestra "Ya bloqueada (TTL extendido)" en algún T3. **No cerrar casos de prueba**: un cierre es evidencia permanente |
+| **+10 min** | Fast Path y worker intactos | Decisiones por hora y tier sin salto (`extraer_metricas.py`; sin decisiones solo durante el restart); `AbuseIPDB API tier=3` sigue y `tier=2` en 0; 0 HTTP 429; lag del indexador 0; sin errores nuevos en el log de `motor-soc` |
+| **+10 min** | Casos | Primera lista con índice de recientes ~12.000; un N1 intentando cerrar por la API recibe 403 y queda `action_denied_role` en `soc-responses-*` |
+| **+60 min** | Redis y latencia | `used_memory` estable (~860 MB de 1,5 GB), `evicted_keys` 72.205, sin SSCAN/KEYS nuevos; p95 del Fast Path igual al de los días previos (57 a 60 ms) |
+| **+60 min** | Cadena | `verify_chain.py` íntegra; si alguien cerró un caso real, existe su `case_state_changed` con el hash de la nota |
+| +60 min | Registro | Anotar la hora real del restart y los segundos sin Fast Path en PENDIENTES §6 |
 
-**Rollback:**
-- Solo frontend: `scripts/deploy_operativo.sh --rollback` (vuelve a `operativo.prev`, sin restart). `operativo.prev` guarda una sola versión: un segundo deploy la pisa.
-- Backend: en `.140`, `git switch --detach 43a62bd` y `sudo systemctl restart motor-soc`. El destino es el último commit con el formato de cadena vigente; los indexadores no cambiaron. Los casos tocados después del deploy conservan su estado (mismo esquema) y `soc:cases:worked` queda sin lector, sin efecto. Después, `git switch develop` antes del próximo `git pull` (en HEAD desacoplado, el pull falla). Volver a `43a62bd` quita el control de rol de los casos.
-- Ambos: **primero el bundle y después el backend** (al revés quedaría el bundle nuevo contra el backend viejo).
+**Rollback, en orden inverso al deploy** (primero el bundle, después el backend; al revés quedaría el bundle nuevo contra el backend viejo):
+1. Bundle: `scripts/deploy_operativo.sh --rollback` (vuelve a `operativo.prev`, sin restart). `operativo.prev` guarda una sola versión: un segundo deploy la pisa.
+2. Backend: en `.140`, `git switch --detach 43a62bd` y `sudo systemctl restart motor-soc`. El destino es el último commit con el formato de cadena vigente; los indexadores no cambiaron. Los casos tocados conservan su estado (mismo esquema) y `soc:cases:worked` queda sin lector. Volver a `43a62bd` quita el control de rol de los casos.
+3. Después, `git switch develop` antes del próximo `git pull` (en HEAD desacoplado el pull falla), y anotar el evento.
+4. Si falla solo el bundle: solo el paso 1, el backend nuevo se queda.
 
-## 5. Revisión independiente de `55f4b7b` (agente sin contexto de la implementación)
+## 5. Revisión independiente de `55f4b7b` y de `fa273ad` (agente sin contexto de la implementación)
 
 Leyó el diff, corrió los 38 tests del commit y escribió tests propios fuera del repo para reproducir cada problema. Confirmé por mi cuenta los puntos 2 y 11. **No apliqué ningún arreglo al backend:** cambiarían lo que vas a revisar. Mi propuesta está en la última columna.
 
@@ -186,7 +191,17 @@ Leyó el diff, corrió los 38 tests del commit y escribió tests propios fuera d
 | 11 | Baja | **Un N1 que intenta cerrar sin nota recibe 422 y el intento no queda como `action_denied_role`,** porque la nota se valida antes que el rol. Lo confirmé | Ahora: validar la nota dentro del endpoint, después del rol |
 | | Info | Bien: orden de rutas, autorización sin forma de saltearla, entradas acotadas, Redis sin lecturas masivas, TTL de los casos sin cambios respecto de H57 | |
 
-**Si das el OK a "ahora"** (1 del lado del endpoint, 2, 3, 5, 8 y 11): es un commit chico solo en `motor-soc` y en el legado, con tests de cada caso (los que el revisor marcó como faltantes) y otra pasada del revisor sobre ese commit. Eso suma unas 2 h a tu revisión antes del mediodía del 11-oct.
+**Aplicado con tu OK en `fa273ad`:** 1 (lado endpoint, con WATCH/MULTI y 409), 2, 3, 5, 8 y 11, más el registro de cada cambio de estado exitoso en la cadena (`case_state_changed`: actor, caso, de, a y sha256 de la nota, sin el texto). El lado del worker del 1 **no se tocó** y queda como limitación declarada (ROADMAP_2027); los puntos 4 (ahora resuelto), 7, 9 y 10 quedan documentados. El texto de limitaciones de la UI se corrigió en un commit aparte.
+
+**Segunda vuelta sobre `fa273ad`: sin hallazgos altos ni medios.** Probó `update_case_state` contra un redis-server real (redis-py 8.1.0): orden WATCH/GET/MULTI/EXEC correcto, `reset()` al salir por `return`, `raise` y éxito, sin WATCH colgado, reintento sin duplicados ni pérdidas, TTL sin cambios, `WatchError` no escapa al endpoint. El evento nuevo no rompe el indexador (cualquier payload con `access_event` se indexa como `access`). Hallazgos bajos, **no aplicados** para no ampliar el commit:
+
+| # | Hallazgo | Propuesta |
+|---|---|---|
+| A | `csv_safe` no trata como espacio inicial a los blancos Unicode (`U+00A0`, `\x00`, `\x0b`, ancho cero) | `text.lstrip()` Unicode; las planillas suelen tratarlos como texto |
+| B | JSON corrupto en Redis da 500 en el detalle y 400 con mensaje confuso en el POST | Poco probable (los escribe el sistema) |
+| C | Una nota de tres caracteres de ancho cero pasa el mínimo | Menor: el cierre queda atribuido y con hash |
+| D | El indexador no extrae `case_id` del detalle de los eventos `access`: la historia de un caso en `soc-responses-*` no es consultable por caso | Cambio del indexador, después del 12-oct |
+| i | `prompt()` bloqueado por el navegador cancela el cierre sin mensaje; faltan tests de WATCH contra Redis real | Documentado |
 
 ## 6. Capturas
 

@@ -250,8 +250,10 @@ export function CasesView() {
           Fuentes de TI desde el registro de respuesta del trace_id con que se abrió el caso.
         </p>
         <p className="muted small">
-          Limitaciones declaradas: los cambios de estado y las notas no entran a la cadena hash de auditoría (quedan en el
-          caso, con actor y hora). Mientras un caso está en investigación, las repeticiones de esa IP abren un caso nuevo.
+          Auditoría: cada cambio de estado queda en la cadena hash (actor, caso, estados y huella de la nota); el texto de la
+          nota queda solo en el caso. Limitaciones declaradas: mientras un caso está en investigación, las repeticiones de
+          esa IP abren un caso nuevo; y si el worker suma una ocurrencia en el mismo instante de un cambio de estado,
+          puede revertirlo (se resuelve del lado del worker, después del período 2).
         </p>
       </div>
     </section>

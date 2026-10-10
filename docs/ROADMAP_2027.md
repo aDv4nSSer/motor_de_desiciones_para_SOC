@@ -24,10 +24,11 @@ Lo que quedó fuera del congelamiento de código del 12-oct-2026, con su diseño
 
 ## Gestión de casos
 
-- **Cambios de estado y notas dentro de la cadena hash.** Hoy quedan en el caso (actor, hora, nota) pero no en `soc-responses-*`; el intento denegado por rol sí queda. Emitir un evento `case_state_changed` al stream de auditoría. Origen: H60.
+- **Notas de casos en la cadena hash.** Los cambios de estado ya emiten `case_state_changed` (actor, caso, de, a y sha256 de la nota, sin el texto; fa273ad). El texto de la nota queda solo en el caso; si la auditoría debe conservarlo, persistirlo cifrado o en un índice propio. Origen: H60.
 - **Deduplicación durante la investigación.** Un caso en investigación deja de recibir ocurrencias: las repeticiones de la IP abren un caso nuevo. Reutilizar el caso mientras no esté cerrado. Origen: H60.
-- **Carrera entre el worker y un analista.** El worker reescribe el caso al sumar una ocurrencia (lectura y escritura sin transacción); si coincide en el mismo instante con un cambio de estado, el cambio del analista puede perderse. Lua o WATCH/MULTI en `response/cases.py`. Origen: H60.
+- **Carrera del lado del worker.** El endpoint ya usa WATCH/MULTI (fa273ad), pero `response/cases.py:_add_occurrence` hace GET y SET sin WATCH: si el worker leyó antes del cambio de estado y escribe después, pisa el cierre (el caso vuelve a `abierto`, pierde la nota y recupera el TTL de 7 días). Ventana de milisegundos, verificada con un test que intercala las operaciones. Arreglarlo exige reiniciar `response-worker` (corte de régimen), por eso va después del período 2: Lua que escriba solo si `state` sigue `abierto`. Origen: H60, revisión independiente.
 - **`soc:cases:index` y `vigilante/cases.py:list_cases`.** El SET histórico tiene ~700.000 ids y crece ~12.000/día solo por compatibilidad; `vigilante/cases.py:list_cases` todavía hace `SMEMBERS` sobre él (sin llamadores hoy). Retirar ambos. Origen: H60, patrón de H54.
+- **Casos en `soc-responses-*`.** El indexador no extrae `detail.case_id` de los eventos `access` (`case_state_changed`): la historia de un caso no es consultable por caso. Extraerlo en `build_content`. Menores de la segunda revisión de H60: `csv_safe` con blancos Unicode, JSON corrupto en un caso (500 y 400), notas de ancho cero, WATCH probado contra Redis real. Origen: H60.
 - **Más de 5.000 casos trabajados.** `soc:cases:worked` recorta por rango: un cierre más antiguo sale del listado y del CSV (el caso sigue en Redis, sin TTL). Persistir los cierres en OpenSearch. Origen: H60.
 
 ## Datos y modelo
