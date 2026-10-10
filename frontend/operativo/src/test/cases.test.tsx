@@ -87,6 +87,11 @@ describe('gestión interna de casos', () => {
     expect(within(rowOf('91.92.42.80')).getByText('sin dato')).toBeInTheDocument() // sin registro de respuesta
   })
 
+  it('avisa que en investigación las nuevas ocurrencias abren casos nuevos', async () => {
+    await enterCases('N1')
+    expect(screen.getByText('Mientras un caso está en investigación, las nuevas ocurrencias de la IP abren casos nuevos.')).toBeInTheDocument()
+  })
+
   it('agrupa por /24', async () => {
     const { user } = await enterCases('N1')
     await user.click(screen.getByLabelText('Agrupar por /24'))

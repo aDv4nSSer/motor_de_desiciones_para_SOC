@@ -12,6 +12,7 @@ import { formatScore, formatTime, shortId } from '../lib/format'
 import { accionR2Label } from '../lib/r2'
 import { lookupResponses, mergeLookups, type RowLookup } from '../lib/responses'
 import { abuseipdbStatus, corroboranLabel, otxStatus } from '../lib/ti'
+import { groupByNet } from '../lib/net'
 import { usePolling } from '../lib/usePolling'
 
 const STATE_CLASS: Record<CaseState, string> = {
@@ -165,6 +166,9 @@ export function CasesView() {
         Un caso nace de una alerta T2 de una IP no propia y agrupa sus repeticiones durante 24 h. N1 pasa un caso a
         investigación; N2 y CISO lo cierran como confirmado o falso positivo, con nota obligatoria. Tu rol es <strong>{role}</strong>.
       </p>
+      <p className="muted small mb3">
+        Mientras un caso está en investigación, las nuevas ocurrencias de la IP abren casos nuevos.
+      </p>
 
       <div className="case-filters" role="group" aria-label="Filtros de casos">
         <div className="seg-tabs" role="group" aria-label="Estado">
@@ -261,12 +265,7 @@ export function CasesView() {
 }
 
 function groupBy24(rows: Case[]): { net: string; cases: Case[] }[] {
-  const m = new Map<string, Case[]>()
-  for (const c of rows) {
-    const net = c.net24 ?? c.host
-    m.set(net, [...(m.get(net) ?? []), c])
-  }
-  return [...m.entries()].map(([net, cases]) => ({ net, cases }))
+  return groupByNet(rows, (c) => c.net24 ?? c.host).map((g) => ({ net: g.net, cases: g.items }))
 }
 
 function sourcesOf(r: ResponseRecord | undefined): string {
