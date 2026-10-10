@@ -21,6 +21,11 @@ class TestRegimenes:
         ids = [r["id"] for r in regimes.regimes_between(datetime(2026, 10, 8, tzinfo=timezone.utc), NOW)]
         assert ids == ["R0", "R1", "R2", "R3"]
 
+    def test_corte_de_la_fase_3a(self) -> None:
+        # restart de response-worker del 9-oct a las 11:21:00 -03 (H58)
+        assert regimes.regime_at(datetime(2026, 10, 9, 14, 20, 59, tzinfo=timezone.utc))["id"] == "R3"
+        assert regimes.regime_at(datetime(2026, 10, 9, 14, 21, 0, tzinfo=timezone.utc))["id"] == "R4"
+
     def test_policy_version_ignora_secretos_y_cambia_con_la_politica(self) -> None:
         from response.config import ResponseSettings
         a = ResponseSettings(abuseipdb_api_key="uno", min_corroborating_sources_for_autoblock=2)

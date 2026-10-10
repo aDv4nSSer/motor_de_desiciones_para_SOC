@@ -34,6 +34,8 @@ REGIMES: tuple[tuple[str, datetime, str], ...] = (
      "T2 de infraestructura propia sin caso (H54, 3243c0d)"),
     ("R3", datetime(2026, 10, 9, 2, 42, 16, tzinfo=timezone.utc),
      "Gauge de la cuota real de AbuseIPDB (H55, d0c8f93)"),
+    ("R4", datetime(2026, 10, 9, 14, 21, 0, tzinfo=timezone.utc),
+     "Fase 3 A: AbuseIPDB solo para T3 decisivos, caché 24 h/6 h, casos T2 con dedup; período 2 (H56/H58, 43a62bd)"),
 )
 
 # Campos de la configuración que nunca entran al hash ni se muestran.
