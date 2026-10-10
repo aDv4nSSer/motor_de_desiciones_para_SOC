@@ -7,8 +7,8 @@ Trabajo del 10-oct, de 02:00 a 03:00 -03. No hubo push, deploy, restart ni escri
 | Rama | Punta | Contenido nuevo | Tests | Pre-commit |
 |---|---|---|---|---|
 | `feature/d2-bucket-rafaga` | `27830f2` | D2 rebasado sobre `develop` (`43a62bd`) | 778 passed; foto fija de R2 sin cambios | limpio |
-| `feature/cumplimiento` | (este commit) | Régimen R4 (`bd27c8f`), H59, PENDIENTES, script del IF del domingo, este informe | ver el final | limpio |
-| `feature/explicabilidad` | sobre `feature/cumplimiento` | Traza v1 y endpoint `explain`, tabla ATT&CK por SID, métricas | 821 passed (antes de las métricas); 28 nuevos | limpio |
+| `feature/cumplimiento` | `4bece97` + este ajuste | Régimen R4 (`bd27c8f`), H59, PENDIENTES, script del IF del domingo, este informe | 798 passed | limpio |
+| `feature/explicabilidad` | `f95bae4` (rebasada sobre `4bece97`) | Traza v1 y endpoint `explain` (`9888707`), tabla ATT&CK por SID y métricas (`f95bae4`) | 829 passed (31 nuevos) | limpio |
 
 Probé rebasar `cumplimiento` + `explicabilidad` sobre D2 en una rama descartable: **sin conflictos, 849 passed**.
 
