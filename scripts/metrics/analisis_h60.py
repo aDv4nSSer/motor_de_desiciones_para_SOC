@@ -20,6 +20,12 @@ Análisis:
 - B) T2 con >= 2 fuentes corroboradas (incluida la caché): IPs por día,
   puertos, /24 y campañas, y cuántas habrían sido bloqueo automático si
   hubieran sido T3. Análisis de sensibilidad, no cambio de política.
+- D) Cola de aprobaciones desde el corte de R4 (9-oct 14:21:00Z):
+  concentración por /24, % de pendientes de los 5 /24 principales, IPs
+  hermanas por campaña y qué fuente falta en cada "1/2 fuentes" (AbuseIPDB
+  < 50 o no consultada, OTX sin pulsos). Sin consultar AbuseIPDB: solo lo
+  registrado en soc-responses-* y el estado actual de soc:approvals:* en
+  Redis (SCARD y SSCAN acotado, nunca SMEMBERS).
 - C) Autonomía: bloqueos nuevos separados de TTL extendidos, en IPs
   distintas, y las IPs distintas por hora con la infra propia aparte (el
   complemento de los contadores de 60 min del dashboard, que cuentan
@@ -34,6 +40,9 @@ Uso:
     cd ~/tesis/repo/motor && python3 - --extraer --desde 2026-10-03 < analisis_h60.py > h60.txt
     # local:
     python3 scripts/metrics/analisis_h60.py --escribir h60.txt --out reports/metricas/2026-10-10
+    # corrida final: CSV y crudo fuera de git, manifiesto con sha256 en el repo
+    python3 scripts/metrics/analisis_h60.py --escribir h60.txt --out reports/metricas/<fecha> \
+        --archivar ~/tesis_archivo/metricas_h60
 
 Motor SOC — Tesis UBO.
 """
@@ -41,9 +50,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import ipaddress
 import itertools
+import json
+import shutil
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
@@ -68,6 +81,8 @@ BINS = [i / 10 for i in range(11)]
 PRIVATE_PREFIXES = ["10.", "192.168.", "127.", "169.254.", "fc", "fd", "fe80:", "::1"] + \
     [f"172.{i}." for i in range(16, 32)]
 ALREADY_BLOCKED = "ya bloqueada"
+CORTE_R4 = "2026-10-09T14:21:00Z"   # régimen R4, apertura del período 2
+TOP_REDES = 5
 TTL_EXTENDED = "TTL extendido"
 
 
@@ -155,6 +170,29 @@ def infra_query(safelist: set[str]) -> dict:
     return {"bool": {"should": should, "minimum_should_match": 1}}
 
 
+def _cola_actual(max_items: int = 5000) -> list[dict]:
+    """Aprobaciones pendientes hoy en Redis: SCARD (O(1)) y, si son pocas, SSCAN
+    acotado (redis_guard) y MGET en lotes. Nunca SMEMBERS (H54)."""
+    from dashboard import _get_redis
+    from redis_guard import guarded_scan
+    rdb = _get_redis()
+    total = rdb.scard("soc:approvals:pending")
+    if total > max_items:
+        return [{"src_ip": "", "created_at": "", "occurrences": "", "approval_level": "",
+                 "nota": f"{total} pendientes > tope {max_items}: no se leen"}]
+    rows: list[dict] = []
+    for batch in guarded_scan(rdb, set_key="soc:approvals:pending"):
+        for raw in rdb.mget([f"soc:approvals:{t}" for t in batch]):
+            if not raw:
+                continue
+            a = json.loads(raw)
+            if a.get("status") == "pending":
+                occ = rdb.hget(f"soc:approvals:meta:{a.get('trace_id')}", "occurrences")
+                rows.append({"src_ip": a.get("src_ip"), "created_at": a.get("created_at"),
+                             "occurrences": occ or 1, "approval_level": a.get("approval_level"), "nota": ""})
+    return rows
+
+
 def emit(name: str, rows: list[dict], fields: list[str] | None = None) -> None:
     print(f"## {name}")
     keys = fields or (list(rows[0].keys()) if rows else ["vacio"])
@@ -204,7 +242,8 @@ def extraer(desde: str, hasta: str | None, heap_max: int, stride: int = JOIN_STR
     # la unión con la decisión (ml_score, anomaly_score) solo sobre 1 de cada `stride`.
     reader.phase = "A lectura"
     docs = reader.scroll(RESPONSES, {"bool": {"filter": [*base, infra, {"terms": {"tier": [2, 3]}}]}},
-                         ["trace_id", "event_time", "src_ip", "tier", "accion_recomendada", "payload.dst_port"], "event_time")
+                         ["trace_id", "event_time", "src_ip", "tier", "accion_recomendada", "payload.dst_port",
+                          "payload.dst_ip"], "event_time")
     dec: dict[str, dict] = {}
     reader.phase = "A union (muestra)"
     ids = [d["trace_id"] for i, d in enumerate(docs) if d.get("trace_id") and i % stride == 0]
@@ -217,12 +256,13 @@ def extraer(desde: str, hasta: str | None, heap_max: int, stride: int = JOIN_STR
             dec[h["_source"]["trace_id"]] = h["_source"]
     emit("infra_docs", [{
         "event_time": d.get("event_time"), "src_ip": d.get("src_ip"), "tier": d.get("tier"),
-        "accion": d.get("accion_recomendada"),
+        "accion": d.get("accion_recomendada"), "dst_ip": (d.get("payload") or {}).get("dst_ip") or "",
         "dst_port": (d.get("payload") or {}).get("dst_port") or dec.get(d.get("trace_id"), {}).get("L4_DST_PORT"),
         "ml_score": dec.get(d.get("trace_id"), {}).get("ml_score"),
         "anomaly_score": dec.get(d.get("trace_id"), {}).get("anomaly_score"),
         "risk_score": dec.get(d.get("trace_id"), {}).get("risk_score"),
-    } for d in docs], ["event_time", "src_ip", "tier", "accion", "dst_port", "ml_score", "anomaly_score", "risk_score"])
+    } for d in docs], ["event_time", "src_ip", "tier", "accion", "dst_ip", "dst_port", "ml_score", "anomaly_score",
+                       "risk_score"])
 
     reader.phase = "B"
     # B) T2 con >= 2 fuentes corroborando (corroboration_count cuenta la caché).
@@ -268,6 +308,51 @@ def extraer(desde: str, hasta: str | None, heap_max: int, stride: int = JOIN_STR
                                             "ips": d["ips"]["value"], "ejecutadas": d["ok"]["doc_count"]}
                                            for d in manual["aggregations"]["d"]["buckets"]])
 
+    # D) Cola de aprobaciones desde el corte de R4: cada T3 que quedó pendiente, con
+    # lo que vio R1 (sin consultar AbuseIPDB), el destino por IP y el estado actual en Redis.
+    reader.phase = "D"
+    since_d: dict[str, Any] = {"gte": max(desde, CORTE_R4)}
+    if hasta:
+        since_d["lt"] = hasta
+    pend = reader.scroll(RESPONSES, {"bool": {"filter": [
+        {"term": {"event_type": "response"}}, {"range": {"event_time": since_d}}, {"term": {"tier": 3}},
+        {"term": {"block_action": "block_pending_approval"}}], "must_not": [infra]}},
+        ["event_time", "src_ip", "trace_id", "corroboration_count", "payload.dst_port",
+         "payload.enrichment.abuseipdb_score", "payload.enrichment.abuseipdb_available",
+         "payload.enrichment.otx_pulse_count", "payload.enrichment.otx_available",
+         "payload.enrichment.corroborating_sources", "payload.enrichment.notes"], "event_time")
+
+    def _enr(d: dict) -> dict:
+        return (d.get("payload") or {}).get("enrichment") or {}
+
+    emit("d_pendientes_docs", [{
+        "event_time": d.get("event_time"), "src_ip": d.get("src_ip"), "trace_id": d.get("trace_id"),
+        "dst_port": (d.get("payload") or {}).get("dst_port"), "count": d.get("corroboration_count"),
+        "abuseipdb": _enr(d).get("abuseipdb_score"), "abuseipdb_disponible": _enr(d).get("abuseipdb_available"),
+        "otx": _enr(d).get("otx_pulse_count"), "otx_disponible": _enr(d).get("otx_available"),
+        "fuentes": "+".join(_enr(d).get("corroborating_sources") or []),
+        "nota_abuseipdb": next((n for n in _enr(d).get("notes") or [] if str(n).startswith("abuseipdb")), ""),
+        "nota_otx": next((n for n in _enr(d).get("notes") or [] if str(n).startswith("otx")), ""),
+    } for d in pend])
+    ips_d = reader.composite(RESPONSES, {"bool": {"filter": [
+        {"term": {"event_type": "response"}}, {"range": {"event_time": since_d}}, {"terms": {"tier": [2, 3]}}],
+        "must_not": [infra]}}, [{"ip": {"terms": {"field": "src_ip"}}}],
+        {"t2": {"filter": {"term": {"tier": 2}}}, "t3": {"filter": {"term": {"tier": 3}}},
+         "bloqueo": {"filter": {"bool": {"filter": [{"term": {"block_action": "block"}},
+                                                    {"term": {"block_enforced": True}}]}}},
+         "ext": {"filter": {"prefix": {"block_reason": ALREADY_BLOCKED}}},
+         "pend": {"filter": {"term": {"block_action": "block_pending_approval"}}}})
+    emit("d_ips_desde_corte", [{"src_ip": b["key"]["ip"], "docs": b["doc_count"], "t2": b["t2"]["doc_count"],
+                                "t3": b["t3"]["doc_count"], "bloqueo": b["bloqueo"]["doc_count"],
+                                "ttl_extendido": b["ext"]["doc_count"], "pendiente": b["pend"]["doc_count"]}
+                               for b in ips_d])
+    resol = reader.composite(RESPONSES, {"bool": {"filter": [{"range": {"event_time": since_d}}, {"terms": {
+        "event_type": ["approval_expired", "manual_approval", "approval_rejected"]}}]}},
+        [{"ip": {"terms": {"field": "src_ip"}}}, {"ev": {"terms": {"field": "event_type"}}}])
+    emit("d_resoluciones", [{"src_ip": b["key"]["ip"], "evento": b["key"]["ev"], "docs": b["doc_count"]} for b in resol])
+    emit("d_cola_actual", _cola_actual())
+
+    reader.phase = "C horas"
     # C) IPs distintas por hora con la infra aparte (complemento de los contadores de 60 min).
     hour = {"date_histogram": {"field": "event_time", "fixed_interval": "1h"}}
     res = reader.search(RESPONSES, {"size": 0, "query": {"bool": {"filter": base}}, "aggs": {"h": {**hour, "aggs": {
@@ -378,10 +463,34 @@ def analisis_a(sec: dict) -> tuple[dict[str, list[dict]], list[str]]:
         tiers[(d["src_ip"], d["dst_port"])][d["tier"]] += 1
     pares = [{"src_ip": ip, "dst_port": port, "decisiones": n, "t2": tiers[(ip, port)]["2"], "t3": tiers[(ip, port)]["3"],
               "pct_del_total_infra": round(100 * n / len(docs), 2)} for (ip, port), n in pairs.most_common(30)]
+    flujos_c = Counter((d["src_ip"], d.get("dst_ip", ""), d["dst_port"]) for d in docs)
+    ftier = defaultdict(Counter)
+    fseen: dict[tuple, list[str]] = {}
+    for d in docs:
+        k = (d["src_ip"], d.get("dst_ip", ""), d["dst_port"])
+        ftier[k][d["tier"]] += 1
+        fs = fseen.setdefault(k, [d["event_time"], d["event_time"]])
+        fs[0], fs[1] = min(fs[0], d["event_time"]), max(fs[1], d["event_time"])
+    flujos = [{"src_ip": k[0], "dst_ip": k[1] or "sin dato", "dst_port": k[2], "decisiones": n,
+               "t2": ftier[k]["2"], "t3": ftier[k]["3"], "primera": fseen[k][0], "ultima": fseen[k][1],
+               "pct_del_total_infra": round(100 * n / len(docs), 2)} for k, n in flujos_c.most_common()]
+    flujos_dia = []
+    for day in sorted({d["event_time"][:10] for d in docs}):
+        dd = [d for d in docs if d["event_time"][:10] == day]
+        for tier in sorted({d["tier"] for d in dd}):
+            dt = [d for d in dd if d["tier"] == tier]
+            flujos_dia.append({"dia_utc": day, "tier": tier, "decisiones": len(dt),
+                               "flujos_distintos": len({(d["src_ip"], d.get("dst_ip", ""), d["dst_port"]) for d in dt}),
+                               "origenes": len({d["src_ip"] for d in dt})})
     t23_total = sum(int(r["docs"]) for r in sec.get("tier_por_dia", []) if r["tier"] in ("2", "3"))
     stride = (sec.get("parametros") or [{}])[0].get("muestra_union_1_de") or "1"
     n_join = sum(1 for d in docs if _f(d["ml_score"]) is not None)
     resumen = [
+        ("NO ES UNA TASA DE FALSOS POSITIVOS SOBRE TRÁFICO EXTERNO: mide cuánto tráfico propio, benigno y conocido, "
+         "el modelo lleva a T2/T3."),
+        (f"Flujos distintos (origen, destino, puerto): {len(flujos)}; los 5 principales concentran "
+         f"{round(100 * sum(f['decisiones'] for f in flujos[:5]) / len(docs), 1) if docs else 0}% de las decisiones de infra. "
+         "Una decisión por flujo repetido no es un evento independiente: la vista por flujo es la unidad comparable."),
         (f"Decisiones T2/T3 de infra propia: {len(docs)} de {t23_total} T2/T3 "
         f"({round(100 * len(docs) / t23_total, 2) if t23_total else 'sin dato'}%), {len({d['src_ip'] for d in docs})} IPs."),
         ("Tasa de falsos positivos del modelo sobre ese conjunto: toda decisión T2/T3 de infra propia es un falso positivo "
@@ -393,7 +502,8 @@ def analisis_a(sec: dict) -> tuple[dict[str, list[dict]], list[str]]:
         ("Salvedad: la infra propia es benigno conocido de un tipo muy particular (API de Wazuh, gestión, bastion); "
         "no representa tráfico externo benigno y no sirve para estimar la tasa de falsos positivos sobre Internet."),
     ]
-    return {"a_infra_por_dia.csv": dia, "a_infra_histograma.csv": hist, "a_infra_pares.csv": pares}, resumen
+    return {"a_infra_por_dia.csv": dia, "a_infra_histograma.csv": hist, "a_infra_pares.csv": pares,
+            "a_infra_flujos.csv": flujos, "a_infra_flujos_por_dia.csv": flujos_dia}, resumen
 
 
 def analisis_b(sec: dict) -> tuple[dict[str, list[dict]], list[str]]:
@@ -519,26 +629,188 @@ def analisis_c(sec: dict) -> tuple[dict[str, list[dict]], list[str]]:
     return {"c_autonomia_por_dia.csv": dia, "c_ips_por_hora.csv": hora}, resumen
 
 
-def escribir(entrada: Path, out: Path) -> int:
+def fuente_faltante(d: dict[str, str]) -> str:
+    """Qué fuente falta en una aprobación pendiente (umbrales de R1: AbuseIPDB >= 50,
+    OTX >= 1 pulso). Solo con lo registrado; no consulta ninguna API."""
+    fuentes = set(filter(None, (d.get("fuentes") or "").split("+")))
+    if len(fuentes) >= 2:
+        return "dos fuentes (no debería estar pendiente)"
+    falta = []
+    if "abuseipdb" not in fuentes:
+        score = _f(d.get("abuseipdb"))
+        nota = d.get("nota_abuseipdb") or ""
+        if score is not None:
+            falta.append("AbuseIPDB < 50")
+        elif "presupuesto" in nota:
+            falta.append("AbuseIPDB no consultada (presupuesto de la ventana agotado)")
+        elif "no decisiva" in nota:
+            falta.append("AbuseIPDB no consultada (no decisiva: OTX no corrobora)")
+        elif "throttling" in nota or "cuota" in nota or "r2_min_tier" in nota:
+            falta.append("AbuseIPDB no consultada (política de cuota)")
+        elif "stale" in nota:
+            falta.append("AbuseIPDB no consultada (evento antiguo)")
+        else:
+            falta.append("AbuseIPDB sin dato (error o sin motivo)")
+    if "otx" not in fuentes:
+        pulses = _f(d.get("otx"))
+        if pulses is not None and pulses < 1:
+            falta.append("OTX sin pulsos")
+        elif pulses is None:
+            falta.append("OTX sin dato (no disponible)")
+    return " y ".join(falta) if falta else "sin dato"
+
+
+def analisis_d(sec: dict) -> tuple[dict[str, list[dict]], list[str]]:
+    docs = sec.get("d_pendientes_docs", [])
+    if not docs:
+        return {}, ["Sin datos de la cola de aprobaciones en la extracción (correr --extraer con la versión H60)."]
+    por_ip: dict[str, dict] = {}
+    for d in docs:   # el último registro de cada IP describe su estado en R1
+        e = por_ip.get(d["src_ip"])
+        if e is None or (_dt(d["event_time"]) or datetime.min.replace(tzinfo=timezone.utc)) >= e["_t"]:
+            por_ip[d["src_ip"]] = {**d, "_t": _dt(d["event_time"]) or datetime.min.replace(tzinfo=timezone.utc)}
+    n_docs = Counter(d["src_ip"] for d in docs)
+    ips_info = {r["src_ip"]: r for r in sec.get("d_ips_desde_corte", [])}
+    resol = defaultdict(Counter)
+    for r in sec.get("d_resoluciones", []):
+        resol[r["src_ip"]][r["evento"]] += int(r["docs"])
+    actual = {r["src_ip"]: r for r in sec.get("d_cola_actual", []) if r.get("src_ip")}
+    redes: dict[str, dict] = {}
+    for ip, d in por_ip.items():
+        n = redes.setdefault(net24(ip), {"net24": net24(ip), "ips_en_cola": 0, "registros_pendientes": 0,
+                                         "pendientes_ahora": 0, "faltante": Counter()})
+        n["ips_en_cola"] += 1
+        n["registros_pendientes"] += n_docs[ip]
+        n["pendientes_ahora"] += int(ip in actual)
+        n["faltante"][fuente_faltante(d)] += 1
+    total_ips = len(por_ip)
+    total_reg = len(docs)
+    total_now = len(actual)
+    orden = sorted(redes.values(), key=lambda x: (-x["ips_en_cola"], -x["registros_pendientes"]))
+    hermanas_by_net = defaultdict(list)
+    for ip, r in ips_info.items():
+        hermanas_by_net[net24(ip)].append((ip, r))
+    tabla_redes, hermanas = [], []
+    for rank, n in enumerate(orden, 1):
+        sis = hermanas_by_net.get(n["net24"], [])
+        tabla_redes.append({
+            "rank": rank, "net24": n["net24"], "ips_en_cola": n["ips_en_cola"],
+            "pct_ips_en_cola": round(100 * n["ips_en_cola"] / total_ips, 2),
+            "registros_pendientes": n["registros_pendientes"],
+            "pct_registros": round(100 * n["registros_pendientes"] / total_reg, 2),
+            "pendientes_ahora": n["pendientes_ahora"],
+            "ips_hermanas_t2_t3": len(sis),
+            "hermanas_autobloqueadas": sum(1 for _, r in sis if int(r["bloqueo"]) or int(r["ttl_extendido"])),
+            "hermanas_solo_t2": sum(1 for _, r in sis if int(r["t3"]) == 0),
+            "fuente_faltante": "; ".join(f"{k}: {v}" for k, v in n["faltante"].most_common()),
+            "campana_candidata": len(sis) >= 2,
+        })
+        if rank <= TOP_REDES:
+            for ip, r in sorted(sis, key=lambda x: -int(x[1]["docs"])):
+                hermanas.append({"net24": n["net24"], "src_ip": ip, "en_cola": ip in por_ip,
+                                 "pendiente_ahora": ip in actual, "t2": r["t2"], "t3": r["t3"],
+                                 "autobloqueos": r["bloqueo"], "ttl_extendido": r["ttl_extendido"],
+                                 "registros_pendientes": r["pendiente"],
+                                 "expiradas": resol[ip]["approval_expired"],
+                                 "aprobadas": resol[ip]["manual_approval"], "rechazadas": resol[ip]["approval_rejected"],
+                                 "fuente_faltante": fuente_faltante(por_ip[ip]) if ip in por_ip else ""})
+    ips_rows = [{"src_ip": ip, "net24": net24(ip), "registros_pendientes": n_docs[ip], "ultimo": d["event_time"],
+                 "puerto_ultimo": d["dst_port"], "abuseipdb": d["abuseipdb"], "otx": d["otx"],
+                 "fuentes": d["fuentes"], "fuente_faltante": fuente_faltante(d), "pendiente_ahora": ip in actual,
+                 "expiradas": resol[ip]["approval_expired"], "aprobadas": resol[ip]["manual_approval"],
+                 "rechazadas": resol[ip]["approval_rejected"]}
+                for ip, d in sorted(por_ip.items(), key=lambda x: -n_docs[x[0]])]
+    falt = Counter(fuente_faltante(d) for d in por_ip.values())
+    top = orden[:TOP_REDES]
+    top_ips = sum(n["ips_en_cola"] for n in top)
+    top_now = sum(n["pendientes_ahora"] for n in top)
+    resumen = [
+        (f"Desde el corte de R4 ({CORTE_R4}): {total_reg} registros T3 pendientes de aprobación, {total_ips} IPs, "
+         f"{len(redes)} redes /24. Pendientes en Redis al extraer: {total_now}."),
+        (f"Los {TOP_REDES} /24 principales concentran {top_ips} de {total_ips} IPs en cola "
+         f"({round(100 * top_ips / total_ips, 1) if total_ips else 0}%) y {top_now} de {total_now} pendientes actuales "
+         f"({round(100 * top_now / total_now, 1) if total_now else 0}%): "
+         + ", ".join(f"{n['net24']} ({n['ips_en_cola']})" for n in top) + "."),
+        "Fuente que falta, por IP (último registro): " + "; ".join(f"{k}: {v}" for k, v in falt.most_common()) + ".",
+        ("IPs hermanas: otras IPs del mismo /24 con T2 o T3 desde el corte, con su desenlace (autobloqueo, TTL "
+         "extendido, solo T2). Sin consultar AbuseIPDB: lo que se ve es lo que R1 registró."),
+    ]
+    return {"d_cola_por_red24.csv": tabla_redes, "d_cola_ips.csv": ips_rows,
+            "d_hermanas_top5.csv": hermanas}, resumen
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _inside_git(path: Path) -> bool:
+    try:
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],  # nosec B603 B607 - comando fijo
+                           capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.stdout.strip() == "true"
+
+
+def escribir(entrada: Path, out: Path, archivo: Path | None = None) -> int:
     sec = read_sections(entrada.read_text(encoding="utf-8"))
     out.mkdir(parents=True, exist_ok=True)
     params = (sec.get("parametros") or [{}])[0]
+    csv_dir = out
+    if archivo is not None:
+        stamp = (params.get("extraido_utc") or "sin_fecha").replace(":", "").replace("+0000", "Z")[:17]
+        csv_dir = archivo.expanduser().resolve() / f"h60_{stamp}"
+        ancestor = next(p for p in (csv_dir, *csv_dir.parents) if p.exists())
+        if _inside_git(ancestor):
+            print(f"ABORTO: {csv_dir} está dentro de un repositorio git; el archivo va fuera de git", file=sys.stderr)
+            return 1
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(entrada, csv_dir / "extraccion_cruda.txt")
     lines = ["# Análisis H60 (solo lectura): infra propia, T2 corroboradas y autonomía\n",
              (f"Extraído {params.get('extraido_utc', 'sin dato')} UTC, ventana desde {params.get('desde')} "
              f"hasta {params.get('hasta') or 'la extracción'}. Días UTC. Reproducir: ver el docstring de "
              "scripts/metrics/analisis_h60.py.\n"),
              ("Exclusiones: hueco de H54 (8-oct 03:32:41 a 03:32:45Z, a lo sumo 5 registros) y restart del 9-oct "
              "(14:27:00,8Z a 14:27:14,6Z, 13,8 s sin decisiones). La ventana H25 (18-ago a 04-sep) queda fuera del rango.\n")]
-    for label, fn in (("A) Infra propia", analisis_a), ("B) T2 con >= 2 fuentes", analisis_b), ("C) Autonomía", analisis_c)):
+    written: list[tuple[str, int]] = []
+    for label, fn in (("A) Infra propia", analisis_a), ("B) T2 con >= 2 fuentes", analisis_b), ("C) Autonomía", analisis_c),
+                      ("D) Cola de aprobaciones desde R4", analisis_d)):
         tables, resumen = fn(sec)
         lines.append(f"## {label}\n")
         lines += [f"- {r}" for r in resumen]
         lines.append("")
         for name, rows in tables.items():
-            write_csv(out / name, rows)
+            write_csv(csv_dir / name, rows)
+            written.append((name, len(rows)))
             lines.append(f"- `{name}`: {len(rows)} filas")
         lines.append("")
-    write_csv(out / "tier_por_dia_respuestas.csv", sec.get("tier_por_dia", []))
+    write_csv(csv_dir / "tier_por_dia_respuestas.csv", sec.get("tier_por_dia", []))
+    written.append(("tier_por_dia_respuestas.csv", len(sec.get("tier_por_dia", []))))
+    if archivo is not None:
+        script = Path(__file__).resolve()
+        rev = subprocess.run(["git", "-C", str(script.parent), "rev-parse", "--short", "HEAD"],  # nosec B603 B607 - comando fijo
+                             capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(script.parent), "status", "--porcelain", "--", str(script)],  # nosec B603 B607 - comando fijo
+                               capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        if rev and dirty:
+            rev += ", con cambios sin commitear: vale el sha256"
+        man = ["# Manifiesto H60 (salidas archivadas fuera de git)\n",
+               (f"Extraído {params.get('extraido_utc', 'sin dato')} UTC; ventana desde {params.get('desde')} hasta "
+               f"{params.get('hasta') or 'la extracción'}; muestra de la unión de A: 1 de cada "
+               f"{params.get('muestra_union_1_de', '1')}.\n"),
+               (f"Archivo: `{csv_dir}`. Script: `scripts/metrics/analisis_h60.py` en `{rev or 'sin dato'}` "
+               f"(sha256 `{_sha256(script)}`).\n"),
+               "Verificar: `shasum -a 256 <archivo>` debe dar el hash de la tabla.\n",
+               "| Archivo | Filas | Bytes | sha256 |", "|---|---|---|---|"]
+        for name, n in [("extraccion_cruda.txt", None), *written]:
+            f = csv_dir / name
+            man.append(f"| `{name}` | {'' if n is None else n} | {f.stat().st_size} | `{_sha256(f)}` |")
+        (out / "manifiesto_h60.md").write_text("\n".join(man) + "\n", encoding="utf-8")
+        lines.append(f"Salidas CSV archivadas fuera de git en `{csv_dir}`; hashes en `manifiesto_h60.md`.")
     (out / "analisis_h60.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     print("\n".join(lines))
     return 0
@@ -553,6 +825,8 @@ def main() -> int:
     ap.add_argument("--muestra", type=int, default=JOIN_STRIDE, help="unión de A sobre 1 de cada N")
     ap.add_argument("--escribir", type=Path)
     ap.add_argument("--out", type=Path, default=Path("reports/metricas/2026-10-10"))
+    ap.add_argument("--archivar", type=Path, default=None,
+                    help="directorio FUERA de git para los CSV y la extracción cruda; el manifiesto queda en --out")
     args = ap.parse_args()
     if args.extraer:
         try:
@@ -561,7 +835,7 @@ def main() -> int:
             print(f"ABORTO: {e}", file=sys.stderr)
             return 1
     if args.escribir:
-        return escribir(args.escribir, args.out)
+        return escribir(args.escribir, args.out, args.archivar)
     ap.print_help()
     return 2
 

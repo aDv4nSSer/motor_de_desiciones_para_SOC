@@ -16,6 +16,7 @@ Lo que quedó fuera del congelamiento de código del 12-oct-2026, con su diseño
 
 - **D2, bucket diario de AbuseIPDB con ráfaga.** Rama `feature/d2-bucket-rafaga` (`a2afcac`): Lua atómico, arranque conservador, techo de 864/día con reserva de cola. Origen: H56.
 - **Cola de aprobaciones sin operador:** 31.559 de 31.560 aprobaciones expiraron. Origen: H52.
+- **Cola de aprobaciones por presupuesto de AbuseIPDB.** Desde R4, el 78,7% de las IPs en cola espera porque se agotó el presupuesto por ventana (6/6 en 600 s) con OTX ya corroborando, y el 66,9% es una sola campaña (`91.92.42.0/24`) ya bloqueada el 4-oct que vuelve al vencer el TTL. Evaluar D2, caché de AbuseIPDB por /24 para campañas confirmadas y aprobación agrupada por /24. Origen: H60, análisis D.
 - **TTL del bloqueo y re-bloqueos.** Con 30 minutos, unas 270 IPs recurrentes se re-bloquean cada día (análisis C de H60). Evaluar TTL escalonado por reincidencia. Origen: H60.
 - **Falsos positivos sobre infra propia.** El 13,7% de los T2/T3 es tráfico propio (Redis, OpenSearch, API de Wazuh) con ml_score entre 0,6 y 0,8. La safelist evita la acción, pero no la decisión: evaluar excluirlo antes del modelo o reentrenar con ese tráfico como benigno. Origen: H60.
 - **Rate-limiting y cuarentena por VLAN** (switch SG350 con Netmiko). Origen: especificación ampliada, sección 9.

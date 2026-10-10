@@ -96,3 +96,86 @@ def test_infra_query_cubre_privadas_y_safelist() -> None:
     prefixes = {c["prefix"]["src_ip"] for c in q["bool"]["should"] if "prefix" in c}
     assert {"10.", "192.168.", "172.16.", "172.31."} <= prefixes
     assert {"terms": {"src_ip": ["200.54.12.139"]}} in q["bool"]["should"]
+
+
+RAW_D = RAW.replace("## aprobaciones_manuales_por_dia", """## d_pendientes_docs
+event_time,src_ip,trace_id,dst_port,count,abuseipdb,abuseipdb_disponible,otx,otx_disponible,fuentes,nota_abuseipdb,nota_otx
+2026-10-09T15:00:00Z,85.217.140.10,p1,22,1,30,True,4,True,otx,,
+2026-10-09T16:00:00Z,85.217.140.11,p2,22,1,,False,2,True,otx,abuseipdb: omitido por throttling (no decisiva),
+2026-10-09T17:00:00Z,85.217.140.11,p3,22,1,,False,2,True,otx,abuseipdb: omitido por throttling (no decisiva),
+2026-10-09T18:00:00Z,69.5.169.7,p4,3389,1,90,True,0,True,abuseipdb,,
+## d_ips_desde_corte
+src_ip,docs,t2,t3,bloqueo,ttl_extendido,pendiente
+85.217.140.10,3,1,2,0,0,1
+85.217.140.11,4,2,2,0,0,2
+85.217.140.99,9,0,9,3,6,0
+69.5.169.7,1,0,1,0,0,1
+## d_resoluciones
+src_ip,evento,docs
+85.217.140.10,approval_expired,1
+## d_cola_actual
+src_ip,created_at,occurrences,approval_level,nota
+85.217.140.11,2026-10-09T16:00:00Z,2,N1,
+## aprobaciones_manuales_por_dia""").replace(
+    "event_time,src_ip,tier,accion,dst_port,ml_score,anomaly_score,risk_score\n"
+    "2026-10-10T01:00:00Z,10.10.10.3,2,ninguna_infra_propia,55000,0.4,0.865,0.54\n"
+    "2026-10-10T02:00:00Z,10.10.10.3,2,ninguna_infra_propia,55000,0.5,0.9,0.62\n"
+    "2026-10-10T03:00:00Z,10.10.10.3,2,ninguna_infra_propia,55000,,,\n",
+    "event_time,src_ip,tier,accion,dst_ip,dst_port,ml_score,anomaly_score,risk_score\n"
+    "2026-10-10T01:00:00Z,10.10.10.3,2,ninguna_infra_propia,10.10.10.1,55000,0.4,0.865,0.54\n"
+    "2026-10-10T02:00:00Z,10.10.10.3,2,ninguna_infra_propia,10.10.10.1,55000,0.5,0.9,0.62\n"
+    "2026-10-10T03:00:00Z,10.10.10.3,2,ninguna_infra_propia,10.30.30.2,55000,,,\n")
+
+
+def test_a_flujos_distintos_y_salvedad() -> None:
+    tables, resumen = h60.analisis_a(h60.read_sections(RAW_D))
+    flujos = tables["a_infra_flujos.csv"]
+    assert [(f["dst_ip"], f["decisiones"]) for f in flujos] == [("10.10.10.1", 2), ("10.30.30.2", 1)]
+    assert tables["a_infra_flujos_por_dia.csv"][0]["flujos_distintos"] == 2
+    assert resumen[0].startswith("NO ES UNA TASA DE FALSOS POSITIVOS SOBRE TRÁFICO EXTERNO")
+
+
+def test_d_fuente_faltante() -> None:
+    assert h60.fuente_faltante({"fuentes": "otx", "abuseipdb": "30"}) == "AbuseIPDB < 50"
+    assert h60.fuente_faltante({"fuentes": "otx", "abuseipdb": "", "nota_abuseipdb": "abuseipdb: omitido por throttling (x)"}) \
+        == "AbuseIPDB no consultada (política de cuota)"
+    presupuesto = "abuseipdb: omitido por throttling (presupuesto de la ventana agotado (6/6 en 600 s))"
+    assert h60.fuente_faltante({"fuentes": "otx", "abuseipdb": "", "nota_abuseipdb": presupuesto}) \
+        == "AbuseIPDB no consultada (presupuesto de la ventana agotado)"
+    no_decisiva = "abuseipdb: omitido por throttling (no decisiva (OTX no corrobora: no puede cambiar R2))"
+    assert h60.fuente_faltante({"fuentes": "", "abuseipdb": "", "otx": "0", "nota_abuseipdb": no_decisiva}) \
+        == "AbuseIPDB no consultada (no decisiva: OTX no corrobora) y OTX sin pulsos"
+    assert h60.fuente_faltante({"fuentes": "abuseipdb", "otx": "0"}) == "OTX sin pulsos"
+    assert h60.fuente_faltante({"fuentes": "", "abuseipdb": "10", "otx": "0"}) == "AbuseIPDB < 50 y OTX sin pulsos"
+
+
+def test_d_concentracion_por_24_y_hermanas() -> None:
+    tables, resumen = h60.analisis_d(h60.read_sections(RAW_D))
+    redes = tables["d_cola_por_red24.csv"]
+    assert redes[0]["net24"] == "85.217.140.0/24" and redes[0]["ips_en_cola"] == 2 and redes[0]["registros_pendientes"] == 3
+    assert redes[0]["pendientes_ahora"] == 1 and redes[0]["ips_hermanas_t2_t3"] == 3 and redes[0]["hermanas_autobloqueadas"] == 1
+    assert redes[0]["pct_ips_en_cola"] == round(100 * 2 / 3, 2)
+    her = {h["src_ip"]: h for h in tables["d_hermanas_top5.csv"]}
+    assert her["85.217.140.99"]["en_cola"] is False and her["85.217.140.10"]["expiradas"] == 1
+    assert "OTX sin pulsos: 1" in resumen[2] and "AbuseIPDB < 50: 1" in resumen[2]
+    assert "1 de 1 pendientes actuales (100.0%)" in resumen[1]
+
+
+def test_archivo_fuera_de_git_con_manifiesto(tmp_path) -> None:
+    raw = tmp_path / "crudo.txt"
+    raw.write_text(RAW_D, encoding="utf-8")
+    out, arch = tmp_path / "repo_out", tmp_path / "archivo"
+    assert h60.escribir(raw, out, arch) == 0
+    man = (out / "manifiesto_h60.md").read_text(encoding="utf-8")
+    assert not list(out.glob("*.csv"))                     # los CSV no quedan en --out
+    dirs = list(arch.iterdir())
+    assert len(dirs) == 1 and (dirs[0] / "extraccion_cruda.txt").exists()
+    f = dirs[0] / "d_cola_por_red24.csv"
+    assert h60._sha256(f) in man
+
+
+def test_archivo_dentro_de_git_aborta(tmp_path) -> None:
+    raw = tmp_path / "crudo.txt"
+    raw.write_text(RAW_D, encoding="utf-8")
+    assert h60.escribir(raw, tmp_path / "o", ROOT / "reports" / "no_deberia_crearse") == 1
+    assert not (ROOT / "reports" / "no_deberia_crearse").exists()
