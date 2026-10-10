@@ -3081,6 +3081,36 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 
 ---
 
+## H60: Gestión interna de casos, correcciones de Alertas y tres análisis de solo lectura para la tesis
+
+**Fecha:** 10-oct-2026, 12:15 a 14:00 -03. Rama local `feature/casos-ui` sobre `feature/explicabilidad` (`9a01771`), en un `git worktree` aparte para no mover los cambios sin versionar de Antonio. Sin push, deploy, restart ni escrituras en producción. Sobre producción hubo solo lecturas, en cinco conexiones SSH, espaciadas: inventario de casos en Redis (12:19, O(1) y una muestra de 6.000 casos por MGET de a 200; `evicted_keys` 72.205 antes y después, 856 MB) y las corridas del análisis de solo lectura en OpenSearch (12:49:27, abortada por el tope antes de leer; 12:49:48, cortada; 13:29, sesión cerrada por un `pkill` propio; 13:30:53, válida). Informe, plan de deploy y capturas: `reports/estado_casos_ui.md`.
+
+**Inventario de casos (antes del cambio).**
+- `soc:cases:recent`: 12.502 casos desde el 9-oct 11:21 (unos 500 por hora); todos `abierto`, todos `network_t2_unconfirmed`, ninguno tocado por un analista. TTL de 7 días extendido por ocurrencia. El caso no guarda el tier ni los nombres de las fuentes de TI, solo `corroboration_count`.
+- `soc:cases:index`: 703.623 ids. `vigilante/cases.py:96` todavía hace `SMEMBERS` sobre él (sin llamadores en el repo): mismo patrón que H54. No se tocó; queda en ROADMAP_2027.
+- El backend aceptaba cualquier transición de cualquier usuario autenticado, sin nota. Un caso movido por un analista no actualizaba su posición en el índice reciente y, con el tope de 2.000 lecturas, salía del listado en unas 4 horas.
+
+**Backend de casos (`55f4b7b`, solo `motor-soc`).**
+- `POST /cases/{id}/state`: rol por estado destino (N1 investiga; cerrar exige N2 o CISO, 403 registrado como `action_denied_role`), transiciones válidas (409), nota obligatoria de al menos 3 caracteres al cerrar (422). Los cerrados son finales.
+- `soc:cases:worked`: ZSET de casos tocados por un analista, con tope duro de 5.000 (`ZREMRANGEBYRANK`). El TTL de los casos no cambia respecto de H57.
+- `GET /cases/page` (estado, solo IPs públicas por defecto, ventana, cursor; a lo sumo 2.000 ids por pedido), `GET /cases/{id}` (O(1)) y `GET /cases/closures.csv` (N2 y CISO, registrado como acceso, sin fórmulas). `GET /cases` queda igual para el dashboard legado.
+
+**Frontend (`e95ec4b`, `b5b79a7`).**
+- Casos: "Gestión interna de casos", sin mención a Iris. Lista con filtros y agrupación por /24; detalle con línea de tiempo, traza explicativa v1 (N2), TI, ATT&CK y evidencia por referencia (trace_id, documento de respuesta, eslabones de la cadena); acciones por rol con nota; CSV de cierres.
+- Alertas, solo presentación: la acción se deriva de `block.action` y `block.reason`. Hoy sale "Sin acción" en T3 que R2 resolvió porque `worker.py:302-305` guarda `ninguna` para todo resultado de `respond_block` que no sea un bloqueo nuevo (ya bloqueada con TTL extendido, safelist, dry_run). La TI separa política de cuota de error real; el detalle muestra la versión de LightGBM y "sin dato" para lo que no se guarda por decisión (hashes, `policy_version`, `regime_id`); el panel de reglas muestra la traza v1 con "Reglas explicativas v1; SHAP pendiente."; los contadores de 60 min dicen "decisiones". Los guiones largos que llegan en textos del backend se muestran con coma, sin cambiar el dato.
+
+**Limitaciones declaradas.** Los cambios de estado y las notas no entran a la cadena hash. Un caso en investigación deja de recibir ocurrencias: las repeticiones abren otro caso. El worker reescribe el caso al sumar una ocurrencia sin transacción: un cambio de estado simultáneo puede perderse (ventana de milisegundos). Las tres van a ROADMAP_2027.
+
+**Tests.** Python: 856 passed (27 nuevos, incluida la foto fija de R2 sin cambios) más 4 del análisis. Frontend: 56 passed (8 nuevos), `tsc` y `oxlint` sin advertencias nuevas. Pre-commit limpio en cada commit.
+
+**Análisis de solo lectura (Tarea 3, preliminares, `scripts/metrics/analisis_h60.py`).** Primera corrida sin muestra: abortada por el tope antes de leer (980.238 respuestas de infra, la mayoría T1 del 3 al 5-oct); segunda (12:49:48) cortada a los 35 min, por decisión de Antonio de usar una muestra, mientras unía 145.000 trace_id con `soc-decisions-*`. Al cortarla, un `pkill -f` no anclado mató también la sesión nueva (coincidía con su propia línea de comando; ver los gotchas de memoria); se repitió con el patrón anclado `^python3 - --extraer`. La corrida válida (13:30:53 a 13:33:30, 263 consultas) une sobre 1 de cada 10 respuestas de infra; los conteos son exactos. Detalle en `reports/estado_casos_ui.md` §3 y `reports/metricas/2026-10-10/analisis_h60.md`.
+- **A:** 145.409 de 1.061.696 decisiones T2/T3 (13,7%) son de infra propia (5 IPs). Dominan `10.10.10.1` hacia Redis (6379) y OpenSearch (9201) y `10.10.10.3` hacia la API de Wazuh (55000). El LightGBM les da entre 0,6 y 0,8 (96%): falsos positivos del umbral de T2 sobre benigno conocido. No representa tráfico externo benigno.
+- **B:** desde el 8-oct (cobertura de `corroboration_count`, H52), 763 IPs T2 con dos o más fuentes, 61 redes /24 con 2 o más IPs; `91.92.42.0/24` aporta 256 IPs y 38.310 decisiones, todas a 443. Como T3 serían 443 bloqueos nuevos y 320 TTL extendidos (cota superior). Los dos ejemplos (`.173`, `.80`) ya estaban bloqueados antes. El 10-oct (R4), las 313 IPs T2 corroboradas ya habían sido bloqueadas automáticamente alguna vez.
+- **C:** con TTL de bloqueo de 30 min, unas 270 IPs recurrentes se re-bloquean cada día; los primeros bloqueos son entre 4 y 21 por día (85 el 10-oct). 2.029 IP-día con bloqueo: 437 primeros y 1.592 re-bloqueos. La autonomía sobre amenazas nuevas se reporta con los primeros bloqueos.
+- Retención: política ISM en todos los índices diarios de `soc-responses-*` y `soc-decisions-*` (90 días por código; valor efectivo no leído).
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - ~~**Desacuerdo de grupos unilaterales (H53)**~~ → **resuelto con P4** (`a90df02`): solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%.
