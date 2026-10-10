@@ -2,7 +2,7 @@
 
 Extraído 2026-10-10T16:50:31+00:00 UTC; ventana desde 2026-10-03T00:00:00Z hasta la extracción; muestra de la unión de A: 1 de cada 10.
 
-Archivo: `~/tesis_archivo/metricas_h60/h60_2026-10-10T165031`. Script: `scripts/metrics/analisis_h60.py` en `7618d96` (sha256 `75c6964a1dbd1cac6a4728dcde1d4f72347b779bf085e9214ef23835bac5e73e`).
+Archivo: `~/tesis_archivo/metricas_h60/h60_2026-10-10T165031`. Script: `scripts/metrics/analisis_h60.py` en `89b34ab` (sha256 `d8e2f612d76cd5fe4dbfadb502ada386fa0b10eb02b9ccf0d27a9b1f3d7b2047`).
 
 Verificar: `shasum -a 256 <archivo>` debe dar el hash de la tabla.
 
