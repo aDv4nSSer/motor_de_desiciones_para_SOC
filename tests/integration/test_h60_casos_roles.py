@@ -136,3 +136,88 @@ def test_csv_neutraliza_formulas(env, monkeypatch) -> None:
          "hora": "h", "actor": "@a", "trace_id": "t"}])
     body = _call(env, "N2", "GET", "/api/v1/dashboard/cases/closures.csv").text
     assert "'=HYPERLINK(1)" in body and "'@a" in body
+
+
+def test_n1_sin_nota_recibe_403_y_queda_registrado_no_422(env) -> None:
+    c = _case(env["cases"])
+    r = _state(env, "N1", c["case_id"], "cerrado_confirmado", "")
+    assert r.status_code == 403
+    env["log"].assert_called_with("un1", "action_denied_role",
+                                  {"required": "N2", "actual": "N1", "action": "case_cerrado_confirmado"})
+
+
+def test_n2_sin_nota_sigue_siendo_422(env) -> None:
+    c = _case(env["cases"])
+    assert _state(env, "N2", c["case_id"], "cerrado_confirmado", "  ").status_code == 422
+    assert not [x for x in env["log"].call_args_list if x.args[1] == "case_state_changed"]
+
+
+def test_cambio_exitoso_queda_en_la_cadena_con_hash_de_la_nota_sin_el_texto(env) -> None:
+    import hashlib
+    c = _case(env["cases"])
+    nota = "AbuseIPDB 100 y OTX 26 pulsos"
+    assert _state(env, "N2", c["case_id"], "cerrado_confirmado", nota).status_code == 200
+    llamada = [x for x in env["log"].call_args_list if x.args[1] == "case_state_changed"]
+    assert len(llamada) == 1
+    usuario, _, detalle = llamada[0].args
+    assert usuario == "un2"
+    assert detalle == {"case_id": c["case_id"], "from": "abierto", "to": "cerrado_confirmado",
+                       "note_sha256": hashlib.sha256(nota.encode()).hexdigest()}
+    assert nota not in repr(llamada[0])
+
+
+def test_transicion_rechazada_no_se_registra_como_cambio(env) -> None:
+    c = _case(env["cases"])
+    _state(env, "N2", c["case_id"], "cerrado_confirmado", "confirmado")
+    env["log"].reset_mock()
+    assert _state(env, "N2", c["case_id"], "en_investigacion").status_code == 409
+    assert not [x for x in env["log"].call_args_list if x.args[1] == "case_state_changed"]
+
+
+def test_conflicto_concurrente_es_409(env) -> None:
+    import dashboard
+    c = _case(env["cases"])
+    key = f"soc:cases:{c['case_id']}"
+    pipe_cls = type(env["cases"].pipeline())
+    original = pipe_cls.execute
+
+    def conflicto(self):
+        env["cases"].set(key, env["cases"].kv[key])
+        return original(self)
+
+    pipe_cls.execute = conflicto
+    try:
+        r = _state(env, "N1", c["case_id"], "en_investigacion")
+    finally:
+        pipe_cls.execute = original
+    assert r.status_code == 409 and "reintent" in r.json()["detail"]
+    assert dashboard.CASES_WORKED_KEY not in env["cases"].zsets
+
+
+def test_redis_caido_da_503_en_detalle_csv_y_cambio(env, monkeypatch) -> None:
+    import dashboard
+    import redis
+    c = _case(env["cases"])
+
+    def caido():
+        raise redis.ConnectionError("down")
+
+    monkeypatch.setattr(dashboard, "_get_redis", caido)
+    assert _call(env, "N1", "GET", f"/api/v1/dashboard/cases/{c['case_id']}").status_code == 503
+    assert _call(env, "N2", "GET", "/api/v1/dashboard/cases/closures.csv").status_code == 503
+    assert _state(env, "N1", c["case_id"], "en_investigacion").status_code == 503
+
+
+def test_csv_campos_vacios_no_llevan_comilla_y_prefijos_nuevos_se_escapan(env, monkeypatch) -> None:
+    import main
+    monkeypatch.setattr(main, "closed_cases_rows", lambda: [
+        {"case_id": "x", "ip": "srv-web", "net24": "", "estado": "cerrado_confirmado", "hora": "h",
+         "actor": "\t=cmd", "trace_id": None}])
+    linea = _call(env, "N2", "GET", "/api/v1/dashboard/cases/closures.csv").text.strip().splitlines()
+    assert linea[1].startswith("x,srv-web,,cerrado_confirmado,h,'\t=cmd,")
+    assert linea[1].endswith(",")      # trace_id None: vacío, sin comilla
+
+
+def test_dashboard_legado_pide_nota_real_para_cerrar() -> None:
+    html = (Path(MOTOR_PATH) / "dashboard.html").read_text(encoding="utf-8")
+    assert "window.prompt(" in html and "desde el panel'," not in html.split("handleCaseAction")[1].split("window.handleCaseAction")[0].replace("Marcado en investigación desde el panel", "")

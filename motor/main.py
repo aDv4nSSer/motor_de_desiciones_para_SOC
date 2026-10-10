@@ -5,6 +5,7 @@ Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -39,8 +40,10 @@ from dashboard import (
     CLOSED_CASE_STATES,
     DECISIONS_MAX_LIMIT,
     RESPONSE_LOOKUP_MAX_IDS,
+    CaseConflictError,
     CaseTransitionError,
     closed_cases_rows,
+    csv_safe,
     get_active_blocks,
     get_case,
     get_experimental_detections,
@@ -62,7 +65,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 # H36: "from model import get_model" NO va a nivel de módulo a propósito —
 # ver _init_score_worker() más abajo para el porqué (contención de joblib/
@@ -415,16 +418,15 @@ CASE_NOTE_MAX_CHARS = 1000
 
 
 class CaseStateRequest(BaseModel):
-    """Cambio de estado de un caso (H60): nota obligatoria al cerrar."""
+    """Cambio de estado de un caso (H60). La nota obligatoria al cerrar se exige en el
+    endpoint, después del rol: un N1 sin nota recibe 403 registrado, no 422."""
     state: CASE_STATE_TARGETS
     note: str = Field("", max_length=CASE_NOTE_MAX_CHARS)
 
-    @model_validator(mode="after")
-    def _note_required_to_close(self) -> "CaseStateRequest":
-        self.note = self.note.strip()
-        if self.state in CLOSED_CASE_STATES and len(self.note) < CASE_NOTE_MIN_CHARS:
-            raise ValueError(f"cerrar un caso exige una nota de al menos {CASE_NOTE_MIN_CHARS} caracteres")
-        return self
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: str) -> str:
+        return v.strip()
 
 
 @app.get("/api/v1/dashboard/cases/page")
@@ -446,14 +448,18 @@ def dashboard_cases_page(
 def dashboard_cases_closures_csv(user: User = Depends(REQUIRE_N2)):
     """Exportación de solo lectura de los cierres (IP, estado, hora, actor),
     insumo de la muestra manual de precisión. Queda registrada como acceso."""
-    rows = closed_cases_rows()
+    try:
+        rows = closed_cases_rows()
+    except redis.RedisError as e:
+        log.error(f"closures.csv: Redis no respondió: {e}")
+        raise HTTPException(status_code=503, detail="No se pudieron leer los casos: Redis no responde")
     buf = io.StringIO()
     fields = ["case_id", "ip", "net24", "estado", "hora", "actor", "trace_id"]
     writer = csv.DictWriter(buf, fieldnames=fields)
     writer.writeheader()
     for row in rows:
         # Sin fórmulas al abrir en una planilla (inyección CSV).
-        writer.writerow({k: ("'" + v if isinstance(v, str) and v[:1] in "=+-@" else v) for k, v in row.items()})
+        writer.writerow({k: csv_safe(v) for k, v in row.items()})
     log_access_event(user.username, "cases_closures_exported", {"rows": len(rows)})
     return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": 'attachment; filename="cierres_casos.csv"'})
@@ -464,7 +470,11 @@ def dashboard_case(
     case_id: str = PathParam(..., pattern=CASE_ID_PATTERN),
     user: User = Depends(get_current_user),
 ):
-    case = get_case(case_id)
+    try:
+        case = get_case(case_id)
+    except redis.RedisError as e:
+        log.error(f"detalle de caso: Redis no respondió: {e}")
+        raise HTTPException(status_code=503, detail="No se pudo leer el caso: Redis no responde")
     if case is None:
         raise HTTPException(status_code=404, detail="Caso no encontrado")
     return case
@@ -483,14 +493,27 @@ def dashboard_update_case(
         log_access_event(user.username, "action_denied_role",
                          {"required": minimum, "actual": user.role, "action": f"case_{payload.state}"})
         raise HTTPException(status_code=403, detail=f"Requiere rol {minimum} o superior (tiene {user.role})")
+    if payload.state in CLOSED_CASE_STATES and len(payload.note) < CASE_NOTE_MIN_CHARS:
+        raise HTTPException(status_code=422,
+                            detail=f"Cerrar un caso exige una nota de al menos {CASE_NOTE_MIN_CHARS} caracteres")
     try:
         case = update_case_state(case_id, payload.state, payload.note, actor=user.username)
-    except CaseTransitionError as e:
+    except (CaseTransitionError, CaseConflictError) as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except redis.RedisError as e:
+        log.error(f"cambio de estado de caso: Redis no respondió: {e}")
+        raise HTTPException(status_code=503, detail="No se pudo actualizar el caso: Redis no responde")
     if case is None:
         raise HTTPException(status_code=404, detail="Caso no encontrado")
+    # Cadena hash (vía el stream de auditoría): quién, qué caso, a qué estado y el
+    # hash de la nota, nunca el texto. Si el log falla se registra, no se revierte.
+    history = case.get("history") or []
+    log_access_event(user.username, "case_state_changed", {
+        "case_id": case_id, "from": history[-2]["state"] if len(history) >= 2 else None, "to": payload.state,
+        "note_sha256": hashlib.sha256(payload.note.encode("utf-8")).hexdigest() if payload.note else None,
+    })
     return case
 
 

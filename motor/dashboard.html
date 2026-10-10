@@ -534,11 +534,15 @@ function renderDist(containerId, dist, order, labelMap, fillMap, signalKey) {
 }
 
 async function handleCaseAction(caseId, newState, btn) {
-  const notes = {
-    en_investigacion: 'Marcado en investigación desde el panel',
-    cerrado_confirmado: 'Confirmado como amenaza real desde el panel',
-    cerrado_falso_positivo: 'Cerrado como falso positivo desde el panel',
-  };
+  // H60: cerrar exige una nota real escrita por quien cierra (mínimo 3 caracteres);
+  // el backend también la exige. Pasar a investigación lleva una nota fija.
+  let note = 'Marcado en investigación desde el panel';
+  if (newState !== 'en_investigacion') {
+    const typed = window.prompt('Nota del cierre (obligatoria, mínimo 3 caracteres): ¿por qué se cierra así?');
+    if (typed === null) return;
+    note = typed.trim();
+    if (note.length < 3) { alert('Hace falta una nota de al menos 3 caracteres para cerrar el caso.'); return; }
+  }
   btn.disabled = true;
   const original = btn.textContent;
   btn.textContent = '···';
@@ -546,7 +550,7 @@ async function handleCaseAction(caseId, newState, btn) {
     await fetchJSON(`/api/v1/dashboard/cases/${caseId}/state`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ state: newState, note: notes[newState] || '' }),
+      body: JSON.stringify({ state: newState, note }),
     });
     await refresh();
   } catch (e) {

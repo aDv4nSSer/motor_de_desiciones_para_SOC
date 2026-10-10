@@ -131,3 +131,80 @@ class TestCierresParaCsv:
         assert rows["45.9.1.7"]["actor"] == "n2" and rows["45.9.1.7"]["estado"] == "cerrado_falso_positivo"
         assert rows["45.9.2.7"]["trace_id"] == "tb" and rows["45.9.2.7"]["net24"] == "45.9.2.0/24"
         assert rows["45.9.1.7"]["hora"] == _stored(rdb, a["case_id"])["history"][-1]["at"]
+
+
+class TestConcurrencia:
+    """WATCH/MULTI: lectura, validación y escritura contra el estado real (revisión de 55f4b7b, punto 1)."""
+
+    def test_un_cierre_concurrente_no_se_pisa_con_investigacion(self, rdb) -> None:
+        c = _case(rdb)
+        key = f"{CASES_KEY_PREFIX}{c['case_id']}"
+
+        def cierre_de_otro_analista() -> None:
+            dashboard_case = json.loads(rdb.kv[key])
+            dashboard_case["state"] = "cerrado_confirmado"
+            dashboard_case["history"].append({"state": "cerrado_confirmado", "at": "x", "note": "ya", "actor": "n2"})
+            rdb.set(key, json.dumps(dashboard_case))
+
+        rdb.before_exec = cierre_de_otro_analista
+        with pytest.raises(dashboard.CaseTransitionError):   # se revalida contra lo que hay al escribir
+            dashboard.update_case_state(c["case_id"], "en_investigacion", "", "n1")
+        assert _stored(rdb, c["case_id"])["state"] == "cerrado_confirmado"
+        assert [h["state"] for h in _stored(rdb, c["case_id"])["history"]][-1] == "cerrado_confirmado"
+
+    def test_una_ocurrencia_del_worker_entre_lectura_y_escritura_no_se_pierde(self, rdb) -> None:
+        c = _case(rdb)
+        key = f"{CASES_KEY_PREFIX}{c['case_id']}"
+
+        def worker_suma_ocurrencia() -> None:
+            d = json.loads(rdb.kv[key]); d["occurrences"] = 99
+            rdb.set(key, json.dumps(d), ex=604800)
+
+        rdb.before_exec = worker_suma_ocurrencia
+        got = dashboard.update_case_state(c["case_id"], "en_investigacion", "", "n1")
+        assert got["occurrences"] == 99 and got["state"] == "en_investigacion"   # releyó y reaplicó
+        assert _stored(rdb, c["case_id"])["occurrences"] == 99
+        assert rdb.ttl[key] is None                                              # sigue sin TTL
+
+    def test_agotados_los_reintentos_es_conflicto(self, rdb, monkeypatch) -> None:
+        c = _case(rdb)
+        key = f"{CASES_KEY_PREFIX}{c['case_id']}"
+        real_set = rdb.set
+        pipe_cls = type(rdb.pipeline())
+        original = pipe_cls.execute
+
+        def siempre_conflicto(self):
+            real_set(key, rdb.kv[key])   # alguien escribe antes de cada EXEC
+            return original(self)
+
+        monkeypatch.setattr(pipe_cls, "execute", siempre_conflicto)
+        with pytest.raises(dashboard.CaseConflictError):
+            dashboard.update_case_state(c["case_id"], "en_investigacion", "", "n1")
+        assert _stored(rdb, c["case_id"])["state"] == "abierto"
+        assert dashboard.CASES_WORKED_KEY not in rdb.zsets
+
+    def test_set_zadd_y_recorte_van_juntos(self, rdb) -> None:
+        c = _case(rdb)
+        dashboard.update_case_state(c["case_id"], "cerrado_confirmado", "nota", "n2")
+        assert _stored(rdb, c["case_id"])["state"] == "cerrado_confirmado"
+        assert c["case_id"] in rdb.zsets[dashboard.CASES_WORKED_KEY]
+
+
+class TestCsvSafe:
+    @pytest.mark.parametrize("raw,esperado", [
+        ("=1+1", "'=1+1"), ("+cmd", "'+cmd"), ("-2", "'-2"), ("@SUM(A1)", "'@SUM(A1)"),
+        ("\t=1", "'\t=1"), ("\r=1", "'\r=1"), ("\n=1", "'\n=1"), ("＝1+1", "'＝1+1"),
+        (' =1+1', "' =1+1"), ('"=1+1', "'\"=1+1"), ("'=1+1", "''=1+1"),
+    ])
+    def test_prefijos_de_formula(self, raw, esperado) -> None:
+        assert dashboard.csv_safe(raw) == esperado
+
+    @pytest.mark.parametrize("raw", [
+        "", "2001:db8::1", "::ffff:10.0.0.1", "45.9.20.7", "2026-10-10T15:00:00+00:00",
+        "13dd7cd0-2c35-4e59-a717-450729535a48", "analista.n2", "45.9.20.0/24", "   ",
+    ])
+    def test_valores_legitimos_no_cambian(self, raw) -> None:
+        assert dashboard.csv_safe(raw) == raw
+
+    def test_none_y_no_str(self) -> None:
+        assert dashboard.csv_safe(None) == "" and dashboard.csv_safe(42) == "42"

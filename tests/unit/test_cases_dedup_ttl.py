@@ -33,13 +33,19 @@ class FakeRedis:
         self.ttl: dict[str, int | None] = {}
         self.sets: dict[str, set] = {}
         self.zsets: dict[str, dict[str, float]] = {}
+        self.versions: dict[str, int] = {}
+        self.before_exec = None   # callback de test: simula una escritura concurrente antes del EXEC
 
     def set(self, key, value, nx=False, ex=None):
         if nx and key in self.kv:
             return None
         self.kv[key] = value
         self.ttl[key] = ex
+        self.versions[key] = self.versions.get(key, 0) + 1
         return True
+
+    def pipeline(self):
+        return FakePipeline(self)
 
     def get(self, key):
         return self.kv.get(key)
@@ -84,6 +90,53 @@ class FakeRedis:
 
     def expire_now(self, key):
         self.kv.pop(key, None)
+
+
+class FakePipeline:
+    """WATCH/MULTI/EXEC mínimo: EXEC falla con WatchError si la clave vigilada cambió."""
+
+    def __init__(self, rdb):
+        self.rdb, self.watched, self.queue, self.multi_mode = rdb, {}, [], False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.reset()
+
+    def reset(self):
+        self.watched, self.queue, self.multi_mode = {}, [], False
+
+    def watch(self, key):
+        self.watched[key] = self.rdb.versions.get(key, 0)
+
+    def get(self, key):
+        return self.rdb.get(key)
+
+    def multi(self):
+        self.multi_mode = True
+
+    def set(self, *a, **kw):
+        self.queue.append(("set", a, kw))
+
+    def zadd(self, *a, **kw):
+        self.queue.append(("zadd", a, kw))
+
+    def zremrangebyrank(self, *a, **kw):
+        self.queue.append(("zremrangebyrank", a, kw))
+
+    def execute(self):
+        import redis
+        if self.rdb.before_exec:
+            hook, self.rdb.before_exec = self.rdb.before_exec, None
+            hook()
+        try:
+            if any(self.rdb.versions.get(k, 0) != v for k, v in self.watched.items()):
+                raise redis.WatchError("clave modificada")
+            for name, a, kw in self.queue:
+                getattr(self.rdb, name)(*a, **kw)
+        finally:
+            self.reset()
 
 
 def _case(rdb, ip="45.9.20.7", trace="t-1"):

@@ -592,6 +592,35 @@ class CaseTransitionError(Exception):
     """Transición de estado no permitida desde el estado actual del caso."""
 
 
+class CaseConflictError(Exception):
+    """El caso cambió bajo el analista en todos los reintentos (escritura concurrente)."""
+
+
+CASE_UPDATE_RETRIES = 5
+CSV_FORMULA_PREFIXES = frozenset("=+-@\t\r\n＝＋－＠")   # OWASP + variantes de ancho completo
+CSV_SKIPPED_LEADING = " \"'"
+
+
+def csv_safe(value: object) -> str:
+    """Valor de una celda CSV sin riesgo de ser evaluado como fórmula.
+
+    None pasa a cadena vacía (sin prefijo); cualquier valor se convierte a str
+    y se antepone `'` si su primer carácter, o el primero tras espacios y
+    comillas iniciales, es un prefijo de fórmula.
+
+    Args:
+        value: valor de la celda.
+
+    Returns:
+        Texto seguro para escribir en el CSV.
+    """
+    text = "" if value is None else str(value)
+    stripped = text.lstrip(CSV_SKIPPED_LEADING)
+    if (text and text[0] in CSV_FORMULA_PREFIXES) or (stripped and stripped[0] in CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
 def _is_public_host(host: str | None) -> bool:
     try:
         return bool(host) and ipaddress.ip_address(host).is_global
@@ -708,10 +737,15 @@ def closed_cases_rows() -> list[dict]:
 
 
 def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> dict | None:
-    """Cambia el estado de un caso y lo deja en soc:cases:worked.
+    """Cambia el estado de un caso, de forma atómica, y lo deja en soc:cases:worked.
 
-    No valida rol: lo hace el endpoint (CASE_TARGET_MIN_ROLE) antes de leer.
-    No entra a la cadena hash de auditoría (limitación declarada en H60).
+    Lectura, validación y escritura van bajo WATCH sobre la clave del caso: si
+    otro proceso la escribe antes del EXEC (otro analista, o el worker al sumar
+    una ocurrencia), se relee y se revalida contra el estado real. SET, ZADD y
+    el recorte del tope van en un solo MULTI. No valida rol (lo hace el
+    endpoint). Limitación declarada: el worker no usa WATCH, así que si
+    escribe después de este EXEC con una lectura anterior, pisa el cambio
+    (H60, ROADMAP_2027).
 
     Args:
         case_id: id del caso.
@@ -725,33 +759,41 @@ def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> di
     Raises:
         ValueError: estado desconocido.
         CaseTransitionError: transición no permitida desde el estado actual.
+        CaseConflictError: el caso cambió en todos los reintentos.
+        redis.RedisError: Redis no respondió.
     """
     if new_state not in VALID_CASE_STATES:
         raise ValueError(f"Estado invalido: {new_state}")
 
     r = _get_redis()
-    raw = r.get(f"{CASES_KEY_PREFIX}{case_id}")
-    if raw is None:
-        return None
-
-    case = json.loads(raw)
-    current = case.get("state", "abierto")
-    if new_state not in CASE_TRANSITIONS.get(current, frozenset()):
-        raise CaseTransitionError(f"No se puede pasar de {current} a {new_state}")
-    now_ts = time.time()
-    now = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
-    case["state"] = new_state
-    case["updated_at"] = now
-    case.setdefault("history", []).append({
-        "state": new_state,
-        "at": now,
-        "note": note,
-        "actor": actor,
-    })
-    # SET sin TTL a propósito (H57): un caso que un analista tocó es evidencia
-    # y deja de expirar, aunque haya nacido como caso automático con TTL.
-    r.set(f"{CASES_KEY_PREFIX}{case_id}", json.dumps(case))
-    r.zadd(CASES_WORKED_KEY, {case_id: now_ts})
-    r.zremrangebyrank(CASES_WORKED_KEY, 0, -(CASES_WORKED_MAX + 1))  # tope duro
-    logging.info(f"caso {case_id} -> {new_state} por {actor}")
-    return case
+    key = f"{CASES_KEY_PREFIX}{case_id}"
+    with r.pipeline() as pipe:
+        for _ in range(CASE_UPDATE_RETRIES):
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if raw is None:
+                    return None
+                case = json.loads(raw)
+                current = case.get("state", "abierto")
+                if new_state not in CASE_TRANSITIONS.get(current, frozenset()):
+                    raise CaseTransitionError(f"No se puede pasar de {current} a {new_state}")
+                now_ts = time.time()
+                now = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
+                case["state"] = new_state
+                case["updated_at"] = now
+                case.setdefault("history", []).append({
+                    "state": new_state, "at": now, "note": note, "actor": actor,
+                })
+                pipe.multi()
+                # SET sin TTL a propósito (H57): un caso que un analista tocó es evidencia
+                # y deja de expirar, aunque haya nacido como caso automático con TTL.
+                pipe.set(key, json.dumps(case))
+                pipe.zadd(CASES_WORKED_KEY, {case_id: now_ts})
+                pipe.zremrangebyrank(CASES_WORKED_KEY, 0, -(CASES_WORKED_MAX + 1))  # tope duro
+                pipe.execute()
+            except redis.WatchError:
+                continue
+            logging.info(f"caso {case_id} {current} -> {new_state} por {actor}")
+            return case
+    raise CaseConflictError("El caso cambió mientras se actualizaba: reintentá")
