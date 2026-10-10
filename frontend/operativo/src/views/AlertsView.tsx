@@ -6,7 +6,7 @@ import { useAuth } from '../auth/AuthContext'
 import { EmptyState, ErrorNotice, Freshness, TableSkeleton, TierBadge } from '../components/common'
 import { ChainLink, ExplainPanel } from '../components/ExplainPanel'
 import { attackText, useExplain } from '../lib/explain'
-import { formatScore, formatTime, shortId } from '../lib/format'
+import { formatScore, formatTime, plainText, shortId } from '../lib/format'
 import { accionR2Label } from '../lib/r2'
 import {
   LOOKUP_MAX_IDS, lookupResponses, mergeLookups, responseState,
@@ -249,7 +249,7 @@ function AlertDetail({ d, r }: { d: Decision; r: ResponseRecord | undefined }) {
         <dt>OTX</dt><dd>{e ? otxStatus(e) : 'sin dato'}</dd>
         <dt>Fuentes que corroboran</dt><dd>{e?.corroborating_sources?.length ? e.corroborating_sources.join(', ') : 'ninguna'}</dd>
         <dt>CrowdSec (observacional)</dt><dd>{e?.crowdsec_observado ? (e.crowdsec_scenario ?? 'observado') : 'no observado'}</dd>
-        {r?.block?.reason && (<><dt>Respuesta R2</dt><dd>{r.block.reason}</dd></>)}
+        {r?.block?.reason && (<><dt>Respuesta R2</dt><dd>{plainText(r.block.reason)}</dd></>)}
       </dl>
       <ExplainPanel traceId={d.trace_id} role={role} load={load} />
       {trace && (

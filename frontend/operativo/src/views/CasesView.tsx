@@ -298,8 +298,8 @@ function CaseRow({ c, lookups, role, open, toggle, onUpdated }: RowProps) {
         <td className="mono">{c.host}</td>
         <td>{tier !== null ? <TierBadge tier={tier} /> : <span className="muted">sin dato</span>}</td>
         <td className="num mono">{formatScore(c.detail?.risk_score)}</td>
-        <td className="mono">{formatTime(c.opened_at)}</td>
-        <td className="mono">{formatTime(lastSeen(c))}</td>
+        <td className="mono nowrap">{formatTime(c.opened_at)}</td>
+        <td className="mono nowrap">{formatTime(lastSeen(c))}</td>
         <td className="num mono">{(c.occurrences ?? 1).toLocaleString('es-CL')}</td>
         <td><span className={`badge ${STATE_CLASS[c.state] ?? 'st-neutral'}`}>{CASE_STATE_LABEL[c.state] ?? c.state}</span></td>
         <td>{sourcesOf(rec)}</td>
@@ -349,8 +349,8 @@ function GroupRows({ net, cases, lookups, role, expanded, setExpanded, onUpdated
         <td className="mono">{net} <span className="muted small">({ips} {ips === 1 ? 'IP' : 'IPs'})</span></td>
         <td>{cases.some((c) => caseTier(c) === 2) ? <TierBadge tier={2} /> : <span className="muted">sin dato</span>}</td>
         <td className="num mono">{formatScore(risk)}</td>
-        <td className="mono">{formatTime(firstAt)}</td>
-        <td className="mono">{formatTime(lastAt)}</td>
+        <td className="mono nowrap">{formatTime(firstAt)}</td>
+        <td className="mono nowrap">{formatTime(lastAt)}</td>
         <td className="num mono">{occ.toLocaleString('es-CL')}</td>
         <td>{states}</td>
         <td>{sources.length ? sources.join(', ') : 'ninguna o sin dato'}</td>

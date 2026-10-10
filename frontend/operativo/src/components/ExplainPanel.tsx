@@ -1,6 +1,6 @@
 import type { ChainVerification, ExplainSignal, Role } from '../api/types'
 import { canExplain, EXPLAIN_NOTE, type ExplainLoad } from '../lib/explain'
-import { formatScore } from '../lib/format'
+import { formatScore, plainText } from '../lib/format'
 
 function fmtValue(v: unknown): string {
   if (typeof v === 'number') return Number.isInteger(v) ? String(v) : formatScore(v)
@@ -80,18 +80,18 @@ function ExplainBody({ load }: { load: ExplainLoad }) {
     <div className="explain">
       {fp ? (
         <section aria-label="Fast Path">
-          <p className="small"><strong>Tier:</strong> <span className="mono">{fp.regla.id}</span> {fp.regla.texto} <Consistency ok={fp.consistente} /></p>
+          <p className="small"><strong>Tier:</strong> <span className="mono">{fp.regla.id}</span> {plainText(fp.regla.texto)} <Consistency ok={fp.consistente} /></p>
           <SignalRows signals={fp.senales} gate={false} />
         </section>
       ) : <p className="muted small">Sin documento del Fast Path para este trace_id.</p>}
       {rp ? (
         <section aria-label="Respuesta R1 y R2">
-          <p className="small"><strong>R2:</strong> <span className="mono">{rp.r2.regla.id}</span> {rp.r2.regla.texto} <Consistency ok={rp.consistente} /></p>
+          <p className="small"><strong>R2:</strong> <span className="mono">{rp.r2.regla.id}</span> {plainText(rp.r2.regla.texto)} <Consistency ok={rp.consistente} /></p>
           <SignalRows signals={rp.r1.senales} gate />
-          {rp.r1.notas.length > 0 && <p className="muted small">Notas de R1: {rp.r1.notas.join('; ')}</p>}
+          {rp.r1.notas.length > 0 && <p className="muted small">Notas de R1: {rp.r1.notas.map(plainText).join('; ')}</p>}
         </section>
       ) : <p className="muted small">Sin registro de respuesta R1/R2 para este trace_id.</p>}
-      <p className="muted small">{load.trace.version}. {load.trace.limitaciones.join(' ')}</p>
+      <p className="muted small">{load.trace.version}. {load.trace.limitaciones.map(plainText).join(' ')}</p>
     </div>
   )
 }

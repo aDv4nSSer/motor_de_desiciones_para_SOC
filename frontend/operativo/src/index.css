@@ -392,7 +392,7 @@ table.data { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .row-detail td { background: var(--surface-2); }
 .data tr.row-detail:hover td { background: var(--surface-2); }
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--s5); padding: var(--s2) 0; }
-.detail-grid dl, dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: var(--s1) var(--s3); margin: 0; font-size: 13px; }
+.detail-grid dl, dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: var(--s1) var(--s3); margin: 0; font-size: 13px; align-content: start; }
 .detail-grid dt, dl.kv dt { color: var(--text-muted); }
 .detail-grid dd, dl.kv dd { margin: 0; min-width: 0; }
 .detail-label { font-weight: 600; font-size: 13px; margin-bottom: var(--s1); }
@@ -572,7 +572,9 @@ details.table-view summary { cursor: pointer; color: var(--brand); }
 .case-timeline li { display: grid; grid-template-columns: 150px minmax(0, 1fr); column-gap: var(--s3); }
 .case-timeline li > .muted { grid-column: 2; }
 .case-actions { display: grid; gap: var(--s2); max-width: 640px; }
-.case-actions .confirm { display: grid; gap: var(--s2); justify-items: start; }
+.case-actions .row-actions { justify-content: flex-start; align-items: center; }
+.case-actions .confirm { display: flex; flex-wrap: wrap; gap: var(--s2); justify-content: flex-start; align-items: center; max-width: 640px; }
+table.data td.nowrap { white-space: nowrap; }
 .case-actions .field { width: 100%; }
 .case-actions textarea.input { min-height: 72px; padding: var(--s2) var(--s3); resize: vertical; }
 table.data.compact { font-size: 12.5px; margin-top: var(--s1); }

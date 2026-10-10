@@ -45,3 +45,9 @@ export function requiredLevel(level: string | null | undefined): Role {
 export function roleReaches(role: Role, level: string | null | undefined): boolean {
   return ROLE_LEVEL[role] >= ROLE_LEVEL[requiredLevel(level)]
 }
+
+/** Textos que vienen del backend (motivos de R2, reglas de la traza) llevan
+ *  guiones largos; la UI no los usa: se muestran con coma, sin cambiar el dato. */
+export function plainText(s: string | null | undefined): string {
+  return (s ?? '').replace(/\s*[—–]\s*/g, ', ')
+}
