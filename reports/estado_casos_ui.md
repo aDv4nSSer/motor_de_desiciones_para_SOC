@@ -172,6 +172,19 @@ scripts/deploy_operativo.sh
 3. Después, `git switch develop` antes del próximo `git pull` (en HEAD desacoplado el pull falla), y anotar el evento.
 4. Si falla solo el bundle: solo el paso 1, el backend nuevo se queda.
 
+## 4b. Deploy incremental desde `ee0004d` (ya en producción desde el 10-oct, H62)
+
+Producción corre `ee0004d` (restart 14:37:33 -03, bundle ~16:47). Los 3 commits de H61 suman **un cambio de backend** (`motor/dashboard.py`: `with_regime` en `get_recent_decisions`) y cambios de frontend (Alertas, Casos, Aprobaciones). Orden, cada paso con OK:
+
+1. Mac: `git push origin feature/casos-ui:develop` (develop avanza de `ee0004d` a la punta de H61).
+2. `.140`, una conexión: `cd ~/tesis/repo && git pull --ff-only && git log --oneline -1`.
+3. **Restart de `motor-soc`** (~15 s sin Fast Path), porque cambió `motor/dashboard.py`: `sudo systemctl restart motor-soc`; anotar hora real. No se toca `response-worker`.
+4. Verificar sin SSH: `curl -s https://motor-soc-ubo.duckdns.org/health`.
+5. Mac: `scripts/deploy_operativo.sh` (tests, build y copia atómica por rsync/tar sobre una conexión; deja `operativo.prev`). Backend primero: el bundle nuevo espera `regime_id` y, sin él, muestra "sin dato" (compatible, pero sin el dato).
+6. Verificar como `aiayala`: Alertas muestra "Respuesta pendiente" en filas recientes y `regime_id` con "derivado de la hora de la decisión" en el detalle; Aprobaciones con el interruptor "Agrupar por /24"; Casos con la nota nueva. **No cerrar casos de prueba.**
+
+Rollback: bundle con `scripts/deploy_operativo.sh --rollback`; backend con `git switch --detach ee0004d` y `sudo systemctl restart motor-soc`; después `git switch develop`.
+
 ## 5. Revisión independiente de `55f4b7b` y de `fa273ad` (agente sin contexto de la implementación)
 
 Leyó el diff, corrió los 38 tests del commit y escribió tests propios fuera del repo para reproducir cada problema. Confirmé por mi cuenta los puntos 2 y 11. **No apliqué ningún arreglo al backend:** cambiarían lo que vas a revisar. Mi propuesta está en la última columna.
