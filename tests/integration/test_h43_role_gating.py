@@ -23,6 +23,7 @@ ENDPOINTS = [
     ("GET", "/api/v1/dashboard/nodes", None, "N1"),
     ("GET", f"/api/v1/dashboard/audit/trace/{TRACE}", None, "N2"),
     ("GET", "/api/v1/dashboard/audit/chain", None, "N2"),
+    ("GET", f"/api/v1/dashboard/explain/{TRACE}", None, "N2"),
     ("GET", "/api/v1/dashboard/audit/access", None, "CISO!"),
     ("GET", "/api/v1/dashboard/users", None, "N2"),
     ("POST", "/api/v1/dashboard/users", {"username": "nuevo.op", "password": PASSWORD, "role": "N1"}, "N2"),
@@ -47,6 +48,7 @@ def env(monkeypatch, mocker):
     import audit_view
     import auth
     import compliance
+    import explain
     import user_admin
     import users
     from fastapi.testclient import TestClient
@@ -60,7 +62,9 @@ def env(monkeypatch, mocker):
         monkeypatch.setattr(mod, "log_access_event", mocker.MagicMock())
     monkeypatch.setattr(main, "get_node_status", lambda: {"overall": "ok", "components": []})
     monkeypatch.setattr(audit_view, "search_trace",
-                        lambda trace_id, include_access: {"trace_id": trace_id, "include_access": include_access})
+                        lambda trace_id, include_access: {"trace_id": trace_id, "include_access": include_access,
+                                                          "decisions": [{"doc": {}}], "events": []})
+    monkeypatch.setattr(explain, "explain_trace", lambda trace, s: {"version": "explain-v1", "trace_id": trace["trace_id"]})
     monkeypatch.setattr(audit_view, "chain_status", lambda: {"chains": {}})
     monkeypatch.setattr(audit_view, "access_events", lambda limit, username: {"available": True, "items": []})
     monkeypatch.setattr(compliance, "compliance_report", lambda w, n, **kw: {"checklist": []})

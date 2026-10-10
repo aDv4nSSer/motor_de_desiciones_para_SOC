@@ -16,6 +16,7 @@ from pathlib import Path
 
 import audit_view
 import compliance
+import explain
 import redis
 import user_admin
 from attck_mapping import attack_fields, get_mapping
@@ -627,6 +628,23 @@ def dashboard_audit_trace(
     is_ciso = user.role == "CISO"
     log_access_event(user.username, "audit_trace_viewed", {"trace_id": trace_id})
     return {**audit_view.search_trace(trace_id, include_access=is_ciso), "scope": "full" if is_ciso else "partial"}
+
+
+@app.get("/api/v1/dashboard/explain/{trace_id}")
+def dashboard_explain(
+    trace_id: str = PathParam(..., max_length=64),
+    user: User = Depends(REQUIRE_N2),
+):
+    """Traza explicativa v1 (H59): señales, pesos y regla que fijaron el tier
+    y la acción de R2, reconstruidas de lo guardado. Solo lectura: no vuelve
+    a puntuar ni decide. Misma visibilidad que el historial parcial (N2)."""
+    if not audit_view.valid_trace_id(trace_id):
+        raise HTTPException(status_code=422, detail="trace_id inválido")
+    log_access_event(user.username, "explain_viewed", {"trace_id": trace_id})
+    trace = audit_view.search_trace(trace_id, include_access=False)
+    if not trace.get("decisions") and not trace.get("events"):
+        raise HTTPException(status_code=404, detail="trace_id sin registros")
+    return explain.explain_trace(trace, get_response_settings())
 
 
 @app.get("/api/v1/dashboard/audit/chain")
