@@ -8,10 +8,12 @@ una capa de lectura pura sobre el estado real del sistema. Tesis UBO.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import logging
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -560,7 +562,170 @@ def list_cases(only_open: bool = False, limit: int = 50) -> list[dict]:
     return cases
 
 
+# ── Casos trabajados por un analista (H60) ──────────────────────────────────
+# soc:cases:recent ordena por última ocurrencia; un caso que un analista movió
+# ya no suma ocurrencias (la recurrencia abre otro caso), así que se hunde y
+# con ~500 casos/h sale de la ventana de CASES_LIST_SCAN_MAX en unas 4 h.
+# Este ZSET guarda solo los casos tocados por un analista, por hora del último
+# cambio, con tope duro: lo que pase de CASES_WORKED_MAX se recorta por rango
+# (el caso en sí sigue en Redis sin TTL, como antes; solo sale del listado).
+CASES_WORKED_KEY = "soc:cases:worked"
+CASES_WORKED_MAX = 5000
+CASES_PAGE_MAX_LIMIT = 200
+CLOSED_CASE_STATES = frozenset({"cerrado_confirmado", "cerrado_falso_positivo"})
+WORKED_CASE_STATES = CLOSED_CASE_STATES | {"en_investigacion"}
+
+# Transiciones permitidas y rol mínimo por estado destino (sección 5 de la
+# especificación: N1 investiga, N2 y CISO cierran). Los cerrados son finales.
+CASE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "abierto": frozenset({"en_investigacion", "cerrado_confirmado", "cerrado_falso_positivo"}),
+    "en_investigacion": frozenset({"cerrado_confirmado", "cerrado_falso_positivo"}),
+}
+CASE_TARGET_MIN_ROLE: dict[str, str] = {
+    "en_investigacion": "N1",
+    "cerrado_confirmado": "N2",
+    "cerrado_falso_positivo": "N2",
+}
+
+
+class CaseTransitionError(Exception):
+    """Transición de estado no permitida desde el estado actual del caso."""
+
+
+def _is_public_host(host: str | None) -> bool:
+    try:
+        return bool(host) and ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
+def list_cases_page(
+    state: str | None = None, public_only: bool = True, since_hours: int | None = None,
+    cursor: int = 0, limit: int = 50, now: float | None = None,
+) -> dict:
+    """Página de casos con filtros, leída de un índice acotado (H60).
+
+    Los casos en investigación o cerrados se leen de soc:cases:worked; el resto
+    de soc:cases:recent. Cada pedido lee a lo sumo CASES_LIST_SCAN_MAX ids, en
+    lotes de MGET de CASES_LIST_BATCH: nunca el índice completo (H54).
+
+    Args:
+        state: filtra por estado; None = todos los del índice reciente.
+        public_only: excluye IPs privadas, de infra propia y hosts no IP.
+        since_hours: solo casos con actividad en las últimas N horas.
+        cursor: posición en el índice desde donde seguir (next_cursor previo).
+        limit: casos por página (1 a CASES_PAGE_MAX_LIMIT).
+        now: epoch de referencia (tests).
+
+    Returns:
+        {"items", "next_cursor" (None si no hay más), "scanned", "source",
+         "index_size", "scan_cap_reached", "available"}.
+    """
+    limit = max(1, min(limit, CASES_PAGE_MAX_LIMIT))
+    worked = state in WORKED_CASE_STATES
+    key = CASES_WORKED_KEY if worked else CASES_RECENT_KEY
+    out: dict = {"items": [], "next_cursor": None, "scanned": 0, "source": "worked" if worked else "recent",
+                 "index_size": None, "scan_cap_reached": False, "available": True}
+    try:
+        r = _get_redis()
+        out["index_size"] = r.zcard(key)
+    except Exception as e:
+        logging.error(f"no se pudo leer casos de Redis: {e}")
+        return {**out, "available": False}
+
+    min_score: float | str = "-inf"
+    if since_hours:
+        min_score = (now if now is not None else time.time()) - since_hours * 3600
+    pos = cursor
+    while out["scanned"] < CASES_LIST_SCAN_MAX:
+        batch = min(CASES_LIST_BATCH, CASES_LIST_SCAN_MAX - out["scanned"])
+        try:
+            ids = r.zrevrangebyscore(key, "+inf", min_score, start=pos, num=batch)
+            if not ids:
+                return out
+            raws = r.mget([f"{CASES_KEY_PREFIX}{cid}" for cid in ids])
+        except Exception as e:
+            logging.error(f"no se pudo leer casos de Redis: {e}")
+            return {**out, "available": False}
+        for raw in raws:
+            pos += 1
+            out["scanned"] += 1
+            if not raw:
+                continue
+            try:
+                case = json.loads(raw)
+            except ValueError:
+                continue
+            if state and case.get("state") != state:
+                continue
+            if public_only and not _is_public_host(case.get("host")):
+                continue
+            out["items"].append(case)
+            if len(out["items"]) >= limit:
+                out["next_cursor"] = pos
+                return out
+        if len(ids) < batch:
+            return out
+    out["next_cursor"] = pos
+    out["scan_cap_reached"] = True
+    return out
+
+
+def get_case(case_id: str) -> dict | None:
+    """Un caso por id (GET O(1)); None si no existe o expiró."""
+    raw = _get_redis().get(f"{CASES_KEY_PREFIX}{case_id}")
+    return json.loads(raw) if raw else None
+
+
+def closed_cases_rows() -> list[dict]:
+    """Cierres registrados en soc:cases:worked (a lo sumo CASES_WORKED_MAX),
+    para la exportación CSV de solo lectura. Hora y actor salen del último
+    evento del historial con el estado de cierre."""
+    r = _get_redis()
+    rows: list[dict] = []
+    for start in range(0, CASES_WORKED_MAX, CASES_LIST_BATCH):
+        ids = r.zrevrange(CASES_WORKED_KEY, start, start + CASES_LIST_BATCH - 1)
+        if not ids:
+            break
+        for raw in r.mget([f"{CASES_KEY_PREFIX}{cid}" for cid in ids]):
+            if not raw:
+                continue
+            try:
+                case = json.loads(raw)
+            except ValueError:
+                continue
+            if case.get("state") not in CLOSED_CASE_STATES:
+                continue
+            closing = next((h for h in reversed(case.get("history") or [])
+                            if h.get("state") == case["state"]), {})
+            rows.append({
+                "case_id": case.get("case_id", ""), "ip": case.get("host", ""),
+                "net24": case.get("net24") or "", "estado": case["state"],
+                "hora": closing.get("at", case.get("updated_at", "")), "actor": closing.get("actor", ""),
+                "trace_id": (case.get("detail") or {}).get("trace_id", ""),
+            })
+    return rows
+
+
 def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> dict | None:
+    """Cambia el estado de un caso y lo deja en soc:cases:worked.
+
+    No valida rol: lo hace el endpoint (CASE_TARGET_MIN_ROLE) antes de leer.
+    No entra a la cadena hash de auditoría (limitación declarada en H60).
+
+    Args:
+        case_id: id del caso.
+        new_state: estado destino.
+        note: nota del analista (el endpoint exige nota al cerrar).
+        actor: usuario que hace el cambio.
+
+    Returns:
+        El caso actualizado, o None si no existe.
+
+    Raises:
+        ValueError: estado desconocido.
+        CaseTransitionError: transición no permitida desde el estado actual.
+    """
     if new_state not in VALID_CASE_STATES:
         raise ValueError(f"Estado invalido: {new_state}")
 
@@ -570,7 +735,11 @@ def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> di
         return None
 
     case = json.loads(raw)
-    now = datetime.now(timezone.utc).isoformat()
+    current = case.get("state", "abierto")
+    if new_state not in CASE_TRANSITIONS.get(current, frozenset()):
+        raise CaseTransitionError(f"No se puede pasar de {current} a {new_state}")
+    now_ts = time.time()
+    now = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
     case["state"] = new_state
     case["updated_at"] = now
     case.setdefault("history", []).append({
@@ -582,5 +751,7 @@ def update_case_state(case_id: str, new_state: str, note: str, actor: str) -> di
     # SET sin TTL a propósito (H57): un caso que un analista tocó es evidencia
     # y deja de expirar, aunque haya nacido como caso automático con TTL.
     r.set(f"{CASES_KEY_PREFIX}{case_id}", json.dumps(case))
+    r.zadd(CASES_WORKED_KEY, {case_id: now_ts})
+    r.zremrangebyrank(CASES_WORKED_KEY, 0, -(CASES_WORKED_MAX + 1))  # tope duro
     logging.info(f"caso {case_id} -> {new_state} por {actor}")
     return case

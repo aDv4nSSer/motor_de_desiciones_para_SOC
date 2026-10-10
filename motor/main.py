@@ -4,6 +4,8 @@ FastAPI: recibe flows de Vector (single o batch), clasifica con ML, publica a Re
 Tesis UBO — Motor de decisión basado en riesgo para SOAR en SOC
 """
 import asyncio
+import csv
+import io
 import json
 import logging
 import multiprocessing
@@ -13,6 +15,7 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import audit_view
 import compliance
@@ -31,9 +34,15 @@ from auth import (
 from auth import login as auth_login
 from constants import T3_CLASSTYPES
 from dashboard import (
+    CASE_TARGET_MIN_ROLE,
+    CASES_PAGE_MAX_LIMIT,
+    CLOSED_CASE_STATES,
     DECISIONS_MAX_LIMIT,
     RESPONSE_LOOKUP_MAX_IDS,
+    CaseTransitionError,
+    closed_cases_rows,
     get_active_blocks,
+    get_case,
     get_experimental_detections,
     get_port_stats,
     get_precision_stats,
@@ -42,6 +51,7 @@ from dashboard import (
     get_stats,
     get_watcher_heartbeat,
     list_cases,
+    list_cases_page,
     lookup_responses,
     update_case_state,
 )
@@ -50,9 +60,9 @@ from dashboard import (
 )
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi import Path as PathParam
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # H36: "from model import get_model" NO va a nivel de módulo a propósito —
 # ver _init_score_worker() más abajo para el porqué (contención de joblib/
@@ -72,7 +82,7 @@ from schemas import FlowFeatures
 from sessions import revoke_session
 from system_status import get_node_status
 from trace_middleware import TRACE_ID_PATTERN, TraceIdMiddleware
-from users import ROLE_LEVEL, Role, User, get_user_record
+from users import ROLE_LEVEL, Role, User, get_user_record, role_at_least
 
 logging.basicConfig(
     level=logging.INFO,
@@ -398,16 +408,85 @@ def dashboard_cases(only_open: bool = False, limit: int = 50, user: User = Depen
     return list_cases(only_open=only_open, limit=limit)
 
 
-@app.post("/api/v1/dashboard/cases/{case_id}/state")
-def dashboard_update_case(
-    case_id: str,
-    payload: dict,
+CASE_ID_PATTERN = r"^[0-9a-fA-F-]{36}$"
+CASE_STATE_TARGETS = Literal["en_investigacion", "cerrado_confirmado", "cerrado_falso_positivo"]
+CASE_NOTE_MIN_CHARS = 3
+CASE_NOTE_MAX_CHARS = 1000
+
+
+class CaseStateRequest(BaseModel):
+    """Cambio de estado de un caso (H60): nota obligatoria al cerrar."""
+    state: CASE_STATE_TARGETS
+    note: str = Field("", max_length=CASE_NOTE_MAX_CHARS)
+
+    @model_validator(mode="after")
+    def _note_required_to_close(self) -> "CaseStateRequest":
+        self.note = self.note.strip()
+        if self.state in CLOSED_CASE_STATES and len(self.note) < CASE_NOTE_MIN_CHARS:
+            raise ValueError(f"cerrar un caso exige una nota de al menos {CASE_NOTE_MIN_CHARS} caracteres")
+        return self
+
+
+@app.get("/api/v1/dashboard/cases/page")
+def dashboard_cases_page(
+    state: Literal["abierto", "en_investigacion", "cerrado_confirmado", "cerrado_falso_positivo"] | None = None,
+    public_only: bool = True,
+    since_hours: int | None = Query(None, ge=1, le=168),
+    cursor: int = Query(0, ge=0, le=100_000),
+    limit: int = Query(50, ge=1, le=CASES_PAGE_MAX_LIMIT),
     user: User = Depends(get_current_user),
 ):
-    new_state = payload.get("state", "")
-    note = payload.get("note", "")
+    """Gestión interna de casos (H60): página con filtros sobre índices
+    acotados (soc:cases:recent o soc:cases:worked), nunca el índice completo."""
+    return list_cases_page(state=state, public_only=public_only, since_hours=since_hours,
+                           cursor=cursor, limit=limit)
+
+
+@app.get("/api/v1/dashboard/cases/closures.csv")
+def dashboard_cases_closures_csv(user: User = Depends(REQUIRE_N2)):
+    """Exportación de solo lectura de los cierres (IP, estado, hora, actor),
+    insumo de la muestra manual de precisión. Queda registrada como acceso."""
+    rows = closed_cases_rows()
+    buf = io.StringIO()
+    fields = ["case_id", "ip", "net24", "estado", "hora", "actor", "trace_id"]
+    writer = csv.DictWriter(buf, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
+        # Sin fórmulas al abrir en una planilla (inyección CSV).
+        writer.writerow({k: ("'" + v if isinstance(v, str) and v[:1] in "=+-@" else v) for k, v in row.items()})
+    log_access_event(user.username, "cases_closures_exported", {"rows": len(rows)})
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="cierres_casos.csv"'})
+
+
+@app.get("/api/v1/dashboard/cases/{case_id}")
+def dashboard_case(
+    case_id: str = PathParam(..., pattern=CASE_ID_PATTERN),
+    user: User = Depends(get_current_user),
+):
+    case = get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Caso no encontrado")
+    return case
+
+
+@app.post("/api/v1/dashboard/cases/{case_id}/state")
+def dashboard_update_case(
+    payload: CaseStateRequest,
+    case_id: str = PathParam(..., pattern=CASE_ID_PATTERN),
+    user: User = Depends(get_current_user),
+):
+    """N1 pasa un caso a investigación; N2 y CISO lo cierran (H60). El rol se
+    valida contra el estado destino antes de leer el caso."""
+    minimum = CASE_TARGET_MIN_ROLE[payload.state]
+    if not role_at_least(user.role, minimum):
+        log_access_event(user.username, "action_denied_role",
+                         {"required": minimum, "actual": user.role, "action": f"case_{payload.state}"})
+        raise HTTPException(status_code=403, detail=f"Requiere rol {minimum} o superior (tiene {user.role})")
     try:
-        case = update_case_state(case_id, new_state, note, actor=user.username)
+        case = update_case_state(case_id, payload.state, payload.note, actor=user.username)
+    except CaseTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if case is None:

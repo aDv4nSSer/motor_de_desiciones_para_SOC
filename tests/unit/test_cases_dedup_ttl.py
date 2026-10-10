@@ -65,6 +65,23 @@ class FakeRedis:
         ordered = sorted(self.zsets.get(key, {}).items(), key=lambda x: -x[1])
         return [m for m, _ in ordered[start:end + 1]]
 
+    def zrevrangebyscore(self, key, hi, lo, start=0, num=None):
+        lo = float(lo)
+        ordered = [m for m, s in sorted(self.zsets.get(key, {}).items(), key=lambda x: -x[1]) if s >= lo]
+        return ordered[start:start + num] if num is not None else ordered[start:]
+
+    def zremrangebyrank(self, key, start, end):
+        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda x: x[1])
+        n = len(ordered)
+        end = n + end if end < 0 else end
+        if end < start:
+            return  # rango vacío, como Redis
+        for m, _ in ordered[start:end + 1]:
+            del self.zsets[key][m]
+
+    def zcard(self, key):
+        return len(self.zsets.get(key, {}))
+
     def expire_now(self, key):
         self.kv.pop(key, None)
 
