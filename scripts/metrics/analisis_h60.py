@@ -747,6 +747,13 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _corto(path: Path) -> str:
+    """Ruta con el home reemplazado por `~`: el manifiesto se versiona en un repo público."""
+    home = str(Path.home())
+    text = str(path)
+    return "~" + text[len(home):] if text.startswith(home) else text
+
+
 def _inside_git(path: Path) -> bool:
     try:
         r = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],  # nosec B603 B607 - comando fijo
@@ -802,7 +809,7 @@ def escribir(entrada: Path, out: Path, archivo: Path | None = None) -> int:
                (f"Extraído {params.get('extraido_utc', 'sin dato')} UTC; ventana desde {params.get('desde')} hasta "
                f"{params.get('hasta') or 'la extracción'}; muestra de la unión de A: 1 de cada "
                f"{params.get('muestra_union_1_de', '1')}.\n"),
-               (f"Archivo: `{csv_dir}`. Script: `scripts/metrics/analisis_h60.py` en `{rev or 'sin dato'}` "
+               (f"Archivo: `{_corto(csv_dir)}`. Script: `scripts/metrics/analisis_h60.py` en `{rev or 'sin dato'}` "
                f"(sha256 `{_sha256(script)}`).\n"),
                "Verificar: `shasum -a 256 <archivo>` debe dar el hash de la tabla.\n",
                "| Archivo | Filas | Bytes | sha256 |", "|---|---|---|---|"]
@@ -810,7 +817,7 @@ def escribir(entrada: Path, out: Path, archivo: Path | None = None) -> int:
             f = csv_dir / name
             man.append(f"| `{name}` | {'' if n is None else n} | {f.stat().st_size} | `{_sha256(f)}` |")
         (out / "manifiesto_h60.md").write_text("\n".join(man) + "\n", encoding="utf-8")
-        lines.append(f"Salidas CSV archivadas fuera de git en `{csv_dir}`; hashes en `manifiesto_h60.md`.")
+        lines.append(f"Salidas CSV archivadas fuera de git en `{_corto(csv_dir)}`; hashes en `manifiesto_h60.md`.")
     (out / "analisis_h60.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     print("\n".join(lines))
     return 0

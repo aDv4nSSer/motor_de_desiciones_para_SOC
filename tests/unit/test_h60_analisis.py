@@ -179,3 +179,13 @@ def test_archivo_dentro_de_git_aborta(tmp_path) -> None:
     raw.write_text(RAW_D, encoding="utf-8")
     assert h60.escribir(raw, tmp_path / "o", ROOT / "reports" / "no_deberia_crearse") == 1
     assert not (ROOT / "reports" / "no_deberia_crearse").exists()
+
+
+def test_manifiesto_no_incluye_el_home(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    raw = tmp_path / "crudo.txt"
+    raw.write_text(RAW_D, encoding="utf-8")
+    assert h60.escribir(raw, tmp_path / "o", tmp_path / "arch") == 0
+    texto = (tmp_path / "o" / "manifiesto_h60.md").read_text(encoding="utf-8") + \
+        (tmp_path / "o" / "analisis_h60.md").read_text(encoding="utf-8")
+    assert str(tmp_path) not in texto and "~/arch/h60_" in texto
