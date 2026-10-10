@@ -3029,6 +3029,58 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 
 ---
 
+## H59: Régimen R4 medido, simulación de D2, traza explicativa v1, escaneo de secretos y preparados del 11-oct
+
+**Fecha:** 10-oct-2026, 02:00 a 03:00 -03. Ramas locales, sin push, deploy ni restart. Sobre producción hubo solo lecturas, en tres conexiones SSH: 02:01:52, 02:06 (verificación de un falso 429) y 02:24:00 -03, más una lectura de huellas del `.env`. Detalle y tablas en `reports/estado_10oct_manana.md`.
+
+**Régimen R4 (desde el 9-oct 11:21:00 -03).**
+- AbuseIPDB:
+  - 323 consultas reales, todas `tier=3 decisiva=True`; `tier=2` = 0;
+  - **0 respuestas HTTP 429** (las 3 coincidencias del patrón eran el gauge "restan 429/1000" y dos `case_id`);
+  - 0 consumo externo; gauge a las 02:01: 970/1000.
+- Aprobaciones creadas: 290 en 14,7 h (19,7/h). La línea base del 9-oct era 1.625 en 24 h (67,7/h): **−71%**. Pendientes ahora: 13 (base: 186).
+- IPs T3 distintas: 386; bloqueadas automáticamente al menos una vez: 307.
+- La conciliación da "diferencia explicada" en las tres ventanas (desde el corte, día UTC 10-oct y 24 h móviles).
+- Redis: 854 MB de 1,5 GB, `evicted_keys` 72.205 sin crecer.
+- Indexador: lag 0 en 7 de 8 lecturas; hubo dos picos momentáneos de pending 12, sin sostenerse.
+
+**D2 (bucket diario con ráfaga).**
+- Rebasado sobre `43a62bd`: `27830f2`, 778 passed, pre-commit limpio, foto fija de R2 sin cambios.
+- Desde el corte, 2.906 docs T3 (**288 IPs, 74,6% de las IPs T3**) quedaron "presupuesto de la ventana agotado". Todos con count 1 y en aprobación.
+- La simulación offline con los parámetros reales de D2 da dos escenarios:
+  - **A, el 9-oct real** (arranque conservador a mitad de día, 522 ya usadas): solo 9 IPs más consultadas y 7 IPs de aprobación a bloqueo. El límite fue el ritmo de 36/h, no la ráfaga.
+  - **B, día UTC limpio** con la misma demanda: 273 IPs más consultadas; **234 IPs (observadas) + ~36 (imputadas, p = 0,95)** pasarían de aprobación a bloqueo automático, con un máximo de 652 usadas en el día (techo 864).
+- La regla de decisión y los comandos para las 21:00 están en el informe.
+- Rebasar `feature/cumplimiento` + `feature/explicabilidad` sobre D2 no genera conflictos (prueba descartable, 849 passed).
+
+**Explicabilidad (`feature/explicabilidad`, sobre `feature/cumplimiento`).**
+- `motor/explain.py` y `GET /api/v1/dashboard/explain/{trace_id}` (N2, solo lectura). Reconstruyen señales, pesos y la regla del tier y de R2 a partir de lo guardado, y marcan `consistente=False` si no coincide.
+- Sobre los 180 docs reales, la regla de la traza produce exactamente la acción de `process_task`.
+- La tabla ATT&CK por SID (30 días) da 375 SIDs y **solo el 4,0% de las alertas con técnica**: el 96% son classtypes que el YAML deja sin técnica (Misc Attack 73,6%, Generic Protocol Command Decode 18,5%).
+- `verify_chain.py` ya era único para las cadenas vigentes desde H57; el legado conserva su script por la fórmula distinta.
+- SHAP queda pendiente y declarado en cada traza.
+
+**Régimen R4** agregado a `motor/regimes.py` (`bd27c8f`).
+
+**Secretos.**
+- El repo es público. Se escaneó todo el historial (217 commits, todas las ramas, mensajes de commit incluidos) contra las huellas de los 7 secretos vigentes del `.env` de `.140` y de la key de `.139`, recorriendo todas las subcadenas y con control positivo: **ninguno aparece**.
+- Sí están en el historial:
+  - el nombre del `CONFIG` renombrado (bitácora H32, `41f1f57`);
+  - la topología (IP pública, puerto SSH 2222, VLANs, dominio duckdns).
+- Los `password=` hardcodeados de H32 son la password de Redis ya rotada.
+
+**Preparados para el 11-oct.**
+- Las cuentas `smoke-*` ya están deshabilitadas desde el 4-oct (H44), sin sesiones y fuera del índice: no hay nada que desactivar.
+- Réplicas: 183 shards sin asignar en 183 índices: `security-auditlog` 101, `suricata-alerts` 72, ISM y sistema 9, `soc-experimental-detections` 1. No hay plantilla para `suricata-alerts-*` ni para `security-auditlog-*`.
+- `soc:users:index` está vacío; el único legítimo es `aiayala`.
+- IF: cron domingo 04:00 -03; corpus 2026-06-20 13:52; hash `4958eb4b`; script posterior en `scripts/mantenimiento/h59_verificar_if_domingo.sh`.
+
+**Hallazgos.**
+- Antes del 3-oct, el `worker.log` tiene entre 16.000 y 107.000 líneas por día con `api.abuseipdb.com`, contra ~1.000 por día desde el 3-oct. Son reintentos y 429, no consultas cobradas: no usar esa serie como consumo.
+- `origin/main` está 99 commits detrás de `develop`.
+
+---
+
 ## Pendientes detectados (no resueltos hoy)
 
 - ~~**Desacuerdo de grupos unilaterales (H53)**~~ → **resuelto con P4** (`a90df02`): solo `ml` y `ti` marcan `ambiguous`. Mismo tráfico: T3 `ambiguous` 53,1% → 39,2%.
