@@ -587,3 +587,4 @@ table.data.compact th, table.data.compact td { padding: 4px 8px; }
   .case-timeline li { grid-template-columns: 1fr; }
   .case-timeline li > .muted { grid-column: 1; }
 }
+.approval-group { padding: 8px 12px; background: var(--surface-2); font-weight: 500; list-style: none; }

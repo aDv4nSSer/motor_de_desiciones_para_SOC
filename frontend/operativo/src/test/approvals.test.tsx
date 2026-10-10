@@ -30,6 +30,27 @@ async function openApprovals(role: 'N1' | 'N2' | 'CISO', resolve: (url: string, 
   return { user, ...mock }
 }
 
+describe('agrupar por /24', () => {
+  const lista = [
+    approval({ trace_id: 'a-1', src_ip: '91.92.42.10' }),
+    approval({ trace_id: 'a-2', src_ip: '203.0.113.50' }),
+    approval({ trace_id: 'a-3', src_ip: '91.92.42.11' }),
+  ]
+
+  it('encabezado por red con la cantidad de IPs, sin acciones en lote', async () => {
+    const { user, calls } = await openApprovals('N1', () => json(200, {}), lista)
+    expect(screen.queryByText('91.92.42.0/24')).not.toBeInTheDocument()
+    await user.click(screen.getByLabelText('Agrupar por /24'))
+    const head = screen.getByText('91.92.42.0/24').closest('li')!
+    expect(within(head).getByText('(2 IPs)')).toBeInTheDocument()
+    expect(screen.getByText('203.0.113.0/24').closest('li')).toHaveTextContent('(1 IP)')
+    expect(screen.getAllByRole('button', { name: /Aprobar/ })).toHaveLength(3) // una acción por IP
+    expect(calls.some((c) => c.url.endsWith('/resolve'))).toBe(false)
+    await user.click(screen.getByLabelText('Agrupar por /24'))
+    expect(screen.queryByText('91.92.42.0/24')).not.toBeInTheDocument()
+  })
+})
+
 describe('aprobar / rechazar', () => {
   it('sin optimistic update: el ítem sigue en la lista hasta el 200 del servidor', async () => {
     let release!: (r: Response) => void

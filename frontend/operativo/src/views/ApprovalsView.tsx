@@ -6,6 +6,7 @@ import type { Approval, ApprovalsPage } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { EmptyState, ErrorNotice, Freshness, LevelBadge, TableSkeleton, TierBadge } from '../components/common'
 import { formatScore, formatTime, requiredLevel, roleReaches, shortId } from '../lib/format'
+import { groupByNet, net24Of } from '../lib/net'
 import { usePolling } from '../lib/usePolling'
 
 type Decision = 'approved' | 'rejected'
@@ -31,6 +32,7 @@ export function ApprovalsView() {
   const [removed, setRemoved] = useState<Set<string>>(new Set())
   const [resolved, setResolved] = useState<Resolved[]>([])
   const [visible, setVisible] = useState(PAGE)
+  const [group24, setGroup24] = useState(false)
 
   if (!user) return null
   const role = user.role
@@ -41,6 +43,14 @@ export function ApprovalsView() {
   const resolvedHere = (page?.items ?? []).filter((a) => removed.has(a.trace_id)).length
   const total = page ? Math.max(page.total - resolvedHere, pending.length) : 0
   const truncated = page ? page.total > page.items.length : false
+  type Entry = { header: { net: string; ips: number }; item?: never } | { header?: never; item: Approval }
+  const visibleItems = pending.slice(0, visible)
+  const shown: Entry[] = group24
+    ? groupByNet(visibleItems, (a) => net24Of(a.src_ip) ?? 'IP sin dato / no IPv4').flatMap((g) => [
+        { header: { net: g.net, ips: new Set(g.items.map((a) => a.src_ip)).size } } as Entry,
+        ...g.items.map((item): Entry => ({ item })),
+      ])
+    : visibleItems.map((item): Entry => ({ item }))
   const state = (id: string): RowState => rowState[id] ?? { confirming: null, submitting: false, message: null }
   const patch = (id: string, p: Partial<RowState>) =>
     setRowState((prev) => ({ ...prev, [id]: { ...state(id), ...p } }))
@@ -96,8 +106,27 @@ export function ApprovalsView() {
           Las acciones de alto impacto que requieran confirmación humana aparecerán aquí.
         </EmptyState>
       ) : (
+        <>
+        <div className="case-filters">
+          <label className="check">
+            <input type="checkbox" checked={group24} onChange={(e) => setGroup24(e.target.checked)} />
+            Agrupar por /24
+          </label>
+          {group24 && (
+            <span className="muted small">Solo presentación: cada aprobación se resuelve por separado, no hay acciones en lote.</span>
+          )}
+        </div>
         <ul className="approval-list">
-          {pending.slice(0, visible).map((a) => {
+          {shown.map((entry) => {
+            if (entry.header) {
+              return (
+                <li key={`net:${entry.header.net}`} className="approval-group">
+                  <span className="mono strong">{entry.header.net}</span>
+                  <span className="muted"> ({entry.header.ips} {entry.header.ips === 1 ? 'IP' : 'IPs'})</span>
+                </li>
+              )
+            }
+            const a = entry.item
             const s = state(a.trace_id)
             const allowed = roleReaches(role, a.approval_level)
             const level = requiredLevel(a.approval_level)
@@ -171,6 +200,7 @@ export function ApprovalsView() {
             )
           })}
         </ul>
+        </>
       )}
 
       {pending.length > visible && (
