@@ -34,3 +34,23 @@ class TestRegimenes:
         assert regimes.policy_version(a) == regimes.policy_version(b)
         assert regimes.policy_version(a) != regimes.policy_version(c)
         assert "abuseipdb_api_key" not in regimes.effective_policy(a)
+
+
+class TestRegimenDeLaDecision:
+    """El régimen se deriva de la hora de la decisión al leer (no se guarda)."""
+
+    def test_deriva_el_regimen_de_la_hora(self) -> None:
+        import dashboard
+        antes = dashboard.with_regime({"trace_id": "a", "timestamp": "2026-10-09T14:20:59+00:00"})
+        despues = dashboard.with_regime({"trace_id": "b", "timestamp": "2026-10-09T14:21:00Z"})
+        assert antes["regime_id"] == "R3"
+        assert despues["regime_id"] == "R4"
+        assert despues["regime_derivado"] is True
+
+    def test_sin_timestamp_valido_o_anterior_queda_en_none_sin_mutar(self) -> None:
+        import dashboard
+        orig = {"trace_id": "c", "timestamp": "2026-10-01T00:00:00+00:00"}
+        assert dashboard.with_regime(orig)["regime_id"] is None
+        assert dashboard.with_regime({"timestamp": "no-es-fecha"})["regime_id"] is None
+        assert dashboard.with_regime({})["regime_id"] is None
+        assert "regime_id" not in orig

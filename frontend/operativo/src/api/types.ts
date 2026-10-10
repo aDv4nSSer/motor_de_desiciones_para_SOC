@@ -31,6 +31,9 @@ export interface Decision {
   DURATION_MS?: number
   latency_ms?: number
   model_version?: string
+  /** Derivado por el backend de la hora de la decisión (no se guarda en soc-decisions). */
+  regime_id?: string | null
+  regime_derivado?: boolean
 }
 
 export interface Enrichment {

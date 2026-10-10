@@ -25,8 +25,8 @@ interface AlertsData {
 const STATUS_TEXT: Record<Exclude<ResponseState['kind'], 'ok'>, { text: string; hint: string; danger: boolean }> = {
   checking: { text: 'Consultando…', hint: 'Buscando el registro de respuesta de esta decisión.', danger: false },
   processing: {
-    text: 'En proceso',
-    hint: 'La tarea sigue en la cola del worker de respuesta o en el lote que está procesando.',
+    text: 'Respuesta pendiente',
+    hint: 'El worker de respuesta todavía no deja el registro R1/R2 de esta decisión (sigue en su cola o en el lote que procesa).',
     danger: false,
   },
   missing: {
@@ -156,6 +156,7 @@ export function AlertsView() {
                 const r = st.kind === 'ok' ? st.record : undefined
                 const open = expanded === d.trace_id
                 const e = r?.enrichment
+                const pending = st.kind === 'processing' || st.kind === 'checking'
                 return (
                   <Fragment key={d.trace_id}>
                     <tr className={d.tier >= 3 ? 'row-critical' : undefined}>
@@ -171,10 +172,10 @@ export function AlertsView() {
                       <td className="mono">{formatTime(d.timestamp)}</td>
                       <td><TierBadge tier={d.tier} /></td>
                       <td className="num mono">{formatScore(d.risk_score)}</td>
-                      <td className="mono">{r?.src_ip ?? e?.src_ip ?? <span className="muted">sin dato</span>}</td>
+                      <td className="mono">{r?.src_ip ?? e?.src_ip ?? <span className="muted">{pending ? 'Respuesta pendiente' : 'sin dato'}</span>}</td>
                       <td className="num mono">{d.L4_DST_PORT ?? 'sin dato'}</td>
                       <td>{r ? accionR2Label(r) : <ResponseStatus st={st} />}</td>
-                      <td>{e ? <TiSummary e={e} /> : <span className="muted">No disponible</span>}</td>
+                      <td>{e ? <TiSummary e={e} /> : <span className="muted">{pending ? 'Respuesta pendiente' : 'No disponible'}</span>}</td>
                       <td className="mono" title={d.trace_id}>{shortId(d.trace_id)}</td>
                     </tr>
                     {open && (
@@ -198,7 +199,7 @@ export function AlertsView() {
           </button>
           <p className="muted small">
             Origen, acción recomendada e inteligencia de amenazas vienen del registro del worker de respuesta, buscado por el
-            trace_id de cada alerta. «En proceso»: el worker todavía no la procesa. «Sin registro de respuesta»: ya pasó y
+            trace_id de cada alerta. «Respuesta pendiente»: el worker todavía no deja el registro (origen e inteligencia de amenazas salen de ese registro). «Sin registro de respuesta»: ya pasó y
             no dejó registro. «No se pudo verificar»: la consulta falló.
           </p>
         </div>
@@ -238,7 +239,10 @@ function AlertDetail({ d, r }: { d: Decision; r: ResponseRecord | undefined }) {
         <dt>LightGBM</dt><dd className="mono">{d.model_version || 'sin dato'}<span className="muted">, hash sin dato</span></dd>
         <dt>Isolation Forest</dt><dd className="muted">versión y hash sin dato</dd>
         <dt>policy_version</dt><dd className="muted">sin dato</dd>
-        <dt>regime_id</dt><dd className="muted">sin dato</dd>
+        <dt>regime_id</dt>
+        <dd className={d.regime_id ? 'mono' : 'muted'}>
+          {d.regime_id ? <>{d.regime_id}<span className="muted"> (derivado de la hora de la decisión)</span></> : 'sin dato'}
+        </dd>
         <dt>ATT&amp;CK</dt><dd>{trace ? attackText(trace.fast_path?.attack ?? trace.respuesta?.attack_alerta_correlacionada) : <span className="muted">{load ? 'cargando' : 'requiere N2'}</span>}</dd>
       </dl>
       <dl>

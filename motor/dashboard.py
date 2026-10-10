@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 import redis
 from dotenv import load_dotenv
 
+from regimes import regime_at
 from response.config import get_settings
 
 load_dotenv()
@@ -145,7 +146,35 @@ def get_recent_decisions(
     result = _os_request("POST", f"/{OS_INDEX}/_search", query)
     if result is None:
         return []
-    return [h["_source"] for h in result.get("hits", {}).get("hits", [])]
+    return [with_regime(h["_source"]) for h in result.get("hits", {}).get("hits", [])]
+
+
+def with_regime(doc: dict) -> dict:
+    """Agrega `regime_id` derivado de la hora de la decisión (regimes.regime_at).
+
+    El documento de soc-decisions no guarda el régimen (es append-only y
+    anterior a regimes.py): se calcula al leer, solo para mostrar. Sin
+    timestamp válido, o anterior al primer régimen, queda en None.
+
+    Args:
+        doc: documento de decisión (_source).
+
+    Returns:
+        Copia del documento con `regime_id` (str | None) y
+        `regime_derivado=True`; no modifica el original.
+    """
+    out = dict(doc)
+    out["regime_derivado"] = True
+    try:
+        ts = datetime.fromisoformat(str(doc.get("timestamp")))
+    except ValueError:
+        out["regime_id"] = None
+        return out
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    regime = regime_at(ts)
+    out["regime_id"] = regime["id"] if regime else None
+    return out
 
 
 # ── Bloqueos activos (R2, con TTL restante) ──────────────────────────────────

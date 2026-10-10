@@ -101,7 +101,9 @@ class TestDecisionsQuery:
 
     def test_sin_filtros_match_all(self, app_env, monkeypatch) -> None:
         dashboard, calls = self._captura(monkeypatch)
-        assert dashboard.get_recent_decisions(10) == [{"trace_id": "t1", "tier": 3}]
+        # with_regime agrega regime_id (None sin timestamp) y la marca de derivado
+        assert dashboard.get_recent_decisions(10) == [
+            {"trace_id": "t1", "tier": 3, "regime_id": None, "regime_derivado": True}]
         assert calls[0]["query"] == {"match_all": {}}
         assert calls[0]["size"] == 10
         assert calls[0]["sort"] == [{"timestamp": {"order": "desc"}}]

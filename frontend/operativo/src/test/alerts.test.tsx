@@ -92,9 +92,33 @@ describe('vista de alertas', () => {
     await login()
     const nueva = (await screen.findByText('nueva-00')).closest('tr')!
     const vieja = screen.getByText('vieja-00').closest('tr')!
-    expect(within(nueva).getByText('En proceso')).toBeInTheDocument()
+    expect(within(nueva).getAllByText('Respuesta pendiente')).toHaveLength(3) // acción, origen y TI
+    expect(within(nueva).queryByText('En proceso')).not.toBeInTheDocument()
+    expect(within(nueva).queryByText('sin dato')).not.toBeInTheDocument()
+    expect(within(vieja).getAllByText('sin dato').length).toBeGreaterThan(0) // el worker ya pasó: ausencia real
     expect(within(vieja).getByText('Sin registro de respuesta')).toBeInTheDocument()
     expect(screen.queryByText(/Sin respuesta en ventana/)).not.toBeInTheDocument()
+  })
+
+  it('regime_id se muestra derivado de la hora y sin dato si el backend no lo trae', async () => {
+    mockFetch({
+      '/api/v1/auth/login': LOGIN_OK,
+      '/api/v1/dashboard/decisions': () => json(200, [
+        { ...DECISION, trace_id: 'conreg-0001', regime_id: 'R4', regime_derivado: true },
+        { ...DECISION, trace_id: 'sinreg-0002', regime_id: null },
+      ]),
+      '/api/v1/dashboard/responses/lookup': () => lookupOk({}),
+      '/api/v1/dashboard/stats': () => json(200, { available: false, window_minutes: 60 }),
+    })
+    const user = await login()
+    await screen.findByText('conreg-0')
+    const [conReg, sinReg] = screen.getAllByRole('button', { name: 'Ver detalle' }) // un detalle abierto a la vez
+    await user.click(conReg)
+    expect(await screen.findByText('R4')).toBeInTheDocument()
+    expect(screen.getByText(/derivado de la hora de la decisión/)).toBeInTheDocument()
+    await user.click(sinReg)
+    expect(screen.queryByText('R4')).not.toBeInTheDocument()
+    expect(screen.queryByText(/derivado de la hora de la decisión/)).not.toBeInTheDocument()
   })
 
   it('si la consulta falla no afirma que falte la respuesta', async () => {
