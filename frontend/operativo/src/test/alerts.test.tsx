@@ -66,12 +66,16 @@ describe('vista de alertas', () => {
     expect(JSON.parse(String(lookup.init?.body))).toEqual({ trace_ids: [DECISION.trace_id] })
     expect(calls.some((c) => c.url.includes('/blocks/recent'))).toBe(false)
     expect(screen.getByText('T3 crítico')).toBeInTheDocument()
-    expect(screen.getByText('Pendiente de aprobación')).toBeInTheDocument()
+    expect(screen.getByText('Pendiente de aprobación (nivel sin dato)')).toBeInTheDocument()
     expect(screen.getByText(/AbuseIPDB 91, OTX 3 pulsos/)).toBeInTheDocument()
+    expect(screen.getByText(/1 fuente corrobora/)).toBeInTheDocument()
     expect(screen.getByText('37')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Ver detalle' }))
-    expect(screen.getByText(/motor de reglas \(rules.yaml\) no está implementado/)).toBeInTheDocument()
+    expect(screen.queryByText(/rules.yaml/)).not.toBeInTheDocument()
+    expect(screen.getByText('Reglas explicativas v1; SHAP pendiente.')).toBeInTheDocument()
+    expect(screen.getByText(/requiere rol N2/)).toBeInTheDocument()
+    expect(calls.some((c) => c.url.includes('/explain/'))).toBe(false) // N1: no pide la traza
   })
 
   it('muestra en proceso y sin registro como estados distintos', async () => {

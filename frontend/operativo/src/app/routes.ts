@@ -31,7 +31,7 @@ export interface RouteDef {
 export const ROUTES: RouteDef[] = [
   { id: 'alertas', label: 'Alertas', title: 'Alertas T2 y T3', icon: Bell, section: 'Operación', minRole: 'N1' },
   { id: 'aprobaciones', label: 'Aprobaciones', title: 'Aprobaciones pendientes', icon: UserCheck, section: 'Operación', minRole: 'N1' },
-  { id: 'casos', label: 'Casos', title: 'Casos', icon: Briefcase, section: 'Operación', minRole: 'N1' },
+  { id: 'casos', label: 'Casos', title: 'Gestión interna de casos', icon: Briefcase, section: 'Operación', minRole: 'N1' },
   { id: 'nodos', label: 'Estado de nodos', title: 'Estado de nodos y servicios', icon: HardDrives, section: 'Operación', minRole: 'N1' },
   { id: 'auditoria', label: 'Historial y auditoría', title: 'Historial y auditoría', icon: Fingerprint, section: 'Gobierno', minRole: 'N2' },
   { id: 'usuarios', label: 'Usuarios y sesiones', title: 'Usuarios y sesiones', icon: UsersThree, section: 'Gobierno', minRole: 'N2' },

@@ -51,6 +51,12 @@ async function readDetail(resp: Response): Promise<string> {
 
 /** Llamada a un endpoint protegido. Lanza ApiError o una subclase. */
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const resp = await apiFetchRaw(path, init)
+  return (await resp.json()) as T
+}
+
+/** Como apiFetch, pero devuelve la respuesta sin parsear (CSV, descargas). */
+export async function apiFetchRaw(path: string, init: RequestInit = {}): Promise<Response> {
   const token = hooks?.getToken() ?? null
   const headers = new Headers(init.headers)
   if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -74,7 +80,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   if (!resp.ok) throw new ApiError(resp.status, await readDetail(resp))
 
   hooks?.onVerified()
-  return (await resp.json()) as T
+  return resp
 }
 
 /** Login: no pasa por los hooks de sesión (un 401 acá es credencial inválida). */

@@ -2,12 +2,17 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { CaretDown, CaretRight } from '@phosphor-icons/react'
 import { apiFetch } from '../api/client'
 import type { Decision, ResponseRecord, Stats } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
 import { EmptyState, ErrorNotice, Freshness, TableSkeleton, TierBadge } from '../components/common'
-import { accionLabel, formatScore, formatTime, shortId } from '../lib/format'
+import { ChainLink, ExplainPanel } from '../components/ExplainPanel'
+import { attackText, useExplain } from '../lib/explain'
+import { formatScore, formatTime, shortId } from '../lib/format'
+import { accionR2Label } from '../lib/r2'
 import {
   LOOKUP_MAX_IDS, lookupResponses, mergeLookups, responseState,
   type ResponseState, type RowLookup,
 } from '../lib/responses'
+import { abuseipdbStatus, corroboranLabel, otxStatus } from '../lib/ti'
 import { usePolling } from '../lib/usePolling'
 
 const PAGE = 50
@@ -111,11 +116,15 @@ export function AlertsView() {
         />
       </header>
 
-      <dl className="counters" aria-label="Decisiones en los últimos 60 minutos">
-        <div className="counter counter-critical"><dt>T3 crítico, 60 min</dt><dd>{tierCount(stats, 'T3')}</dd></div>
-        <div className="counter counter-high"><dt>T2 medio, 60 min</dt><dd>{tierCount(stats, 'T2')}</dd></div>
-        <div className="counter"><dt>Total decisiones, 60 min</dt><dd>{stats?.available ? (stats.total_decisiones ?? 0).toLocaleString('es-CL') : 'sin dato'}</dd></div>
+      <dl className="counters" aria-label="Decisiones del Fast Path en los últimos 60 minutos">
+        <div className="counter counter-critical"><dt>Decisiones T3, 60 min</dt><dd>{tierCount(stats, 'T3')}</dd></div>
+        <div className="counter counter-high"><dt>Decisiones T2, 60 min</dt><dd>{tierCount(stats, 'T2')}</dd></div>
+        <div className="counter"><dt>Decisiones totales, 60 min</dt><dd>{stats?.available ? (stats.total_decisiones ?? 0).toLocaleString('es-CL') : 'sin dato'}</dd></div>
       </dl>
+      <p className="muted small mb3">
+        Unidad: decisiones del Fast Path (un flujo es una decisión), no IPs distintas. Incluyen la infraestructura propia.
+        IPs distintas e infraestructura propia por separado: análisis de solo lectura en reports/metricas.
+      </p>
 
       {poll.error && <ErrorNotice message={poll.error} />}
 
@@ -164,7 +173,7 @@ export function AlertsView() {
                       <td className="num mono">{formatScore(d.risk_score)}</td>
                       <td className="mono">{r?.src_ip ?? e?.src_ip ?? <span className="muted">sin dato</span>}</td>
                       <td className="num mono">{d.L4_DST_PORT ?? 'sin dato'}</td>
-                      <td>{r ? accionLabel(r.accion_recomendada) : <ResponseStatus st={st} />}</td>
+                      <td>{r ? accionR2Label(r) : <ResponseStatus st={st} />}</td>
                       <td>{e ? <TiSummary e={e} /> : <span className="muted">No disponible</span>}</td>
                       <td className="mono" title={d.trace_id}>{shortId(d.trace_id)}</td>
                     </tr>
@@ -205,20 +214,19 @@ function ResponseStatus({ st }: { st: ResponseState }) {
 }
 
 function TiSummary({ e }: { e: NonNullable<ResponseRecord['enrichment']> }) {
-  const parts: string[] = []
-  if (e.abuseipdb_available === false) parts.push('AbuseIPDB no disponible')
-  else if (typeof e.abuseipdb_score === 'number') parts.push(`AbuseIPDB ${e.abuseipdb_score}`)
-  if (e.otx_available === false) parts.push('OTX no disponible')
-  else if (typeof e.otx_pulse_count === 'number') parts.push(`OTX ${e.otx_pulse_count} pulsos`)
   return (
     <span>
-      {parts.join(', ') || 'Sin señales'}
-      <span className="muted"> ({e.corroboration_count ?? 0} fuentes corroboran)</span>
+      {abuseipdbStatus(e)}, {otxStatus(e)}
+      <span className="muted"> ({corroboranLabel(e.corroboration_count)})</span>
     </span>
   )
 }
 
 function AlertDetail({ d, r }: { d: Decision; r: ResponseRecord | undefined }) {
+  const { user } = useAuth()
+  const role = user?.role ?? 'N1'
+  const load = useExplain(d.trace_id, role)
+  const trace = load?.kind === 'ok' ? load.trace : null
   const e = r?.enrichment
   return (
     <div className="detail-grid">
@@ -227,20 +235,29 @@ function AlertDetail({ d, r }: { d: Decision; r: ResponseRecord | undefined }) {
         <dt>Decisión del Fast Path</dt><dd>{d.decision}</dd>
         <dt>Score ML / anomalía</dt><dd className="mono">{formatScore(d.ml_score)} / {formatScore(d.anomaly_score)}</dd>
         <dt>Latencia</dt><dd className="mono">{typeof d.latency_ms === 'number' ? `${d.latency_ms.toFixed(1)} ms` : 'sin dato'}</dd>
-        <dt>Modelo</dt><dd className="mono">{d.model_version ?? 'sin dato'}</dd>
+        <dt>LightGBM</dt><dd className="mono">{d.model_version || 'sin dato'}<span className="muted">, hash sin dato</span></dd>
+        <dt>Isolation Forest</dt><dd className="muted">versión y hash sin dato</dd>
+        <dt>policy_version</dt><dd className="muted">sin dato</dd>
+        <dt>regime_id</dt><dd className="muted">sin dato</dd>
+        <dt>ATT&amp;CK</dt><dd>{trace ? attackText(trace.fast_path?.attack ?? trace.respuesta?.attack_alerta_correlacionada) : <span className="muted">{load ? 'cargando' : 'requiere N2'}</span>}</dd>
       </dl>
       <dl>
         <dt>DNS inverso</dt><dd className="mono wrap-anywhere">{e?.reverse_dns ?? 'sin dato'}</dd>
         <dt>País (AbuseIPDB)</dt><dd>{e?.abuseipdb_country ?? 'sin dato'}</dd>
         <dt>Reportes AbuseIPDB</dt><dd className="mono">{e?.abuseipdb_total_reports ?? 'sin dato'}</dd>
+        <dt>AbuseIPDB</dt><dd>{e ? abuseipdbStatus(e) : 'sin dato'}</dd>
+        <dt>OTX</dt><dd>{e ? otxStatus(e) : 'sin dato'}</dd>
         <dt>Fuentes que corroboran</dt><dd>{e?.corroborating_sources?.length ? e.corroborating_sources.join(', ') : 'ninguna'}</dd>
         <dt>CrowdSec (observacional)</dt><dd>{e?.crowdsec_observado ? (e.crowdsec_scenario ?? 'observado') : 'no observado'}</dd>
         {r?.block?.reason && (<><dt>Respuesta R2</dt><dd>{r.block.reason}</dd></>)}
       </dl>
-      <div className="detail-note">
-        <p className="detail-label">Reglas y razonamiento</p>
-        <p className="muted">No disponible todavía: el motor de reglas (rules.yaml) no está implementado, así que esta decisión no trae rules_fired ni reasoning.</p>
-      </div>
+      <ExplainPanel traceId={d.trace_id} role={role} load={load} />
+      {trace && (
+        <dl className="detail-chain">
+          <ChainLink label="Eslabón de la decisión" v={trace.integridad.decision} />
+          <ChainLink label="Eslabón de la respuesta" v={trace.integridad.respuesta} />
+        </dl>
+      )}
     </div>
   )
 }

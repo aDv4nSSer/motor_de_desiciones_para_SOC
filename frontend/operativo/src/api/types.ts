@@ -407,3 +407,116 @@ export interface Trends {
     truncated?: boolean
   }
 }
+
+// ── H60: gestión interna de casos y traza explicativa v1 ────────────────────
+
+export type CaseState = 'abierto' | 'en_investigacion' | 'cerrado_confirmado' | 'cerrado_falso_positivo'
+
+export interface CaseHistoryEntry {
+  state: CaseState
+  at: string
+  note?: string
+  /** Solo en los cambios hechos por un analista; la apertura automática no lo trae. */
+  actor?: string
+}
+
+/** Caso de soc:cases:* (motor/response/cases.py, vigilante/cases.py). */
+export interface Case {
+  case_id: string
+  kind: string
+  host: string
+  net24?: string | null
+  detail?: {
+    trace_id?: string
+    risk_score?: number
+    dst_port?: number
+    classtype?: string
+    corroboration_count?: number
+  }
+  state: CaseState
+  opened_at: string
+  updated_at?: string
+  last_seen?: string
+  occurrences?: number
+  trace_ids?: string[]
+  history?: CaseHistoryEntry[]
+}
+
+/** GET /api/v1/dashboard/cases/page (dashboard.list_cases_page). */
+export interface CasesPage {
+  items: Case[]
+  next_cursor: number | null
+  scanned: number
+  source: 'recent' | 'worked'
+  index_size: number | null
+  scan_cap_reached: boolean
+  available: boolean
+}
+
+export interface ExplainRule {
+  id: string
+  texto: string
+}
+
+export interface ExplainSignal {
+  senal: string
+  fuente?: string
+  valor: unknown
+  peso?: number
+  aporte?: number
+  umbral?: string
+  disponible?: boolean
+  corrobora?: boolean
+  observado?: boolean
+  nota?: string
+}
+
+/** audit_view.verify_document: eslabón de la cadena hash de un documento. */
+export interface ChainVerification {
+  content_ok?: boolean
+  prev_link_ok?: boolean | null
+  next_link_ok?: boolean | null
+  chain_seq?: number | null
+  hash?: string | null
+  prev_hash?: string | null
+}
+
+export interface AttackInfo {
+  classtype?: string | null
+  tactica?: string
+  tecnica?: string
+  tecnica_nombre?: string
+  confianza?: string
+  nota?: string
+}
+
+/** GET /api/v1/dashboard/explain/{trace_id} (motor/explain.py, N2). */
+export interface ExplainTrace {
+  version: string
+  trace_id: string
+  fast_path: null | {
+    senales: ExplainSignal[]
+    risk_score: number
+    risk_score_recalculado: number
+    tier: number
+    tier_recalculado: number
+    regla: ExplainRule
+    consistente: boolean
+    attack?: AttackInfo
+  }
+  respuesta: null | {
+    r1: { senales: ExplainSignal[]; corroboration_count: number; notas: string[] }
+    r2: {
+      regla: ExplainRule
+      accion_recomendada?: string
+      accion?: string
+      ejecutado: boolean
+      motivo?: string | null
+      minimo_fuentes: number
+    }
+    consistente: boolean
+    attack_alerta_correlacionada?: AttackInfo
+  }
+  integridad: { decision?: ChainVerification | null; respuesta?: ChainVerification | null }
+  limitaciones: string[]
+}
