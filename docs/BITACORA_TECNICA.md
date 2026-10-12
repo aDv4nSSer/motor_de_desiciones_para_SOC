@@ -3079,6 +3079,27 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 - Antes del 3-oct, el `worker.log` tiene entre 16.000 y 107.000 líneas por día con `api.abuseipdb.com`, contra ~1.000 por día desde el 3-oct. Son reintentos y 429, no consultas cobradas: no usar esa serie como consumo.
 - `origin/main` está 99 commits detrás de `develop`.
 
+
+---
+
+## H60: Cierre del período 2, réplicas de OpenSearch a 0 y campaña nocturna propia (12-oct)
+
+**Hechos del 10-oct.**
+- Deploy de `motor-soc` con `d432f14`, reinicio a las 17:48:03 -03; frontend con `scripts/deploy_operativo.sh` (~17:50). `response-worker` intacto.
+- Caso de prueba `9c1f9870-251d-4767-87ec-8a1a8919fbd1` (`143.208.132.131`): ejercicio fuera de la prueba de operador.
+- Apagado inesperado del Mac (causa -63), sin impacto en producción.
+
+**Verificación del 12-oct 12:35 -03.** `response-worker` con `ActiveEnterTimestamp` 2026-10-09 11:21:00: período 2 completo de 72 h, sin cortes. Tres servicios activos; sin errores de `motor-soc` desde el 10-oct 17:48.
+
+**Isolation Forest.** Reentrenamiento del 11-oct 04:00: hash de `isolation_forest.pkl` idéntico (`4958eb4b…`), F1 0.6021, mismo corpus. El script reinicia `motor-soc` (último reinicio 11-oct 04:00:50) y se repite cada domingo (cron `0 4 * * 0`). Un único modelo IF durante el período 2. Pendiente de decisión: comentar ese cron tras el corte del 14-oct 21:00.
+
+**Campaña propia nocturna.** Cron diario `0 2 * * *` de `.140`: `/home/aiayala/tesis/ataques/campana_automatica.sh` (nmap SYN a 12 puertos, hydra SSH contra el 2222 durante 60 s y nmap -sV, todo contra `200.54.12.139`; dura ~1 min, la del 12-oct terminó 02:01:13). Se lanza desde `.140`, así que su origen es `10.10.10.3`. En `soc-responses` ese `src_ip` aparece en la ventana 02:00-02:10 -03 de las cuatro noches revisadas (9 al 12-oct: 54, 220, 76 y 93 registros). **Confirmado: explica `10.10.10.3`. No confirmado que explique las 5 IPs propias del análisis A:** la campaña usa una sola IP de origen, y el análisis A no está descrito en los documentos del repo, así que el cruce con las otras cuatro queda abierto hasta tener la lista. Lo que sí se vio en esa ventana: `10.10.10.1` (gateway) también aparece, pero la campaña no lo explica.
+
+**OpenSearch: réplicas a 0.** Estado en `yellow` por 189 réplicas sin asignar (nodo único); todos los shards sin asignar eran réplicas (`prirep=r`). Ninguno de `soc-responses`/`soc-decisions-*` estaba en la lista. Sin choque de plantillas (solo existían `soc-responses` y `soc-decisions`, prioridad 100, y ninguna plantilla legacy). Se creó `soc-replicas-cero` (`suricata-alerts-*`, `security-auditlog-*`, prioridad 50, réplicas 0) y se aplicó `number_of_replicas: 0` a los 189 índices, en lotes de 40, con el plugin de seguridad sin rechazar ninguno (incluidos `.opendistro-ism-*` y `.opendistro-job-scheduler-lock`). Antes: `yellow`, 215 activos / 189 sin asignar. Después: `green`, 215 activos / 0 sin asignar.
+- **Solo lectura sobre ISM:** `plugins.index_state_management.history.number_of_replicas` (y su par `opendistro.`) vale **1**, y `history.max_age` 24 h. Cada índice nuevo `.opendistro-ism-managed-index-history-*` nacerá con una réplica sin asignar y el cluster volverá a `yellow` en el siguiente rollover. La plantilla nueva no los cubre. No se cambió.
+
+**Pendiente de decisión (Antonio):** fijar `plugins.index_state_management.history.number_of_replicas: 0` (cluster setting persistente) o ampliar la plantilla a `.opendistro-ism-managed-index-history-*`.
+
 ---
 
 ## H60: Gestión interna de casos, correcciones de Alertas y tres análisis de solo lectura para la tesis
