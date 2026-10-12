@@ -3093,7 +3093,7 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 
 **Isolation Forest.** Reentrenamiento del 11-oct 04:00: hash de `isolation_forest.pkl` idéntico (`4958eb4b…`), F1 0.6021, mismo corpus. El script reinicia `motor-soc` (último reinicio 11-oct 04:00:50) y se repite cada domingo (cron `0 4 * * 0`). Un único modelo IF durante el período 2. Pendiente de decisión: comentar ese cron tras el corte del 14-oct 21:00.
 
-**Campaña propia nocturna.** Cron diario `0 2 * * *` de `.140`: `/home/aiayala/tesis/ataques/campana_automatica.sh` (nmap SYN a 12 puertos, hydra SSH contra el 2222 durante 60 s y nmap -sV, todo contra `200.54.12.139`; dura ~1 min, la del 12-oct terminó 02:01:13). Se lanza desde `.140`, así que su origen es `10.10.10.3`. En la ventana 02:00-02:10 -03 de las cuatro noches revisadas (9 al 12-oct) `10.10.10.3` aparece en `soc-responses`, pero eso no mide cuánto aporta la campaña.
+**Campaña propia nocturna.** Cron diario `0 2 * * *` de `.140`: `~/tesis/ataques/campana_automatica.sh` (nmap SYN a 12 puertos, hydra SSH contra el 2222 durante 60 s y nmap -sV, todo contra `200.54.12.139`; dura ~1 min, la del 12-oct terminó 02:01:13). Se lanza desde `.140`, así que su origen es `10.10.10.3`. En la ventana 02:00-02:10 -03 de las cuatro noches revisadas (9 al 12-oct) `10.10.10.3` aparece en `soc-responses`, pero eso no mide cuánto aporta la campaña.
 
 **Tráfico propio del análisis A (13,69 %: 145.591 de 1.063.428 decisiones T2/T3, 3-oct a 10-oct, 5 IPs).** Fuente: `a_infra_pares.csv` y `a_infra_flujos.csv` en `~/tesis_archivo/metricas_h60/` (`reports/metricas/2026-10-10/analisis_h60.md`).
 
