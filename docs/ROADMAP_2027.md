@@ -22,6 +22,10 @@ Lo que quedó fuera del congelamiento de código del 12-oct-2026, con su diseño
 - **Rate-limiting y cuarentena por VLAN** (switch SG350 con Netmiko). Origen: especificación ampliada, sección 9.
 - **T2 con dos o más fuentes corroborando.** IPs con AbuseIPDB alto (caché) y OTX con pulsos quedan en T2 con "Alertar y crear caso", porque el tier solo depende del score del Fast Path. Evaluar que la corroboración de R1 pueda subir un T2 a la regla de bloqueo de T3. Estimación preliminar (análisis B de `reports/metricas/2026-10-10/analisis_h60.md`, 8 al 10-oct): 763 IPs, 443 serían bloqueos nuevos y 320 TTL extendidos; en R4 la brecha casi desaparece, porque esas IPs ya se bloquean cuando llegan a T3. La campaña `91.92.42.0/24` (256 IPs a 443) sugiere además bloqueo por /24. No se cambia en esta tesis: cambiaría la política de decisión dentro del período 2. Origen: H60.
 
+- **AbuseIPDB a demanda para pendientes:** al abrirse una aprobación pendiente, consultar AbuseIPDB una vez (hoy se omite como "no decisiva" cuando OTX no corrobora). Origen: H64.
+- **Reintento o distinción de error de OTX:** un `ReadTimeout` hoy se trata como "OTX no corrobora". Reintentar o registrar el error como estado propio, distinto de "consultada y sin pulsos". Origen: H64.
+- **Señal de corroboración menos sensible a escáneres:** `pulse_count` cuenta como fuente a escáneres de investigación (167.94.145.30: OTX 50 pulsos, AbuseIPDB 0). Ponderar por tipo de pulso o por clasificación de escáner. Origen: H64.
+
 ## Gestión de casos
 
 - **Notas de casos en la cadena hash.** Los cambios de estado ya emiten `case_state_changed` (actor, caso, de, a y sha256 de la nota, sin el texto; fa273ad). El texto de la nota queda solo en el caso; si la auditoría debe conservarlo, persistirlo cifrado o en un índice propio. Origen: H60.

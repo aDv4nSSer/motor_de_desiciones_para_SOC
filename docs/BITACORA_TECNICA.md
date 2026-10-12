@@ -3147,6 +3147,27 @@ Lo que **no** está confirmado es la causa: por qué estos flujos de servicio a 
 - **Revisión independiente de `55f4b7b`** (un agente sin contexto de la implementación, con tests propios fuera del repo): una alta (carrera GET/SET sin WATCH entre el worker y el endpoint, y entre dos analistas: un cierre puede revertirse a `abierto` y recuperar TTL), cinco medias (CSV con `'` en campos vacíos; faltan `\t`, `\r`, `\n` y `＝` en el escape; cierres exitosos fuera de la cadena; el legado cierra con notas fijas; orden de deploy invertido), cinco bajas. El orden de deploy quedó corregido en el plan (backend primero). Con el OK de Antonio se aplicaron en un commit solo de `motor-soc` y del dashboard legado (`fa273ad`): WATCH/MULTI en el endpoint (con reintento y 409), escape CSV completo, nota validada después del rol, 503 con Redis caído, nota real con `prompt()` en el legado y evento `case_state_changed` en la cadena (actor, caso, de, a, sha256 de la nota, sin el texto). **El lado worker del punto 1 NO se tocó** (sin reinicio de `response-worker`, sin corte de régimen): queda como limitación declarada y en ROADMAP_2027. 898 passed. Tabla completa y segunda vuelta del revisor en `reports/estado_casos_ui.md` §5.
 - Las salidas CSV y la extracción cruda se archivan fuera de git (`~/tesis_archivo/metricas_h60/`); el manifiesto con sha256 (`reports/metricas/2026-10-10/manifiesto_h60.md`) sí se versiona.
 
+
+---
+
+## H64: Aprobaciones "0/2" y "1/2": gate correcto, presentación ambigua (12-oct)
+
+**Diagnóstico (solo lectura, 6 pendientes a las ~13:10 UTC).** Todas T3 con menos de 2 fuentes, así que el gate funcionó. Ninguna fue por presupuesto agotado.
+- **0 fuentes por no consulta o error (2):** `700fac4b` (89.248.165.203) y `53528db3` (64.62.156.86). AbuseIPDB omitida ("no decisiva") y OTX con `ReadTimeout`. No hay dato de ninguna fuente.
+- **0 fuentes, OTX consultada y negativa (2):** `ad2a4975` (176.65.148.124, desde caché) y `09465099` (146.158.99.160). OTX con 0 pulsos; AbuseIPDB no consultada ("no decisiva").
+- **1 fuente (2):** `75897c20` (23.178.112.106, OTX 11 pulsos) y `524bdae4` (167.94.145.30, OTX 50 pulsos). AbuseIPDB consultada con score 0 en ambas.
+
+**Hallazgos.**
+1. **Las aprobaciones "0/2" mezclaban** "no consultada o error" con "consultada y negativa". El texto de la aprobación ("corroboración insuficiente (0/2 fuentes)") no distingue los casos y el registro de la aprobación no guarda la TI por fuente. El operador decidía sin ver el detalle.
+2. **Pregunta de diseño (no se toca, sin cambio en worker ni `regimes.py`):** ante un `ReadTimeout` de OTX, R1 anota "OTX no corrobora" y omite AbuseIPDB como "no decisiva". Con OTX caída es cierto que AbuseIPDB sola no llega a 2, pero la IP queda en 0/2 sin que ninguna fuente haya respondido. Un error no es lo mismo que "sin evidencia".
+3. **`167.94.145.30` con OTX 50 pulsos y AbuseIPDB 0:** el `pulse_count` cuenta como corroboración aunque la IP sea un escáner conocido. **Hipótesis, no verificada:** que `167.94.145.30` sea un escáner de investigación (el rango parece de Censys; no se comprobó con FCrDNS/ASN como en H56) y que la corroboración por pulsos sea sensible a escáneres. No medido más allá de estos casos.
+
+**Cambio (solo frontend, `feature` sobre develop; no toca worker, `regimes.py`, endpoints ni `dashboard.py`).**
+- `views/ApprovalsView.tsx`: debajo del motivo, `AbuseIPDB … · OTX …` por aprobación, leído de `POST /api/v1/dashboard/responses/lookup` (que ya existe, N1, solo lectura). Un solo pedido por lote con los `trace_id` visibles; lo ya resuelto no se vuelve a pedir y lo no encontrado se reintenta como máximo cada 60 s, así el refresco de la lista no genera N+1. Si el lookup falla o no hay registro: "Detalle por fuente no disponible"; la lista y los botones siguen funcionando.
+- Cuando una fuente falló: "Una fuente con error NO equivale a «sin evidencia»: la consulta falló y no hay dato."
+- `lib/ti.ts`: "no decisiva" tiene texto propio ("no consultada (no decisiva: la otra fuente no corrobora, no puede cambiar R2)") en vez de "política de cuota"; nueva `tiHasError`. Las dos aserciones previas de `cases.test.tsx` no cambian (sus notas no dicen "no decisiva"); se añadió la nota real.
+- Tests nuevos en `approvals.test.tsx`: detalle por fuente y aviso de error, lookup que falla, un solo lookup por lote sin repetirse al refrescar.
+
 ---
 
 ## Pendientes detectados (no resueltos hoy)
