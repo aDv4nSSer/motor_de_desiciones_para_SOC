@@ -10,17 +10,23 @@ Calcula, sobre el CSV etiquetado:
 - indeterminados aparte, con cotas pesimista y optimista de ambas precisiones;
 - sensibilidad por /24: precisión dando el mismo peso a cada /24 distinto y cuántos /24 hay en la muestra;
 - acuerdo con el segundo etiquetador sobre los ids en común: % de acuerdo y kappa de Cohen;
-- tasa de corrección de las reglas: pre_etiquetas que el etiquetador humano cambió.
+- tasa de corrección de las reglas: pre_etiquetas que el etiquetador humano cambió;
+- sensibilidad al umbral de M1 (puerto de autenticación con N flujos, columna max_flujos_puerto_auth): con 20 y con 50
+  flujos. Una IP etiquetada malicioso cuya `evidencia` cita SOLO M1 y cuyo max_flujos_puerto_auth queda bajo el umbral
+  alternativo se reclasifica como indeterminado (ya no tiene base); se reporta la diferencia de precisión.
 """
 import argparse
 import csv
 import math
+import re
 import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
 ETIQUETAS = ("malicioso", "escáner de investigación", "falso positivo", "indeterminado")
 NIVEL_CONFIANZA = 0.95
+UMBRALES_M1 = (20, 50)
+CRITERIO = re.compile(r"\bM[1-4]\b")
 
 
 def normalizar(texto: str) -> str:
@@ -80,6 +86,19 @@ def fila(x: int, n: int) -> str:
     return f"{x}/{n} = {100 * x / n:.1f} % (IC 95 % {100 * lo:.1f}–{100 * hi:.1f} %)"
 
 
+def reclasificar_m1(filas: list[dict], et: dict[str, str], umbral: int) -> tuple[dict[str, str], int]:
+    """Etiquetas bajo un umbral alternativo de M1: malicioso solo por M1 con max_flujos_puerto_auth < umbral pasa a indeterminado."""
+    nuevo, cambios = dict(et), 0
+    for r in filas:
+        if et[r["id"]] != "malicioso":
+            continue
+        criterios = set(CRITERIO.findall(r.get("evidencia", "")))
+        if criterios == {"M1"} and int(r.get("max_flujos_puerto_auth") or 0) < umbral:
+            nuevo[r["id"]] = "indeterminado"
+            cambios += 1
+    return nuevo, cambios
+
+
 def leer(path: Path) -> list[dict]:
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
@@ -125,6 +144,18 @@ def main() -> None:
         print(f"- Reglas de preetiquetado: {len(pre)} aplicadas; el etiquetador humano corrigió {cambiadas} ({100 * cambiadas / len(pre):.1f} %).")
     else:
         print("- Reglas de preetiquetado: ninguna aplicada.")
+    print("- Sensibilidad al umbral de M1 (malicioso solo por M1 bajo el umbral pasa a indeterminado):")
+    base_e, base_x = m / n, (m + e) / n
+    for umbral in UMBRALES_M1:
+        alt, cambios = reclasificar_m1(filas, et, umbral)
+        ca = Counter(alt.values())
+        em, ex_ = ca["malicioso"], ca["malicioso"] + ca["escáner de investigación"]
+        print(f"  - M1 con {umbral} flujos: {cambios} IPs reclasificadas; estricta {fila(em, n)} ({100 * (em / n - base_e):+.1f} pts); "
+              f"ampliada {fila(ex_, n)} ({100 * (ex_ / n - base_x):+.1f} pts).")
+    solo_m1_bajo = sum(1 for r in filas if et[r["id"]] == "malicioso" and set(CRITERIO.findall(r.get("evidencia", ""))) == {"M1"}
+                       and int(r.get("max_flujos_puerto_auth") or 0) < UMBRALES_M1[0])
+    if solo_m1_bajo:
+        print(f"  - Aviso: {solo_m1_bajo} IPs etiquetadas malicioso por M1 con max_flujos_puerto_auth < {UMBRALES_M1[0]}: revisar la evidencia.")
     if a.segundo:
         et2 = etiquetadas(leer(a.segundo), "segundo etiquetador")
         comunes = [i for i in et2 if i in et]

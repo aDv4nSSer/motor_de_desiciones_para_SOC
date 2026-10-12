@@ -51,9 +51,13 @@ REGLAS = [
     ("R15", "TUM (Technische Universität München)", "rdns", ".in.tum.de"),
     ("R16", "Internet Measurement", "rdns", ".internet-measurement.com"),
 ]
-COLUMNAS_FICHA = ["id", "ip", "net24", "rdns", "fcrdns", "asn", "organizacion", "pais", "puertos_distintos", "top5_puertos",
-                  "flujos_t2_t3", "primera_vista", "ultima_vista", "suricata_alertas", "suricata_firmas",
-                  "suricata_categorias", "pre_etiqueta", "regla", "etiqueta", "evidencia", "notas"]
+PUERTOS_SENSIBLES = frozenset({21, 22, 23, 25, 445, 1433, 3306, 3389, 5432, 5900, 6379, 9200, 27017, 2222})
+PUERTOS_AUTENTICACION = frozenset({21, 22, 23, 445, 1433, 3306, 3389, 5432, 5900, 2222})
+CLAVE_SHA256_ESPERADA = "c869fc311e22b7ed9b676f6d3aa19692ccd1b7d7bef0186b60cf807fd1b5cbd4"  # pragma: allowlist secret - sha256 público de clave_sellada.csv, no un secreto
+COLUMNAS_FICHA = ["id", "ip", "net24", "rdns", "fcrdns", "asn", "organizacion", "pais", "n_puertos", "n_flujos",
+                  "max_flujos_puerto_auth", "n_top5_sensibles", "top5_puertos", "primera_vista", "ultima_vista",
+                  "suricata_alertas", "suricata_firmas", "suricata_categorias", "pre_etiqueta", "regla", "etiqueta",
+                  "evidencia", "notas"]
 COLUMNAS_SEGUNDO = [c for c in COLUMNAS_FICHA if c not in ("pre_etiqueta", "regla")]
 COLUMNAS_CLAVE = ["id", "ip", "score", "tier", "fuentes_ti", "abuseipdb_score", "otx_pulsos", "hora_bloqueo", "trace_id"]
 
@@ -141,6 +145,15 @@ def net24(ip: str) -> str:
     return str(ipaddress.ip_network(f"{ip}/{24 if a.version == 4 else 48}", strict=False))
 
 
+def metricas_comportamiento(puertos: dict[str, int]) -> dict[str, int]:
+    """Cifras derivadas SOLO del comportamiento observado (puertos y flujos), nunca de score, tier ni TI."""
+    p = {int(k): v for k, v in puertos.items()}
+    top5 = sorted(p.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    return {"n_puertos": len(p), "n_flujos": sum(p.values()),
+            "max_flujos_puerto_auth": max((v for k, v in p.items() if k in PUERTOS_AUTENTICACION), default=0),
+            "n_top5_sensibles": sum(1 for k, _ in top5 if k in PUERTOS_SENSIBLES)}
+
+
 def formato_top(d: dict, n: int = 5) -> str:
     return "; ".join(f"{k}:{v}" for k, v in list(d.items())[:n])
 
@@ -158,10 +171,19 @@ def escribir_csv(path: Path, columnas: list[str], filas: list[dict]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw", required=True, type=Path)
-    ap.add_argument("--base", required=True, type=Path)
+    ap.add_argument("--raw", type=Path)
+    ap.add_argument("--base", type=Path)
+    ap.add_argument("--reutilizar", type=Path, help="carpeta existente: regenera las fichas con la salida cruda y la "
+                    "resolución externa guardadas (sin consultar nada) y exige que la clave no cambie")
     a = ap.parse_args()
-    texto = a.raw.read_text(encoding="utf-8")
+    if a.reutilizar:
+        destino = a.reutilizar.expanduser()
+        raw_path, resolucion = destino / "salida_cruda.json", json.loads((destino / "resolucion_externa.json").read_text())
+    else:
+        if not (a.raw and a.base):
+            sys.exit("falta --raw y --base (o --reutilizar)")
+        destino, raw_path, resolucion = None, a.raw, None
+    texto = raw_path.read_text(encoding="utf-8")
     raw = json.loads(texto[texto.index('{"extraido_utc"'):])
     if not raw.get("marco_ok"):
         sys.exit(f"marco insuficiente: {raw.get('exclusiones')}")
@@ -169,13 +191,20 @@ def main() -> None:
     muestra = raw["muestra"]
     if random.Random(raw["semilla"]).sample(marco, len(muestra)) != muestra:
         sys.exit("la muestra no se reproduce con random.Random(semilla).sample en este equipo")
-    destino = a.base.expanduser() / raw["extraido_utc"][:19].replace(":", "").replace("-", "")
-    destino.mkdir(parents=True, exist_ok=False)
-
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        dns = dict(zip(muestra, ex.map(resolver_dns, muestra)))
-    cymru = cymru_masivo(muestra)
-    (destino / "resolucion_externa.json").write_text(json.dumps({"dns": dns, "cymru": cymru}, ensure_ascii=False, indent=1))
+    if resolucion is None:
+        destino = a.base.expanduser() / raw["extraido_utc"][:19].replace(":", "").replace("-", "")
+        destino.mkdir(parents=True, exist_ok=False)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            dns = dict(zip(muestra, ex.map(resolver_dns, muestra)))
+        cymru = cymru_masivo(muestra)
+        (destino / "resolucion_externa.json").write_text(json.dumps({"dns": dns, "cymru": cymru}, ensure_ascii=False, indent=1))
+    else:
+        dns, cymru = resolucion["dns"], resolucion["cymru"]
+        anterior = destino / "v1_reemplazada"
+        anterior.mkdir(exist_ok=False)
+        for nombre in ("ficha_ciega.csv", "ficha_segundo_etiquetador.csv", "manifiesto_precision_p2.md",
+                       "construir_ficha.py", "analizar_etiquetado.py"):
+            shutil.move(destino / nombre, anterior / nombre)
 
     rng = random.Random(SEMILLA + 1)       # ids opacos: no derivan de la IP ni de su posición
     ids: list[str] = []
@@ -191,9 +220,9 @@ def main() -> None:
         cy, d = cymru.get(ip, {}), dns[ip]
         pre, regla = preetiquetar(d, cy)
         ficha.append({"id": i, "ip": ip, "net24": net24(ip), "rdns": d["rdns"], "fcrdns": d["fcrdns"], "asn": cy.get("asn", ""),
-                      "organizacion": cy.get("as_name", ""), "pais": cy.get("pais", ""), "puertos_distintos": len(c["puertos"]),
-                      "top5_puertos": formato_top(c["puertos"]), "flujos_t2_t3": c["flujos"], "primera_vista": c["primera"],
-                      "ultima_vista": c["ultima"], "suricata_alertas": "" if sur.get("aviso") else s.get("alertas", 0),
+                      "organizacion": cy.get("as_name", ""), "pais": cy.get("pais", ""), **metricas_comportamiento(c["puertos"]),
+                      "top5_puertos": formato_top(c["puertos"]), "primera_vista": c["primera"], "ultima_vista": c["ultima"],
+                      "suricata_alertas": "" if sur.get("aviso") else s.get("alertas", 0),
                       "suricata_firmas": formato_top(s.get("firmas", {})), "suricata_categorias": formato_top(s.get("categorias", {})),
                       "pre_etiqueta": pre, "regla": regla, "etiqueta": "", "evidencia": "", "notas": ""})
         m = por_ip[ip]
@@ -202,17 +231,30 @@ def main() -> None:
                       "fuentes_ti": "+".join(enr.get("corroborating_sources") or []) or "ninguna",
                       "abuseipdb_score": enr.get("abuseipdb_score"), "otx_pulsos": enr.get("otx_pulse_count"),
                       "hora_bloqueo": m.get("event_time"), "trace_id": m.get("trace_id")})
+    clave_path = destino / "clave_sellada.csv"
+    if a.reutilizar:       # la clave ya está sellada: se regenera en memoria y debe dar exactamente el mismo archivo
+        verificacion = destino / ".clave_verificacion.csv"
+        escribir_csv(verificacion, COLUMNAS_CLAVE, clave)
+        igual = sha256(verificacion) == sha256(clave_path) == CLAVE_SHA256_ESPERADA
+        verificacion.unlink()
+        if not igual:
+            sys.exit("la clave regenerada no coincide con la sellada: no se toca nada más")
+    else:
+        escribir_csv(clave_path, COLUMNAS_CLAVE, clave)
     escribir_csv(destino / "ficha_ciega.csv", COLUMNAS_FICHA, ficha)
     escribir_csv(destino / "ficha_segundo_etiquetador.csv", COLUMNAS_SEGUNDO, ficha[:SEGUNDO_ETIQUETADOR])
-    escribir_csv(destino / "clave_sellada.csv", COLUMNAS_CLAVE, clave)
-    shutil.copy(a.raw, destino / "salida_cruda.json")
+    if not a.reutilizar:
+        shutil.copy(raw_path, destino / "salida_cruda.json")
     for p in Path(__file__).resolve().parent.glob("*.py"):
         shutil.copy(p, destino / p.name)
 
     filas = [f"| `{p.name}` | {p.stat().st_size} | `{sha256(p)}` |" for p in sorted(destino.iterdir()) if p.is_file()]
     ex = raw["exclusiones"]
+    nota_v2 = ("Segunda versión de las fichas (columnas numéricas derivadas del comportamiento, nuevo orden de evaluación). "
+               "Nadie había etiquetado la versión anterior, que queda en `v1_reemplazada/`. La clave sellada no cambió.\n\n"
+               if a.reutilizar else "")
     (destino / "manifiesto_precision_p2.md").write_text(
-        "# Manifiesto de la muestra de precisión del período 2 (salidas fuera de git)\n\n"
+        "# Manifiesto de la muestra de precisión del período 2 (salidas fuera de git)\n\n" + nota_v2 +
         f"Extraído {raw['extraido_utc']} UTC. Ventana de bloqueos: {raw['ventana'][0]} a {raw['ventana'][1]}. Semilla {raw['semilla']}; "
         f"algoritmo: {raw['algoritmo']} (Python {raw['python']} en .140; reproducido en este equipo con Python {sys.version.split()[0]}).\n\n"
         f"Marco: N = {ex['n_marco']}. Exclusiones: {json.dumps(ex, ensure_ascii=False)}.\n\n"

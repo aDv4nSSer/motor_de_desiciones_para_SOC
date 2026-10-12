@@ -1,6 +1,6 @@
 # Protocolo: precisión del auto-bloqueo en el período 2
 
-Estado: **rúbrica y reglas para OK de Antonio; la ficha no se entrega para etiquetar hasta ese OK.** Extraído 2026-10-12T16:42:52.370228+00:00 UTC. Este documento no contiene listas de IPs (el repo es público): ficha, clave y salida cruda están en `~/tesis_archivo/precision_p2/20261012T164252/`.
+Estado: **rúbrica y protocolo aprobados por Antonio el 12-oct con tres cambios (orden de evaluación, columnas numéricas, ventana temporal), ya aplicados. Fichas regeneradas (versión 2); nadie había etiquetado la versión 1.** Extraído 2026-10-12T16:42:52.370228+00:00 UTC. Este documento no contiene listas de IPs (el repo es público): ficha, clave y salida cruda están en `~/tesis_archivo/precision_p2/20261012T164252/`.
 
 ## 1. Pregunta y alcance
 
@@ -20,6 +20,7 @@ Aleatoria simple de 100 IPs, sin reemplazo, **semilla 20261012**. Algoritmo: `ra
 ## 4. Fuentes del comportamiento por IP
 
 - **Puertos, flujos, primera y última vista:** `soc-responses-*` (decisiones T2/T3 con `src_ip`, desde 2026-10-03T00:00Z hasta la extracción). El puerto destino sale de `_source.payload.dst_port`, que se lee con un scroll de 89610 documentos (los campos `payload.*` no están indexados, así que no se agregan en el servidor). Se eligió porque da el comportamiento de las 100 IPs en una sola lectura; la alternativa (`soc-decisions-*`) no tiene `src_ip`.
+- **Ventana temporal exacta del comportamiento.** `soc-responses-*`: `event_time` ≥ 2026-10-03T00:00:00Z, **sin límite superior**; se leyó una sola vez el 2026-10-12 a las 16:42:52Z, así que cubre hasta esa hora. En las 100 IPs, la primera vista más antigua es 2026-10-03T00:02:23Z y la última más reciente 2026-10-12T16:42:10Z. `suricata-alerts-*`: campo `timestamp` ≥ 2026-10-03T00:00:00Z, sin límite superior, misma lectura. El comportamiento incluye por lo tanto lo posterior al bloqueo de cada IP y los días anteriores al período 2 (la ventana de bloqueos es otra, ver sección 2).
 - **Firmas y categorías de Suricata:** `suricata-alerts-*` (74 índices), agregación por `src_ip` con las 5 firmas y 5 categorías más frecuentes por IP.
 - **DNS inverso, FCrDNS, ASN, organización y país:** resueltos desde el Mac con `dig` y el whois masivo de Team Cymru (nada se consulta desde producción).
 
@@ -30,25 +31,26 @@ Todo se verifica con las columnas de la ficha. **No se consultan** AbuseIPDB, OT
 **Definiciones.**
 - *Puertos sensibles:* 21, 22, 23, 25, 445, 1433, 3306, 3389, 5432, 5900, 6379, 9200, 27017 y 2222 (SSH de administración).
 - *Puertos de autenticación:* 21, 22, 23, 445, 1433, 3306, 3389, 5432, 5900 y 2222.
+- *Columnas numéricas* (`n_puertos`, `n_flujos`, `max_flujos_puerto_auth`, `n_top5_sensibles`): derivadas solo del comportamiento observado, nunca de score, tier ni TI. `max_flujos_puerto_auth` es el mayor número de flujos a un único puerto de autenticación sobre **todos** los puertos de la IP; `n_top5_sensibles` cuenta cuántos de sus 5 puertos más frecuentes son sensibles.
 - *Flujo:* decisión T2/T3 registrada para la IP (los flujos T0/T1 no guardan `src_ip`), así que los conteos son un piso.
 - *Firma de ataque:* contiene EXPLOIT, MALWARE, TROJAN, BRUTE, SHELLCODE, "Privilege Gain" o "Web Application Attack". Las firmas de reputación o listas (CINS, DROP, "Poor Reputation", "Known Malicious") **no bastan solas**: son evidencia de apoyo.
 
-**Orden de evaluación:** M1/M2, luego FP, luego ER, luego M3/M4, y si nada aplica, I.
+**Orden de evaluación:** M2, luego FP, luego ER, luego M1, M3 y M4, y si nada aplica, I. Una identidad de proyecto confirmada (DNS inverso con FCrDNS, o AS confirmado por el humano) gana a M1, M3 y M4; solo M2 (firma de ataque) la supera.
 
 | Etiqueta | Criterio | Condición verificable en la ficha |
 |---|---|---|
-| **malicioso** | M1, intentos repetidos de autenticación | `top5_puertos` trae un puerto de autenticación con ≥ 20 flujos |
-| | M2, explotación o intrusión | `suricata_firmas` o `suricata_categorias` con una firma de ataque (definición arriba) |
-| | M3, barrido amplio sin identificación | `puertos_distintos` ≥ 50 y `flujos_t2_t3` ≥ 50 y sin pre-etiqueta ni proyecto identificado (ER2) |
-| | M4, sondeo sostenido de puertos sensibles | ≥ 3 de los 5 puertos de `top5_puertos` son sensibles y `flujos_t2_t3` ≥ 20 |
-| **escáner de investigación** | ER1 | la pre-etiqueta se confirma (la regla aplicó y la revisión humana la valida) y no hay M1 ni M2 |
-| | ER2 | la organización o el DNS inverso identifican un proyecto de censo o medición no incluido en las reglas, con la fuente citada en `evidencia`, y no hay M1 ni M2 |
-| **falso positivo** | FP1, servicio legítimo verificado | FCrDNS **confirmado** bajo un dominio de la lista cerrada: googlebot.com, search.msn.com, applebot.apple.com, crawl.yahoo.net, yandex.com, yandex.ru, yandex.net, baidu.com, baidu.jp, duckduckgo.com; con `puertos_distintos` ≤ 3 en 80/443 y sin M1–M4 |
+| **malicioso** | M2, explotación o intrusión (se evalúa primero) | `suricata_firmas` o `suricata_categorias` con una firma de ataque (definición arriba) |
+| | M1, intentos repetidos de autenticación | `max_flujos_puerto_auth` ≥ 20 |
+| | M3, barrido amplio sin identificación | `n_puertos` ≥ 50 y `n_flujos` ≥ 50, sin identidad de proyecto (ER1/ER2) |
+| | M4, sondeo sostenido de puertos sensibles | `n_top5_sensibles` ≥ 3 y `n_flujos` ≥ 20 |
+| **escáner de investigación** | ER1 | la pre-etiqueta se confirma (la regla aplicó y la revisión humana la valida) y no hay M2; gana a M1, M3 y M4 |
+| | ER2 | la organización o el DNS inverso identifican un proyecto de censo o medición no incluido en las reglas, con la fuente citada en `evidencia`, y no hay M2; gana a M1, M3 y M4 |
+| **falso positivo** | FP1, servicio legítimo verificado | FCrDNS **confirmado** bajo un dominio de la lista cerrada: googlebot.com, search.msn.com, applebot.apple.com, crawl.yahoo.net, yandex.com, yandex.ru, yandex.net, baidu.com, baidu.jp, duckduckgo.com; con `n_puertos` ≤ 3 en 80/443 y sin M2 |
 | | FP2, servicio propio o contratado | el dueño del ASN/dominio es un servicio que el laboratorio usa (validación de certificados, monitoreo de disponibilidad) y se cita en `evidencia`; ≤ 3 puertos (80/443) y sin firmas de ataque |
-| **indeterminado** | I1 | ningún criterio anterior aplica y `flujos_t2_t3` < 10 sin firmas de ataque ni identificación de proyecto |
+| **indeterminado** | I1 | ningún criterio anterior aplica y `n_flujos` < 10 sin firmas de ataque ni identificación de proyecto |
 | | I2 | la evidencia es contradictoria o falta (por ejemplo una regla de escáner que choca con M2 y el etiquetador no puede decidir) |
 
-Una IP con pre-etiqueta que además cumple M1 o M2 se etiqueta `malicioso`; eso cuenta como corrección de la regla.
+Una IP con pre-etiqueta que además cumple **M2** (firma de ataque) se etiqueta `malicioso`; eso cuenta como corrección de la regla. Cumplir M1, M3 o M4 **no** anula una identidad de proyecto confirmada.
 
 ## 6. Reglas de preetiquetado
 
@@ -77,19 +79,21 @@ Proyectos sin regla por no tener un patrón verificable en el repo: Silent Push 
 
 ## 7. Entregables y verificación de la ficha ciega
 
-- **Ficha ciega** (`ficha_ciega.csv`): id, ip, /24, DNS inverso, FCrDNS, ASN, organización, país, puertos distintos, 5 puertos más frecuentes, flujos, primera y última vista, alertas, firmas y categorías de Suricata, pre_etiqueta, regla, y las columnas vacías etiqueta, evidencia y notas. No lleva score, tier, resultado de AbuseIPDB u OTX ni hora del bloqueo.
+- **Ficha ciega** (`ficha_ciega.csv`): id, ip, /24, DNS inverso, FCrDNS, ASN, organización, país, `n_puertos`, `n_flujos`, `max_flujos_puerto_auth`, `n_top5_sensibles`, 5 puertos más frecuentes, primera y última vista, alertas, firmas y categorías de Suricata, pre_etiqueta, regla, y las columnas vacías etiqueta, evidencia y notas. No lleva score, tier, resultado de AbuseIPDB u OTX ni hora del bloqueo.
 - **Clave sellada** (`clave_sellada.csv`): id, ip, score, tier, tipo de fuentes de TI, resultados de AbuseIPDB y OTX, hora del bloqueo, trace_id. Su sha256 se registró **antes** de entregar la ficha.
 - **Ficha del segundo etiquetador** (`ficha_segundo_etiquetador.csv`): los 30 primeros ids del orden aleatorio, **sin** pre_etiqueta ni regla.
 
 | Archivo | sha256 |
 |---|---|
-| `clave_sellada.csv` | `c869fc311e22b7ed9b676f6d3aa19692ccd1b7d7bef0186b60cf807fd1b5cbd4` |
-| `ficha_ciega.csv` | `0a80289f82a4ad9a0d052ee07b74e342dc9990ae92aa73df79bb8b70d810fc15` |
-| `ficha_segundo_etiquetador.csv` | `1f08ed6cada01904ec7497cab03a97851b80d99e20609a639b2202bfbf2e54af` |
+| `clave_sellada.csv` (sin cambios) | `c869fc311e22b7ed9b676f6d3aa19692ccd1b7d7bef0186b60cf807fd1b5cbd4` |
+| `ficha_ciega.csv` (v2) | `45b3835fde2a225afaf8abaedcb103622c3012e116b30ad17ceb0a3fd3a41499` |
+| `ficha_segundo_etiquetador.csv` (v2) | `c6aa5876c9caff9e00d4dc5f56ee182de74a6b18ba6103c16ba407f99cf40aea` |
+
+La versión 1 de las fichas queda archivada fuera de git en `v1_reemplazada/` (nunca se entregó para etiquetar). La v2 se regeneró a partir de la salida cruda y la resolución externa guardadas, sin consultar nada, y el script verifica que la clave regenerada sea idéntica a la sellada (sha256 `c869fc31…`).
 
 ## 8. Análisis posterior al etiquetado
 
-`scripts/metrics/precision_p2/analizar_etiquetado.py` (probado con datos sintéticos; no se ha ejecutado con datos reales) calcula: precisión estricta (malicioso / n) y ampliada ((malicioso + escáner) / n) con intervalo de Clopper-Pearson al 95 %; tasa de falsos positivos; indeterminados aparte con cotas pesimista y optimista; precisión con el mismo peso por /24 y número de /24 distintos; acuerdo y kappa de Cohen con el segundo etiquetador sobre los 30 ids; y la tasa de corrección de las pre-etiquetas.
+`scripts/metrics/precision_p2/analizar_etiquetado.py` (probado con datos sintéticos; no se ha ejecutado con datos reales) calcula: precisión estricta (malicioso / n) y ampliada ((malicioso + escáner) / n) con intervalo de Clopper-Pearson al 95 %; tasa de falsos positivos; indeterminados aparte con cotas pesimista y optimista; precisión con el mismo peso por /24 y número de /24 distintos; acuerdo y kappa de Cohen con el segundo etiquetador sobre los 30 ids; y la tasa de corrección de las pre-etiquetas. Además recalcula la precisión con umbrales alternativos de M1 (20 y 50 flujos): una IP etiquetada `malicioso` cuya `evidencia` cita solo M1 y cuyo `max_flujos_puerto_auth` queda bajo el umbral pasa a `indeterminado`, y se reporta la diferencia en puntos.
 
 ## 9. Límites
 
@@ -98,4 +102,5 @@ Proyectos sin regla por no tener un patrón verificable en el repo: Silent Push 
 - **Agrupación:** las 100 IPs están en 61 /24 distintos; el intervalo de Clopper-Pearson supone independencia, por eso se reporta también la precisión con peso igual por /24.
 - **Tiempo:** el comportamiento incluye lo visto hasta la extracción (12-oct 16:42Z) y desde el 3-oct, no solo hasta el bloqueo; la primera y última vista no son la hora del bloqueo.
 - **Marco:** excluye las 37 IPs con aprobación manual; no extrapola a ellas ni a la infra propia.
+- **M1 y M4 en esta muestra:** ninguna de las 100 IPs alcanza M1 (el máximo de flujos a un puerto de autenticación es 19) ni M4 (como máximo 2 de los 5 puertos más frecuentes son sensibles). Con estos datos la sensibilidad al umbral de M1 dará diferencia 0 y la decisión recae en M2, M3, la identidad de proyecto y las listas FP; conviene saberlo antes de etiquetar.
 - **Umbrales de la rúbrica** (20 flujos, 50 puertos, etc.) son convenciones del protocolo, no estándares; se fijan antes de ver la ficha etiquetada.
