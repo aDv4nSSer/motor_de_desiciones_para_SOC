@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle, Prohibit, XCircle } from '@phosphor-icons/react'
 import { resolveApproval } from '../api/approvals'
 import { apiFetch } from '../api/client'
@@ -7,12 +7,17 @@ import { useAuth } from '../auth/AuthContext'
 import { EmptyState, ErrorNotice, Freshness, LevelBadge, TableSkeleton, TierBadge } from '../components/common'
 import { formatScore, formatTime, requiredLevel, roleReaches, shortId } from '../lib/format'
 import { groupByNet, net24Of } from '../lib/net'
+import { lookupResponses, mergeLookups, type RowLookup } from '../lib/responses'
+import { abuseipdbStatus, otxStatus, tiHasError } from '../lib/ti'
 import { usePolling } from '../lib/usePolling'
 
 type Decision = 'approved' | 'rejected'
 
 const PAGE = 50
 const FETCH_LIMIT = 1000 // tope del endpoint; hoy la cola real ronda las 260
+/** Reintento mínimo del detalle por fuente de una aprobación sin registro: la
+ *  vista refresca cada pocos segundos y no debe golpear el lookup en cada vuelta. */
+const DETAIL_RETRY_MS = 60_000
 
 interface RowState {
   confirming: Decision | null
@@ -33,6 +38,36 @@ export function ApprovalsView() {
   const [resolved, setResolved] = useState<Resolved[]>([])
   const [visible, setVisible] = useState(PAGE)
   const [group24, setGroup24] = useState(false)
+  const [details, setDetails] = useState<Map<string, RowLookup>>(() => new Map())
+  const detailsRef = useRef(details)
+  const triedAt = useRef(new Map<string, number>())
+
+  // Detalle por fuente (solo lectura, POST /responses/lookup): un único pedido por
+  // lote con los trace_id VISIBLES que aún no tienen registro. Lo ya encontrado no
+  // se vuelve a pedir (el enrichment de un trace_id no cambia) y lo no encontrado se
+  // reintenta como máximo una vez por DETAIL_RETRY_MS. Si falla, la vista sigue igual.
+  const visibleKey = useMemo(
+    () => (poll.data?.items ?? []).filter((a) => a.status === 'pending' && !removed.has(a.trace_id))
+      .slice(0, visible).map((a) => a.trace_id).join(','),
+    [poll.data, removed, visible],
+  )
+  useEffect(() => {
+    detailsRef.current = details
+  }, [details])
+  useEffect(() => {
+    const now = Date.now()
+    const todo = (visibleKey ? visibleKey.split(',') : [])
+      .filter((id) => !detailsRef.current.get(id)?.record && now - (triedAt.current.get(id) ?? 0) >= DETAIL_RETRY_MS)
+    if (todo.length === 0) return
+    todo.forEach((id) => triedAt.current.set(id, now))
+    let cancelled = false
+    lookupResponses(todo)
+      .then((fresh) => { if (!cancelled) setDetails((prev) => mergeLookups(prev, fresh)) })
+      // Errores de sesión: los detecta el polling de la lista; acá solo degrada el detalle.
+      .catch(() => { if (!cancelled) setDetails((prev) => mergeLookups(prev, new Map(todo.map((id) => [id,
+        { complete: false, failed: true, frontierMs: null, checkedAt: now } as RowLookup])))) })
+    return () => { cancelled = true }
+  }, [visibleKey, poll.updatedAt])
 
   if (!user) return null
   const role = user.role
@@ -140,6 +175,7 @@ export function ApprovalsView() {
                     {a.safelisted && <span className="badge sev-high">Infraestructura propia</span>}
                   </div>
                   <p className="approval-reason">{a.reason || 'Sin motivo registrado'}</p>
+                  <SourceDetail lookup={details.get(a.trace_id)} />
                   <p className="muted small mono">
                     {(a.occurrences ?? 1) > 1
                       ? <>
@@ -233,5 +269,20 @@ export function ApprovalsView() {
         </section>
       )}
     </section>
+  )
+}
+
+/** Estado por fuente de TI de la aprobación (R1 ya lo registró; esto solo lo muestra). */
+function SourceDetail({ lookup }: { lookup: RowLookup | undefined }) {
+  if (!lookup) return <p className="muted small">Consultando detalle por fuente…</p>
+  const e = lookup.record?.enrichment
+  if (!e) return <p className="muted small">Detalle por fuente no disponible</p>
+  return (
+    <p className="muted small">
+      {abuseipdbStatus(e)} · {otxStatus(e)}
+      {tiHasError(e) && (
+        <strong className="text-danger"> · Una fuente con error NO equivale a «sin evidencia»: la consulta falló y no hay dato.</strong>
+      )}
+    </p>
   )
 }

@@ -14,10 +14,12 @@ function approval(over: Partial<Approval> = {}): Approval {
   }
 }
 
-async function openApprovals(role: 'N1' | 'N2' | 'CISO', resolve: (url: string, init?: RequestInit) => Response | Promise<Response>, list: Approval[] = [approval()]) {
+async function openApprovals(role: 'N1' | 'N2' | 'CISO', resolve: (url: string, init?: RequestInit) => Response | Promise<Response>, list: Approval[] = [approval()],
+  lookup: (url: string, init?: RequestInit) => Response | Promise<Response> = () => json(500, { detail: 'sin lookup' })) {
   const mock = mockFetch({
     '/api/v1/auth/login': () => json(200, { access_token: 't', token_type: 'bearer', role }),
     '/api/v1/dashboard/approvals/': resolve,
+    '/api/v1/dashboard/responses/lookup': lookup,
     '/api/v1/dashboard/approvals': () => json(200, { items: list, total: list.length, limit: 1000, available: true }),
   })
   window.location.hash = '#aprobaciones'
@@ -188,5 +190,48 @@ describe('dedup por IP y expiración', () => {
     const msg = await screen.findByText(/La aprobación expiró/)
     expect(msg).toBeInTheDocument()
     expect(screen.queryByText('Ya fue resuelta por otro operador.')).not.toBeInTheDocument()
+  })
+})
+
+describe('detalle por fuente (H64)', () => {
+  const lookupOf = (records: Record<string, unknown>) => () => json(200, {
+    responses: records, complete: true, sources: { opensearch: true, redis: true }, worker_frontier: null,
+  })
+  const lookupCalls = (calls: { url: string; init?: RequestInit }[]) => calls.filter((c) => c.url.startsWith('/api/v1/dashboard/responses/lookup'))
+
+  it('muestra cada fuente y avisa que un error de OTX no equivale a "sin evidencia"', async () => {
+    const lista = [
+      approval({ trace_id: 'a-1', src_ip: '89.248.165.203', reason: 'corroboración insuficiente (0/2 fuentes)' }),
+      approval({ trace_id: 'a-2', src_ip: '167.94.145.30' }),
+    ]
+    await openApprovals('N1', () => json(200, {}), lista, lookupOf({
+      'a-1': { trace_id: 'a-1', enrichment: { abuseipdb_available: false, otx_available: false, corroboration_count: 0,
+        notes: ['abuseipdb: omitido por throttling (no decisiva (OTX no corrobora: no puede cambiar R2))', 'otx error: ReadTimeout'] } },
+      'a-2': { trace_id: 'a-2', enrichment: { abuseipdb_score: 0, otx_pulse_count: 50, corroboration_count: 1, corroborating_sources: ['otx'] } },
+    }))
+    const first = (await screen.findByText(/AbuseIPDB no consultada \(no decisiva/)).closest('p')!
+    expect(first).toHaveTextContent('OTX no disponible (error)')
+    expect(first).toHaveTextContent('NO equivale a «sin evidencia»')
+    const second = screen.getByText(/AbuseIPDB 0 · OTX 50 pulsos/).closest('p')!
+    expect(second).not.toHaveTextContent('NO equivale')
+  })
+
+  it('si el lookup falla, la lista funciona y dice "Detalle por fuente no disponible"', async () => {
+    await openApprovals('N1', () => json(200, {}), [approval()], () => json(500, { detail: 'boom' }))
+    expect(await screen.findByText('Detalle por fuente no disponible')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Aprobar/ })).toBeEnabled()
+  })
+
+  it('un solo lookup por lote y sin repetirlo al refrescar lo ya resuelto', async () => {
+    const lista = ['b-1', 'b-2', 'b-3'].map((id, i) => approval({ trace_id: id, src_ip: `198.51.100.${i + 1}` }))
+    const rec = (id: string) => ({ trace_id: id, enrichment: { abuseipdb_score: 0, otx_pulse_count: 0, corroboration_count: 0 } })
+    const { user, calls } = await openApprovals('N1', () => json(200, {}), lista,
+      lookupOf({ 'b-1': rec('b-1'), 'b-2': rec('b-2'), 'b-3': rec('b-3') }))
+    await waitFor(() => expect(screen.getAllByText(/AbuseIPDB 0 · OTX 0 pulsos/)).toHaveLength(3))
+    expect(lookupCalls(calls)).toHaveLength(1)
+    expect(JSON.parse(lookupCalls(calls)[0].init!.body as string).trace_ids).toEqual(['b-1', 'b-2', 'b-3'])
+    await user.click(screen.getByRole('button', { name: /Actualizar/ }))
+    await waitFor(() => expect(calls.filter((c) => c.url.startsWith('/api/v1/dashboard/approvals?')).length).toBeGreaterThan(1))
+    expect(lookupCalls(calls)).toHaveLength(1)
   })
 })

@@ -11,7 +11,8 @@ function sourceStatus(name: string, prefix: string, available: boolean | undefin
   if (available !== false && !note) return `${name} sin dato`
   if (note.includes('IP no pública')) return `${name} no aplica (IP no pública)`
   if (note.includes('stale')) return `${name} no consultada (evento antiguo, solo caché)`
-  if (note.includes('r2_min_tier') || note.includes('throttling') || note.includes('no decisiva')) {
+  if (note.includes('no decisiva')) return `${name} no consultada (no decisiva: la otra fuente no corrobora, no puede cambiar R2)`
+  if (note.includes('r2_min_tier') || note.includes('throttling')) {
     return `${name} no consultada (política de cuota, solo caché)`
   }
   if (note.includes('cuota diaria agotada')) return `${name} no consultada (cuota diaria agotada)`
@@ -35,4 +36,10 @@ export function otxStatus(e: Enrichment): string {
 export function corroboranLabel(n: number | null | undefined): string {
   const k = n ?? 0
   return k === 1 ? '1 fuente corrobora' : `${k} fuentes corroboran`
+}
+
+/** Alguna fuente falló en la consulta (timeout, API caída). Un error NO equivale
+ *  a "sin evidencia": no hay dato, ni a favor ni en contra. */
+export function tiHasError(e: Enrichment): boolean {
+  return abuseipdbStatus(e).endsWith('no disponible (error)') || otxStatus(e).endsWith('no disponible (error)')
 }

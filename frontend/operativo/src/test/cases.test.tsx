@@ -193,6 +193,9 @@ describe('etiquetas de presentación de Alertas (H60)', () => {
     expect(abuseipdbStatus(politica)).toBe('AbuseIPDB no consultada (política de cuota, solo caché)')
     expect(abuseipdbStatus({ abuseipdb_available: false, notes: ['abuseipdb: omitido por throttling (presupuesto de la ventana agotado)'] }))
       .toBe('AbuseIPDB no consultada (política de cuota, solo caché)')
+    // Nota real de R1 (H64): no es cuota, es que la otra fuente no corrobora y AbuseIPDB sola no llega a 2.
+    expect(abuseipdbStatus({ abuseipdb_available: false, notes: ['abuseipdb: omitido por throttling (no decisiva (OTX no corrobora: no puede cambiar R2))'] }))
+      .toBe('AbuseIPDB no consultada (no decisiva: la otra fuente no corrobora, no puede cambiar R2)')
     expect(abuseipdbStatus({ abuseipdb_available: false, notes: ['abuseipdb error: ReadTimeout'] })).toBe('AbuseIPDB no disponible (error)')
     expect(abuseipdbStatus({ abuseipdb_available: false, notes: ['abuseipdb no disponible (evento stale, solo caché)'] }))
       .toBe('AbuseIPDB no consultada (evento antiguo, solo caché)')
