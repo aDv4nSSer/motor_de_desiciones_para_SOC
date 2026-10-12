@@ -3098,7 +3098,8 @@ Ninguno toca el worker, el gate de R2 ni `corroboration.py`.
 **OpenSearch: réplicas a 0.** Estado en `yellow` por 189 réplicas sin asignar (nodo único); todos los shards sin asignar eran réplicas (`prirep=r`). Ninguno de `soc-responses`/`soc-decisions-*` estaba en la lista. Sin choque de plantillas (solo existían `soc-responses` y `soc-decisions`, prioridad 100, y ninguna plantilla legacy). Se creó `soc-replicas-cero` (`suricata-alerts-*`, `security-auditlog-*`, prioridad 50, réplicas 0) y se aplicó `number_of_replicas: 0` a los 189 índices, en lotes de 40, con el plugin de seguridad sin rechazar ninguno (incluidos `.opendistro-ism-*` y `.opendistro-job-scheduler-lock`). Antes: `yellow`, 215 activos / 189 sin asignar. Después: `green`, 215 activos / 0 sin asignar.
 - **Solo lectura sobre ISM:** `plugins.index_state_management.history.number_of_replicas` (y su par `opendistro.`) vale **1**, y `history.max_age` 24 h. Cada índice nuevo `.opendistro-ism-managed-index-history-*` nacerá con una réplica sin asignar y el cluster volverá a `yellow` en el siguiente rollover. La plantilla nueva no los cubre. No se cambió.
 
-**Pendiente de decisión (Antonio):** fijar `plugins.index_state_management.history.number_of_replicas: 0` (cluster setting persistente) o ampliar la plantilla a `.opendistro-ism-managed-index-history-*`.
+**ISM resuelto (12-oct, OK de Antonio):** `PUT _cluster/settings` con `{"persistent":{"plugins.index_state_management.history.number_of_replicas":0}}`. `GET _cluster/settings` lo devuelve en `0` y `_cluster/health` sigue `green` (215 activos, 0 sin asignar). **Reversible:** poner el mismo setting en `null`. Aplica a los índices de historial que se creen desde ahora; el actual ya estaba en 0 por el lote anterior.
+- **Pendiente:** el 13-oct ~21:00 -03, con la rotación del índice de historial (`max_age` 24 h), comprobar que el cluster sigue `green`.
 
 ---
 

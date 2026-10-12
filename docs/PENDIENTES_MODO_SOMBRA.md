@@ -102,6 +102,7 @@ _(Se anexan acá, uno por día, con la salida de `shadow_period_checkpoint.py`.)
 - **H63, réplicas de OpenSearch (preparado, NO ejecutado):** pendiente la lista de índices con réplicas sin asignar (una conexión SSH de solo lectura; requiere cargar la llave) y el comando para llevarlos a `number_of_replicas: 0` excepto `.opendistro_security`. Ejecución solo con OK por acción.
 
 - **Reentrenamiento del IF, 11-oct 04:00 (H60):** `isolation_forest.pkl` con hash idéntico (`4958eb4b…`), F1 0.6021, mismo corpus. El script reinicia `motor-soc` (último reinicio 11-oct 04:00:50) y el cron `0 4 * * 0` lo repite cada domingo. Un único modelo IF en todo el período 2.
+- **13-oct ~21:00 -03 (H60):** comprobar que OpenSearch sigue `green` tras la rotación del índice de historial de ISM. El setting `plugins.index_state_management.history.number_of_replicas` quedó en 0 (persistente) el 12-oct; reversible poniéndolo en `null`.
 - **Pendiente de decisión:** comentar el cron de reentrenamiento (`0 4 * * 0`) tras el corte del 14-oct 21:00. El próximo disparo sería el domingo 18-oct 04:00.
 
 **Para el checkpoint de mañana (~20:40 -03):** correr el script dos veces. Una con la ventana completa (default) para los criterios 1-3 y las horas, y otra con `--since 2026-10-08T00:56:08Z` para P2 (fila "TI disponible" y "OTX / AbuseIPDB por separado"). Anotar las dos.
